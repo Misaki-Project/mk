@@ -17,7 +17,9 @@
 	apicompat apicompat-routes apicompat-render \
 	shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check \
 	diff-up diff-test diff-down diff-logs \
-	upstream-e2e upstream-e2e-deps upstream-e2e-up upstream-e2e-down upstream-e2e-migrate upstream-e2e-test
+	upstream-e2e upstream-e2e-deps upstream-e2e-up upstream-e2e-down upstream-e2e-migrate upstream-e2e-test \
+	cherrypick-rehearsal-validate cherrypick-rehearsal-clean-db \
+	cherrypick-rehearsal-prepare cherrypick-rehearsal-resume cherrypick-rehearsal-abort
 
 .DEFAULT_GOAL := help
 
@@ -707,3 +709,23 @@ limitspec-check: ## ページネーションの default / max の drift を検�
 # Misskey の requireAdmin/requireModerator/requireCredential より緩くないか検証。
 perm-check: ## router middleware の権限が upstream より緩くないか検査
 	go test ./internal/entitycompat/... -run 'TestPermissionDrift|TestSecureDrift' -count=1 -v
+
+# 本番 CherryPick dump の隔離リハーサル (tests/cherrypick_migration)。
+# 詳細は docs/migration-from-cherrypick.md を参照。
+# コンテナは internal ネットワークのみで動かし、build / pull は一切行わない。
+# 値は環境変数 CHERRYPICK_BACKUP_PATH / CHERRYPICK_BACKUP_SHA256 /
+# CHERRYPICK_CREDENTIAL_PATH だけから受け取り、実パス・実ハッシュを直接書かない。
+cherrypick-rehearsal-validate: ## リハーサルの検証のみ (コンテナ起動なし・資格情報不要)
+	pwsh -NoProfile -File tests/cherrypick_migration/verify.ps1 -ValidateOnly -BackupPath "$(CHERRYPICK_BACKUP_PATH)" -ExpectedBackupSha256 "$(CHERRYPICK_BACKUP_SHA256)"
+
+cherrypick-rehearsal-clean-db: ## クリーンDB でマイグレーション 2 回 + 起動 + health を確認
+	pwsh -NoProfile -File tests/cherrypick_migration/verify.ps1 -CleanDatabaseOnly
+
+cherrypick-rehearsal-prepare: ## 復元 + pre 集計まで実行し、手動修復用に stack を保持
+	pwsh -NoProfile -File tests/cherrypick_migration/verify.ps1 -PrepareManualRepair -BackupPath "$(CHERRYPICK_BACKUP_PATH)" -ExpectedBackupSha256 "$(CHERRYPICK_BACKUP_SHA256)"
+
+cherrypick-rehearsal-resume: ## 保持済み stack を検証し、修復後の全零 gate を経て再開
+	pwsh -NoProfile -File tests/cherrypick_migration/verify.ps1 -ResumeManualRepair -BackupPath "$(CHERRYPICK_BACKUP_PATH)" -ExpectedBackupSha256 "$(CHERRYPICK_BACKUP_SHA256)" -CredentialPath "$(CHERRYPICK_CREDENTIAL_PATH)"
+
+cherrypick-rehearsal-abort: ## 保持済み stack / runtime を破棄
+	pwsh -NoProfile -File tests/cherrypick_migration/verify.ps1 -AbortManualRepair

@@ -191,9 +191,11 @@ func TestCheckPreflight(t *testing.T) {
 }
 
 // TestCheckPreflightRejectsIncompatibleSchema proves the schema-mismatch
-// branches of the detection contract fail closed: an absent schema is a clean
-// no-op, a partially present schema is incompatible, and every consumed column
-// must match type/length/nullability before any row is read.
+// branches of the detection contract fail closed: an incomplete lifecycle
+// schema (fewer than all three tables) is a clean no-op so repeated incremental
+// `-steps` runs can keep applying migrations, and once all three tables exist
+// every consumed column must match type/length/nullability before any row is
+// read.
 func TestCheckPreflightRejectsIncompatibleSchema(t *testing.T) {
 	conn := preflightConn(t)
 	ctx := context.Background()
@@ -206,14 +208,28 @@ func TestCheckPreflightRejectsIncompatibleSchema(t *testing.T) {
 		require.NoError(t, (&Lock{conn: conn}).CheckPreflight(ctx))
 	})
 
-	t.Run("only some tables present aborts", func(t *testing.T) {
-		recreatePreflightTables(t, conn)
-		seedValidPreflightRows(t, conn)
-		_, err := conn.Exec(ctx, `DROP TABLE avatar_decoration`)
-		require.NoError(t, err)
+	// CheckPreflight runs before every migration step, so every schema shape a
+	// clean database passes through between migrations 0 and N must commit
+	// without blocking the next `-steps 1` call.
+	t.Run("partial lifecycle schemas are a clean no-op", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			drop string
+		}{
+			{"only user exists", `drive_file, avatar_decoration`},
+			{"user and drive_file exist", `avatar_decoration`},
+			{"only avatar_decoration exists", `"user", drive_file`},
+			{"drive_file and avatar_decoration exist", `"user"`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				recreatePreflightTables(t, conn)
+				seedValidPreflightRows(t, conn)
+				_, err := conn.Exec(ctx, `DROP TABLE IF EXISTS `+tc.drop)
+				require.NoError(t, err)
 
-		err = (&Lock{conn: conn}).CheckPreflight(ctx)
-		require.ErrorIs(t, err, errIncompatibleSchema)
+				require.NoError(t, (&Lock{conn: conn}).CheckPreflight(ctx))
+			})
+		}
 	})
 
 	t.Run("missing consumed column aborts", func(t *testing.T) {

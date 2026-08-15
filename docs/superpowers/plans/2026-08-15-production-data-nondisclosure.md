@@ -56,7 +56,6 @@
 **Interfaces:**
 - Consumes: `Lock.conn lockConn`、`context.Context`
 - Produces: `func (l *Lock) CheckPreflight(ctx context.Context) error`
-- Produces: `var errIncompatibleSchema error`
 - Removes: `approvedAvatarPairs`、`approvedPairsSQL`、`sqlLiteral`、`func (l *Lock) Reconcile(...)`
 
 - [ ] **Step 1: synthetic fixtureだけを使う失敗テストへ書き換える**
@@ -137,7 +136,7 @@ require.Contains(t, src[:preflightIdx], `if *direction == "up" {`)
 `preflight.go`は次の順序だけを実行する。
 
 1. transaction開始。
-2. `user`、`drive_file`、`avatar_decoration`の存在確認。全て不存在ならclean DBとしてcommit、部分存在なら`errIncompatibleSchema`。
+2. `user`、`drive_file`、`avatar_decoration`の存在確認。どれか1つでも欠けたschemaはclean no-opとしてcommitし、3つ揃ってから列・孤児の検証へ進む。
 3. 使用列の型・長さ・nullability確認。
 4. 3 tableを`SHARE ROW EXCLUSIVE MODE`でlock。
 5. 無効な`avatarDecorations`行、無効item、孤児装飾、孤児avatar、孤児bannerを件数だけ取得。

@@ -2,13 +2,8 @@ package migrationcompat
 
 import (
 	"context"
-	"errors"
 	"fmt"
 )
-
-// errIncompatibleSchema is returned when only part of the required tables exist
-// and CheckPreflight therefore cannot reason about the schema.
-var errIncompatibleSchema = errors.New("migration compatibility: incompatible schema")
 
 // columnSpec pins one consumed column's exact type/length/nullability.
 type columnSpec struct {
@@ -57,10 +52,11 @@ SELECT
 // CheckPreflight is a detection-only preflight that runs before an upward
 // golang-migrate run adds the decoration/avatar FK constraints.
 //
-// 修復は一切行わず、件数だけを返す。schema / 列定義のどれか1つでも一致しなけ
-// れば fail-closed で abort し、全カテゴリの件数が0のときだけ commit する。
-// エラーは件数と固定のテーブル/カラム名・カテゴリ名のみを含み、ユーザー ID・
-// ファイル ID・装飾 ID・URL・JSON・接続 URL は決して含めない。
+// 修復は一切行わず、件数だけを返す。3テーブルのうち1つでも欠けた schema
+// (クリーン DB、装飾 migration 前の既存 install) は何も検証せず commit する。
+// 全て揃ってから列定義を照合し、不一致か孤児が1件でもあれば fail-closed で
+// abort する。エラーは件数と固定のテーブル/カラム名・カテゴリ名のみを含み、
+// ユーザー ID・ファイル ID・装飾 ID・URL・JSON・接続 URL は決して含めない。
 func (l *Lock) CheckPreflight(ctx context.Context) error {
 	tx, err := l.conn.Begin(ctx)
 	if err != nil {
@@ -70,8 +66,9 @@ func (l *Lock) CheckPreflight(ctx context.Context) error {
 	// 成功時の Commit 後は no-op になる。
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// 1. 必要テーブルの存在確認。全て無ければクリーンな schema として commit
-	// で完了し、一部だけなら安全に進めない。
+	// 1. 必要テーブルの存在確認。3つ揃う前の schema (クリーン DB や
+	// `-steps 1` で装飾 migration がまだ走っていない段階) はそのまま commit
+	// し、追加分は migration 自体が作る。揃ってから初めて列・孤児を検証する。
 	var hasUser, hasDriveFile, hasDecoration bool
 	if err := tx.QueryRow(ctx, `
 		SELECT (to_regclass('"user"') IS NOT NULL),
@@ -80,11 +77,8 @@ func (l *Lock) CheckPreflight(ctx context.Context) error {
 	`).Scan(&hasUser, &hasDriveFile, &hasDecoration); err != nil {
 		return fmt.Errorf("check migration compatibility tables: %w", err)
 	}
-	if !hasUser && !hasDriveFile && !hasDecoration {
-		return tx.Commit(ctx)
-	}
 	if !hasUser || !hasDriveFile || !hasDecoration {
-		return errIncompatibleSchema
+		return tx.Commit(ctx)
 	}
 
 	// 2. 消費する全カラムの型・長さ・nullability を検証する。不一致は

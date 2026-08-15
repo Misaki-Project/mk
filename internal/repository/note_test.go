@@ -2550,7 +2550,7 @@ func TestNoteRepository_SearchByTag_Filters(t *testing.T) {
 	repo := NewNoteRepository(testDB)
 	user := insertTestUser(t, "sbtf_u", "sbtfuser")
 	defer cleanupUser(t, user.ID)
-	// reply の ReplyID は FK_note_replyId 制約があるため既存 note (plain) を指す。
+	// reply filter のfixtureとして、plain note を参照する通常replyを作る。
 	parent := "sbtf_plain"
 	bt := func(v bool) *bool { return &v }
 

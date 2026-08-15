@@ -206,8 +206,6 @@ CREATE TABLE IF NOT EXISTS "note" (
     "renoteChannelId" varchar(32)
 );
 
-ALTER TABLE "note" ADD CONSTRAINT "FK_note_replyId" FOREIGN KEY ("replyId") REFERENCES "note"("id") ON DELETE SET NULL;
-ALTER TABLE "note" ADD CONSTRAINT "FK_note_renoteId" FOREIGN KEY ("renoteId") REFERENCES "note"("id") ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS "IDX_note_userId" ON "note" ("userId");
 CREATE INDEX IF NOT EXISTS "IDX_note_visibility" ON "note" ("visibility");
 CREATE INDEX IF NOT EXISTS "IDX_note_userHost" ON "note" ("userHost");

@@ -14,10 +14,10 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
 	"github.com/shiroha-a/mk/internal/api/apierr"
+	authpassword "github.com/shiroha-a/mk/internal/auth/password"
 	"github.com/shiroha-a/mk/internal/core/twofactor"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/server/middleware"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -61,7 +61,7 @@ func (h *Handler) TwoFARegister(c echo.Context) error {
 	if profile.TwoFactorEnabled && !h.verify2FAToken(c.Request().Context(), profile, req.Token) {
 		return c.JSON(http.StatusForbidden, apierr.InvalidToken())
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.Password)); err != nil {
+	if !authpassword.Verify(req.Password, *profile.Password) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "78d6c839-20c9-4c66-b90a-fc0542168b48"))
 	}
 
@@ -185,7 +185,7 @@ func (h *Handler) TwoFAUnregister(c echo.Context) error {
 	if profile.TwoFactorEnabled && !h.verify2FAToken(c.Request().Context(), profile, req.Token) {
 		return c.JSON(http.StatusForbidden, apierr.InvalidToken())
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.Password)); err != nil {
+	if !authpassword.Verify(req.Password, *profile.Password) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "7add0395-9901-4098-82f9-4f67af65f775"))
 	}
 
@@ -227,7 +227,7 @@ func (h *Handler) requireWebAuthn(c echo.Context, password, incorrectPwID string
 		_ = c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "No password set.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 		return nil, nil, false
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(password)); err != nil {
+	if !authpassword.Verify(password, *profile.Password) {
 		_ = c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", incorrectPwID))
 		return nil, nil, false
 	}
@@ -461,7 +461,7 @@ func (h *Handler) TwoFARemoveKey(c echo.Context) error {
 	if profile.TwoFactorEnabled && !h.verify2FAToken(c.Request().Context(), profile, req.Token) {
 		return c.JSON(http.StatusForbidden, apierr.InvalidToken())
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.Password)); err != nil {
+	if !authpassword.Verify(req.Password, *profile.Password) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "141c598d-a825-44c8-9173-cfb9d92be493"))
 	}
 

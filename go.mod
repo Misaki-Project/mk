@@ -4,6 +4,7 @@ go 1.26.6
 
 require (
 	github.com/SherClockHolmes/webpush-go v1.4.0
+	github.com/alexedwards/argon2id v1.0.0
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/aws/aws-sdk-go-v2 v1.41.5
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14

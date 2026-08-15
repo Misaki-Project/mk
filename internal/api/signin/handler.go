@@ -13,6 +13,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
 	"github.com/shiroha-a/mk/internal/api/apierr"
+	authpassword "github.com/shiroha-a/mk/internal/auth/password"
 	"github.com/shiroha-a/mk/internal/core/captcha"
 	coreemail "github.com/shiroha-a/mk/internal/core/email"
 	"github.com/shiroha-a/mk/internal/core/twofactor"
@@ -21,7 +22,6 @@ import (
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
-	"golang.org/x/crypto/bcrypt"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -164,7 +164,7 @@ func (h *Handler) Signin(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, errBody("932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(*req.Password)); err != nil {
+	if !authpassword.Verify(*req.Password, *profile.Password) {
 		return h.fail(c, user, http.StatusForbidden, "932c904e-9460-45b7-9ce6-7ed33be7eb2c")
 	}
 
@@ -254,7 +254,7 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, errBody("932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
-	passwordOK := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(*req.Password)) == nil
+	passwordOK := authpassword.Verify(*req.Password, *profile.Password)
 
 	// CAPTCHA 検証 (password step 完了後、2FA 無しの場合のみ)。
 	// 本家 Misskey と同じく 2FA 有効なユーザーはキーデバイスが人間性を担保する

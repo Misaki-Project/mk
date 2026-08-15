@@ -14,6 +14,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/api/notehide"
 	"github.com/shiroha-a/mk/internal/api/pagination"
+	authpassword "github.com/shiroha-a/mk/internal/auth/password"
 	"github.com/shiroha-a/mk/internal/core/notification"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/achievement"
@@ -53,7 +54,7 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 	// upstream Misskey TS は raw `throw new Error('authentication failed')` を
 	// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため 401
 	// に揃える (旧 mk-go は 403 を返していた)。
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.CurrentPassword)); err != nil {
+	if !authpassword.Verify(req.CurrentPassword, *profile.Password) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
@@ -101,7 +102,7 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 	// upstream Misskey TS は raw `throw new Error('incorrect password')` を
 	// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため 401
 	// に揃える (旧 mk-go は 403 を返していた)。
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.Password)); err != nil {
+	if !authpassword.Verify(req.Password, *profile.Password) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
@@ -290,7 +291,7 @@ func (h *Handler) RegenerateToken(c echo.Context) error {
 	// upstream Misskey TS は raw `throw new Error('incorrect password')` を
 	// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため 401
 	// に揃える (旧 mk-go は 403 を返していた)。
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.Password)); err != nil {
+	if !authpassword.Verify(req.Password, *profile.Password) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 

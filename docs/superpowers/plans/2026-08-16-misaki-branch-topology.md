@@ -14,11 +14,12 @@
 - `Misaki-Stable`と`Misaki-develop`は、確認済みの変更前`origin/develop` SHA `ab3bb1493ced07251a40347aa5b06c8351a5d526`から作成する。
 - 既存の`develop`と`docker`は削除せず、force-pushしない。
 - GitHubのdefault branchは`Misaki-develop`へ変更する。
+- GitHub Issuesはfork側`Misaki0331/mk`でのみ有効化する。fork元`shiroha-a/mk`は読み取り専用のままとし、Issues・その他repository設定を変更しない。
 - private branch `feature/cherrypick-compatibility-foundation`のlocal履歴はpushしない。
 - 公開worktreeのHEADだけをremote `feature/cherrypick-compatibility-foundation`へpushする。
 - dump、credential、local evidence、production由来の値・件数・path・hash・SQLをIssue、Pull Request、commit、artifactへ含めない。
 - IssueとPull Requestのタイトル・本文は日本語にする。
-- branch protectionなど、明示されていないrepository設定は変更しない。
+- branch protectionなど、本planで明示した操作（default branch変更、fork側Issues有効化）以外のrepository設定は変更しない。
 
 ---
 
@@ -172,7 +173,26 @@ private commit ancestry = false
 
 Expected: 全categoryが安全（operator absolute path categoryはbranch追加行のみを対象に判定する）。問題があればIssue作成・pushを行わず停止する。
 
-- [ ] **Step 3: 日本語Issueを作成する**
+- [ ] **Step 3: fork側Issuesを有効化して検証する**
+
+Run:
+
+```powershell
+gh repo edit Misaki0331/mk --enable-issues
+gh repo view Misaki0331/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
+gh repo view shiroha-a/mk --json nameWithOwner,defaultBranchRef
+```
+
+Expected:
+
+- `gh repo edit Misaki0331/mk --enable-issues`はexit 0。
+- `Misaki0331/mk`の`hasIssuesEnabled`が`true`。
+- parentは引き続き`shiroha-a/mk`で、default branchは`Misaki-develop`のまま。
+- fork元`shiroha-a/mk`は読み取り専用のままで変更されていない。
+
+有効化・検証に失敗した場合はfeature push前に停止する。
+
+- [ ] **Step 4: 日本語Issueを作成する**
 
 Run:
 
@@ -208,7 +228,7 @@ CherryPickからmk-goへ移行する際の認証・migration互換性と、個�
 
 Expected: 新規Issue URLが返る。本文にproduction由来情報を含まない。
 
-- [ ] **Step 4: Issueを読み戻して監査する**
+- [ ] **Step 5: Issueを読み戻して監査する**
 
 Run:
 
@@ -220,7 +240,7 @@ gh issue view --repo Misaki0331/mk $issueNumber --json number,title,body,state,u
 
 Expected: title/bodyは日本語、stateはOPEN、privacy禁止categoryは0。
 
-- [ ] **Step 5: public HEADだけをremote feature branchへpushする**
+- [ ] **Step 6: public HEADだけをremote feature branchへpushする**
 
 Run:
 
@@ -230,7 +250,7 @@ git push -u origin HEAD:refs/heads/feature/cherrypick-compatibility-foundation
 
 Expected: remote feature branchが新規作成される。private local branchはpushされない。
 
-- [ ] **Step 6: remote feature branchのSHAとbranch一覧を検証する**
+- [ ] **Step 7: remote feature branchのSHAとbranch一覧を検証する**
 
 Run:
 
@@ -334,11 +354,11 @@ Expected:
 Run:
 
 ```powershell
-gh repo view Misaki0331/mk --json defaultBranchRef
+gh repo view Misaki0331/mk --json defaultBranchRef,hasIssuesEnabled
 git ls-remote --heads origin refs/heads/develop refs/heads/docker refs/heads/Misaki-Stable refs/heads/Misaki-develop refs/heads/feature/cherrypick-compatibility-foundation
 ```
 
-Expected: default branchは`Misaki-develop`で、既存branchと新規branchが全て存在する。
+Expected: default branchは`Misaki-develop`で、`hasIssuesEnabled`は`true`、既存branchと新規branchが全て存在する。
 
 - [ ] **Step 6: CIを監視する**
 
@@ -352,4 +372,4 @@ Expected: required checksが成功する。non-required checkが失敗した場�
 
 - [ ] **Step 7: 完了結果を報告する**
 
-default branch、branch作成・既存branch保持、実際のIssue URL、実際のPull Request URL、required CIの状態、privacy結果を報告する。production由来情報、local path、private branch SHA、local evidenceは報告しない。
+default branch、fork側Issues有効状態、branch作成・既存branch保持、実際のIssue URL、実際のPull Request URL、required CIの状態、privacy結果を報告する。production由来情報、local path、private branch SHA、local evidenceは報告しない。

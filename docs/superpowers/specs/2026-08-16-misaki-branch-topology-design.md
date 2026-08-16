@@ -13,7 +13,8 @@ fork元repositoryには変更を加えない。
 - `Misaki-develop`も同じ`origin/develop`先端から作成する。
 - GitHubのdefault branchを`develop`から`Misaki-develop`へ変更する。
 - 既存の`develop`と`docker`は削除せず保持する。
-- branch protectionなど、明示されていないrepository設定は変更しない。
+- GitHub Issuesはfork側`Misaki0331/mk`でのみ有効化する。fork元`shiroha-a/mk`は読み取り専用のままとし、Issues・その他repository設定を変更しない。
+- branch protectionなど、本設計で明示した操作（default branch変更、fork側Issues有効化）以外のrepository設定は変更しない。
 
 この構成により、変更前のfork既定状態を`Misaki-Stable`に保存し、以後の開発変更を`Misaki-develop`向けPull Requestとして扱える。
 
@@ -45,15 +46,17 @@ Pull Requestは次の条件で作成する。
 2. `Misaki-Stable`と`Misaki-develop`を同じ先端へpushする。
 3. 両branchのremote SHAが一致することを確認する。
 4. GitHubのdefault branchを`Misaki-develop`へ変更する。
-5. 日本語Issueを作成する。
-6. 公開feature HEADをremote feature branchへpushする。
-7. `Misaki-develop`向け日本語Pull Requestを作成する。
-8. Pull Requestのbase/head、diff、本文、CIを確認する。
+5. fork側`Misaki0331/mk`のIssuesを有効化し、`hasIssuesEnabled=true`を検証する（fork元`shiroha-a/mk`は変更しない）。
+6. 日本語Issueを作成する。
+7. 公開feature HEADをremote feature branchへpushする。
+8. `Misaki-develop`向け日本語Pull Requestを作成する。
+9. Pull Requestのbase/head、diff、本文、CIを確認する。
 
 ## 失敗時の扱い
 
 - branch作成に失敗した場合はdefault branchを変更しない。
 - default branch変更に失敗した場合はfeature branchとPull Requestを作成せず停止する。
+- fork側Issuesの有効化・検証に失敗した場合はfeature branchとPull Requestを作成せず停止する。
 - privacy監査、base/head確認、またはCIで問題が見つかった場合はmergeしない。
 - force-push、既存branch削除、fork元repositoryへの書き込みは行わない。
 
@@ -61,6 +64,7 @@ Pull Requestは次の条件で作成する。
 
 - `Misaki-Stable`と`Misaki-develop`が変更前の`origin/develop`先端から作成されている。
 - GitHubのdefault branchが`Misaki-develop`になっている。
+- fork側`Misaki0331/mk`のIssuesが有効化され、`hasIssuesEnabled`が`true`になっている。
 - 既存の`develop`と`docker`が保持されている。
 - 公開feature branchだけがpushされている。
 - 日本語Issueと`Misaki-develop`向け日本語Pull Requestが作成されている。

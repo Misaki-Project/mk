@@ -22,7 +22,7 @@
 - dump、credential、local evidence、production由来の値・件数・path・hash・SQLをIssue、Pull Request、commit、artifactへ含めない。
 - IssueとPull Requestのタイトル・本文は日本語にする。Organization Issue #1の更新本文はsanitized本文のみを使用する。
 - force-push、削除対象外branchの削除、Issue #1以外のIssue削除は行わない。
-- `gh`のmutationは全て明示的な`--repo`引数を付ける。cross-fork PRのheadは`Misaki0331:feature/cherrypick-compatibility-foundation`形式を使う。
+- 全てのmutationコマンドは対象repositoryを明示する。`gh repo edit`はpositional引数`OWNER/REPO`（`gh repo edit Misaki0331/mk ...`）で指定し、`gh issue`/`gh pr`は`--repo OWNER/REPO`で指定する。git pushはforkの場合remote `origin`、Organizationの場合明示的なrepository URLを使う。cross-fork PRのheadは`Misaki0331:feature/cherrypick-compatibility-foundation`形式を使う。
 - branch protectionなど、本planで明示した操作（fork default branch復帰・Issues無効化、fork誤branch/Issue削除、Organization branch作成・default branch変更、Issue更新、PR作成）以外のrepository設定は変更しない。
 
 ---
@@ -61,7 +61,7 @@ Expected:
 Run:
 
 ```powershell
-gh repo edit --repo Misaki0331/mk --default-branch develop
+gh repo edit Misaki0331/mk --default-branch develop
 ```
 
 Expected: exit 0。
@@ -107,7 +107,7 @@ Expected: Issueが存在せず失敗（exit 1相当）。存在する場合は�
 Run:
 
 ```powershell
-gh repo edit --repo Misaki0331/mk --enable-issues=false
+gh repo edit Misaki0331/mk --enable-issues=false
 ```
 
 Expected: exit 0。
@@ -182,7 +182,7 @@ Expected: 両branchが新規作成され、既存branchは更新されない。
 Run:
 
 ```powershell
-gh repo edit --repo Misaki-Project/mk --default-branch Misaki-develop
+gh repo edit Misaki-Project/mk --default-branch Misaki-develop
 ```
 
 Expected: exit 0。
@@ -418,7 +418,9 @@ Expected: `Misaki-Project/mk`の`Misaki-develop`向け新規cross-fork Pull Requ
 Run:
 
 ```powershell
-gh pr view --repo Misaki-Project/mk Misaki0331:feature/cherrypick-compatibility-foundation --json number,title,body,state,isDraft,baseRefName,headRefName,url,commits,files
+$prNumber = gh pr list --repo Misaki-Project/mk --state open --head Misaki0331:feature/cherrypick-compatibility-foundation --json number --jq '.[] | .number'
+if (@($prNumber).Count -ne 1) { throw 'matching open PR is not unique' }
+gh pr view --repo Misaki-Project/mk $prNumber --json number,title,body,state,isDraft,baseRefName,headRefName,url,commits,files
 ```
 
 Expected:
@@ -451,7 +453,9 @@ Expected:
 Run:
 
 ```powershell
-gh pr checks --repo Misaki-Project/mk Misaki0331:feature/cherrypick-compatibility-foundation --watch --interval 10
+$prNumber = gh pr list --repo Misaki-Project/mk --state open --head Misaki0331:feature/cherrypick-compatibility-foundation --json number --jq '.[] | .number'
+if (@($prNumber).Count -ne 1) { throw 'matching open PR is not unique' }
+gh pr checks --repo Misaki-Project/mk $prNumber --watch --interval 10
 ```
 
 Expected: required checksが成功する。non-required checkが失敗した場合はログを確認し、branch変更との関連を判定する。required check失敗時はmergeせず、固定されたcheck名と原因categoryだけを報告する。

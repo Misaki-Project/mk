@@ -379,3 +379,49 @@ func TestRoleRepository_ListByLastUsed(t *testing.T) {
 	assert.Less(t, pos["rlu_new"], pos["rlu_mid"], "new は mid より前 (#2061)")
 	assert.Less(t, pos["rlu_mid"], pos["rlu_old"], "mid は old より前 (#2061)")
 }
+
+func TestRoleRepository_LevelRoleFieldsRoundTrip(t *testing.T) {
+	repo := NewRoleRepository(testDB)
+	assignRepo := NewRoleAssignmentRepository(testDB)
+
+	now := time.Now()
+	role := &model.Role{
+		ID: "role_lvl_test", UpdatedAt: now, LastUsedAt: now, Name: "Level",
+		Target: model.RoleTargetManualLevel,
+		LevelPolicies: datatypes.JSON([]byte(
+			`{"baseLevel":10,"experiencePolicies":[{"level":5,"type":"const","base":100}]}`)),
+		CanHideProfileByUser: true,
+		Policies:             datatypes.JSON([]byte("{}")),
+		CondFormula:          datatypes.JSON([]byte("{}")),
+	}
+	require.NoError(t, repo.Create(role))
+	defer cleanupRole(t, role.ID)
+
+	found, err := repo.FindByID(role.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.RoleTargetManualLevel, found.Target)
+	assert.True(t, found.CanHideProfileByUser)
+
+	lp, err := model.ParseLevelPolicies(found.LevelPolicies)
+	require.NoError(t, err)
+	assert.Equal(t, 10, lp.BaseLevel)
+	require.Len(t, lp.ExperiencePolicies, 1)
+	assert.Equal(t, 5, lp.ExperiencePolicies[0].Level)
+	assert.Equal(t, 100.0, lp.ExperiencePolicies[0].Base)
+
+	createTestUser(t, "lvl_u1")
+	exp := int64(250)
+	hide := true
+	require.NoError(t, assignRepo.Create(&model.RoleAssignment{
+		ID: "lvl_a1", UserID: "lvl_u1", RoleID: role.ID, Experience: &exp, IsHideProfile: &hide,
+	}))
+	t.Cleanup(func() { testDB.Exec(`DELETE FROM "role_assignment" WHERE id = ?`, "lvl_a1") })
+
+	assigns, err := assignRepo.ListByUser("lvl_u1")
+	require.NoError(t, err)
+	require.Len(t, assigns, 1)
+	require.NotNil(t, assigns[0].Experience)
+	assert.Equal(t, int64(250), *assigns[0].Experience)
+	require.NotNil(t, assigns[0].IsHideProfile)
+	assert.True(t, *assigns[0].IsHideProfile)
+}

@@ -262,21 +262,31 @@ Task 1 Step 4の表と同一の変更を、`$tmp`内の6 fileへ適用する（`
 
 - [ ] **Step 4: YAMLを検証する（disposable clone内の6 fileを対象）**
 
-disposable clone内に一時的な検証スクリプトを作成し、**`$tmp`を引数で渡して**6 fileをyaml.v3でパースし、`on.pull_request.branches`に`Misaki-develop`があることを確認する。検証対象は必ず`$tmp`（disposable clone）内のファイルであり、公開feature worktree側のファイルを読まない。
+`gopkg.in/yaml.v3`は**モジュール内パッケージからのimportでしか解決できない**（module外の単体ファイル`go run file.go`はモジュール解決が効かず、`undefined: yaml`で失敗する）。そのため、`$tmp`（disposable clone）の**モジュール内部に一時`_test.go`を置き**、`go test -C $tmp ./internal/entitycompat/`で**clone自身のモジュールcontext**から実行する。検証対象は必ず`$tmp`（disposable clone）内の`.github/workflows/`であり、公開feature worktree側のファイルは読まない。
+
+`--no-checkout` cloneなので作業ツリーにファイルが無い。Step 4の前に`git -C $tmp checkout-index -a -f`でindex（base content）から作業ツリーをmaterializeする（gitのindex/HEAD/refは変更しない）。続いてStep 3の編集結果を`git add`でindexへ載せ、`checkout-index -a -f`で**編集済み6 fileをindexから再materialize**する（追加された`Misaki-develop`行を含む版が作業ツリーへ展開される）。`internal/entitycompat`はbaseに存在する実パッケージなので、一時`_test.go`をこのパッケージ内に配置すれば`go test -C $tmp`がyaml.v3を解決できる。検証が成功/失敗いずれでも`finally`で一時`_test.go`を削除する（residue 0）。一時`_test.go`は`git add`しない（commit対象に含めない）。
 
 Run:
 ```powershell
-$tmpCheck = @'
-package main
+$tmpRoot = $tmp
+$env:TMP_ORG_BOOTSTRAP = $tmpRoot
+$testFile = @'
+package entitycompat
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
-func main() {
-	dir := os.Args[1]
+func TestOrgBootstrapWorkflowsIncludeMisakiDevelop(t *testing.T) {
+	dir := os.Getenv("TMP_ORG_BOOTSTRAP")
+	if dir == "" {
+		t.Fatal("TMP_ORG_BOOTSTRAP is not set")
+	}
 	files := []string{
 		"ci.yml",
 		"diff-e2e.yml",
@@ -285,18 +295,19 @@ func main() {
 		"playwright.yml",
 		"upstream-backend-e2e.yml",
 	}
-	fail := false
 	for _, f := range files {
 		data, err := os.ReadFile(filepath.Join(dir, ".github", "workflows", f))
 		if err != nil {
-			fmt.Printf("READ-ERR %s: %v\n", f, err)
-			fail = true
+			t.Errorf("READ-ERR %s: %v", f, err)
 			continue
 		}
+		// yaml.v3 rejects bare CR control characters; the clone's working
+		// tree may be CRLF on Windows. Normalize CRLF/CR to LF before parse.
+		content := strings.ReplaceAll(string(data), "\r\n", "\n")
+		content = strings.ReplaceAll(content, "\r", "\n")
 		var doc map[string]interface{}
-		if err := yaml.Unmarshal(data, &doc); err != nil {
-			fmt.Printf("YAML-ERR %s: %v\n", f, err)
-			fail = true
+		if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+			t.Errorf("YAML-ERR %s: %v", f, err)
 			continue
 		}
 		on, _ := doc["on"].(map[string]interface{})
@@ -308,24 +319,29 @@ func main() {
 				ok = true
 			}
 		}
-		fmt.Printf("%s: hasMisakiDevelop=%v branches=%v\n", f, ok, branches)
+		t.Logf("%s: hasMisakiDevelop=%v branches=%v", f, ok, branches)
 		if !ok {
-			fail = true
+			t.Errorf("%s: on.pull_request.branches=%v; want Misaki-develop", f, branches)
 		}
-	}
-	if fail {
-		os.Exit(1)
 	}
 }
 '@
-Set-Content -Path "$tmp\bootstrap_check.go" -Value $tmpCheck -Encoding utf8
-go run "$tmp\bootstrap_check.go" "$tmp"
-$yamlExit = $LASTEXITCODE
-Remove-Item "$tmp\bootstrap_check.go" -Force
+try {
+  git -C $tmp add .github/workflows/ci.yml .github/workflows/diff-e2e.yml .github/workflows/docker.yml .github/workflows/dropin-e2e.yml .github/workflows/playwright.yml .github/workflows/upstream-backend-e2e.yml
+  git -C $tmp checkout-index -a -f
+  [System.IO.File]::WriteAllText((Join-Path $tmp "internal\entitycompat\org_bootstrap_check_test.go"), $testFile, (New-Object System.Text.UTF8Encoding($false)))
+  go mod download gopkg.in/yaml.v3
+  go test -C $tmp ./internal/entitycompat/ -run TestOrgBootstrapWorkflowsIncludeMisakiDevelop -count=1 -v
+  $yamlExit = $LASTEXITCODE
+} finally {
+  Remove-Item Env:\TMP_ORG_BOOTSTRAP -ErrorAction SilentlyContinue
+  Remove-Item (Join-Path $tmp "internal\entitycompat\org_bootstrap_check_test.go") -Force -ErrorAction SilentlyContinue
+  $env:TMP_ORG_BOOTSTRAP = $null
+}
 Write-Output "YAML_CHECK_EXIT=$yamlExit"
 ```
 
-Expected: 6 fileすべて`hasMisakiDevelop=true`でexit 0。`go run`は公開feature worktreeのmodule context（`gopkg.in/yaml.v3`は直接依存）で動作し、`os.Args[1]`（=`$tmp`）配下の`.github/workflows/`を読み、**public worktree側のファイルは読まない**。一時ファイルは削除済み（residue 0）。
+Expected: 6 fileすべて`hasMisakiDevelop=true`（`-v`で`branches=[main develop Misaki-develop]`等を出力）でexit 0。検証は**disposable cloneのモジュールcontext**（clone自身の`go.mod`/`go.sum`、`gopkg.in/yaml.v3 v3.0.1`）で動作し、`$env:TMP_ORG_BOOTSTRAP`（=`$tmp`）配下の`.github/workflows/`を読み、**public worktree側のファイルは読まない**。失敗時は`go test`がexit 1で、`finally`の後続処理を止めない（throwされない）。検証後`git -C $tmp diff --stat`は6 workflowのみ（Step 5で再確認）。一時`_test.go`は`finally`で削除済み（residue 0、commit対象外）。
 
 - [ ] **Step 5: diffのscopeを検証する**
 
@@ -436,6 +452,8 @@ base（post-SHA）とfeature（Task 1後HEAD）の各6 fileについて、`on.pu
 
 `git show $postSha`を使う前に、`Misaki-Project/mk:Misaki-develop`を`git fetch`で取得し、`FETCH_HEAD`が`$postSha`と一致することを確認する。fetchは**remote-tracking branchを作らずFETCH_HEADのみ**へ取得する（`git fetch <URL> refs/heads/Misaki-develop`形式。`refs/remotes/...`を作るfetch指定にしない）。local branch/refは変更しない。
 
+`gopkg.in/yaml.v3`は**モジュール内パッケージからのimportでしか解決できない**（module外の単体ファイル`go run file.go`は`undefined: yaml`で失敗する）。そのため、公開feature worktreeのモジュール内部（`internal/entitycompat`）に一時`_test.go`を置き、`go test`で**worktree自身のモジュールcontext**から実行する。base/featureの6 fileは`git cat-file blob`でバイト列のまま`$env:TEMP`へ展開し（PowerShellの`git show | Set-Content`パイプラインはCRLFを混入させ得るため使わない）、テストは`$env:TMP_PRFILTER_CMP`（=`$env:TEMP`）配下の`base_*`/`feat_*`を読む。yaml.v3は`\r`を制御文字として拒否するため、テスト内で`\r`を除去してからパースする（LF相当に正規化。base/feature両側へ等しく適用されるので一致判定には影響しない）。検証が成功/失敗いずれでも`finally`で一時`_test.go`と`$env:TEMP`の`base_*`/`feat_*`を削除する（residue 0）。一時`_test.go`は`git add`しない（commit対象に含めない）。
+
 Run:
 ```powershell
 $featureHead = git rev-parse HEAD
@@ -448,30 +466,37 @@ Write-Output "FETCH_HEAD=$fetchHead"
 if ($fetchHead -ne $postSha) { throw "FETCH_HEAD mismatch: $fetchHead != $postSha" }
 $files = @('ci.yml','diff-e2e.yml','docker.yml','dropin-e2e.yml','playwright.yml','upstream-backend-e2e.yml')
 foreach ($f in $files) {
-  git show "$postSha`:.github/workflows/$f" | Set-Content -Path "$env:TEMP\base_$f" -Encoding utf8
-  git show "HEAD`:.github/workflows/$f" | Set-Content -Path "$env:TEMP\feat_$f" -Encoding utf8
+  $baseBlob = git rev-parse "$postSha`:.github/workflows/$f"
+  $featBlob = git rev-parse "HEAD`:.github/workflows/$f"
+  git cat-file blob $baseBlob > "$env:TEMP\base_$f"
+  git cat-file blob $featBlob > "$env:TEMP\feat_$f"
 }
-$cmp = @'
-package main
+$env:TMP_PRFILTER_CMP = $env:TEMP
+$testFile = @'
+package entitycompat
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"testing"
 
 	"gopkg.in/yaml.v3"
 )
 
-func branches(path string) []string {
+func branches(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Printf("READ-ERR %s: %v\n", path, err)
-		os.Exit(2)
+		return nil, err
 	}
+	// yaml.v3 rejects bare CR control characters; normalize CRLF/CR to LF.
+	// Applied identically to both base and feature inputs, so the comparison
+	// remains unaffected.
+	content := strings.ReplaceAll(string(data), "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
 	var doc map[string]interface{}
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		fmt.Printf("YAML-ERR %s: %v\n", path, err)
-		os.Exit(2)
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+		return nil, err
 	}
 	on, _ := doc["on"].(map[string]interface{})
 	pr, _ := on["pull_request"].(map[string]interface{})
@@ -482,7 +507,7 @@ func branches(path string) []string {
 			out = append(out, s)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func equal(a, b []string) bool {
@@ -497,34 +522,46 @@ func equal(a, b []string) bool {
 	return true
 }
 
-func main() {
-	dir := os.Args[1]
-	files := []string{"ci.yml", "diff-e2e.yml", "docker.yml", "dropin-e2e.yml", "playwright.yml", "upstream-backend-e2e.yml"}
-	fail := false
-	for _, f := range files {
-		base := branches(filepath.Join(dir, "base_"+f))
-		feat := branches(filepath.Join(dir, "feat_"+f))
-		if !equal(base, feat) {
-			fmt.Printf("MISMATCH %s base=%v feat=%v\n", f, base, feat)
-			fail = true
-		} else {
-			fmt.Printf("MATCH %s %v\n", f, base)
-		}
+func TestOrgBaseFeaturePrBranchesMatch(t *testing.T) {
+	dir := os.Getenv("TMP_PRFILTER_CMP")
+	if dir == "" {
+		t.Fatal("TMP_PRFILTER_CMP is not set")
 	}
-	if fail {
-		os.Exit(1)
+	files := []string{"ci.yml", "diff-e2e.yml", "docker.yml", "dropin-e2e.yml", "playwright.yml", "upstream-backend-e2e.yml"}
+	for _, f := range files {
+		base, err := branches(filepath.Join(dir, "base_"+f))
+		if err != nil {
+			t.Errorf("BASE-ERR %s: %v", f, err)
+			continue
+		}
+		feat, err := branches(filepath.Join(dir, "feat_"+f))
+		if err != nil {
+			t.Errorf("FEAT-ERR %s: %v", f, err)
+			continue
+		}
+		if !equal(base, feat) {
+			t.Errorf("MISMATCH %s base=%v feat=%v", f, base, feat)
+		} else {
+			t.Logf("MATCH %s %v", f, base)
+		}
 	}
 }
 '@
-Set-Content -Path "$env:TEMP\pr_filter_compare.go" -Value $cmp -Encoding utf8
-go run "$env:TEMP\pr_filter_compare.go" "$env:TEMP"
-$cmpExit = $LASTEXITCODE
-foreach ($f in $files) { Remove-Item "$env:TEMP\base_$f", "$env:TEMP\feat_$f" -Force -ErrorAction SilentlyContinue }
-Remove-Item "$env:TEMP\pr_filter_compare.go" -Force -ErrorAction SilentlyContinue
+try {
+  [System.IO.File]::WriteAllText((Join-Path $PWD.Path "internal\entitycompat\pr_filter_compare_test.go"), $testFile, (New-Object System.Text.UTF8Encoding($false)))
+  go mod download gopkg.in/yaml.v3
+  go test ./internal/entitycompat/ -run TestOrgBaseFeaturePrBranchesMatch -count=1 -v
+  $cmpExit = $LASTEXITCODE
+} finally {
+  Remove-Item Env:\TMP_PRFILTER_CMP -ErrorAction SilentlyContinue
+  foreach ($f in $files) { Remove-Item "$env:TEMP\base_$f", "$env:TEMP\feat_$f" -Force -ErrorAction SilentlyContinue }
+  Remove-Item (Join-Path $PWD.Path "internal\entitycompat\pr_filter_compare_test.go") -Force -ErrorAction SilentlyContinue
+  $env:TMP_PRFILTER_CMP = $null
+}
 Write-Output "FILTER_CMP_EXIT=$cmpExit"
 ```
 
-Expected: `FILTER_CMP_EXIT=0`。6 fileすべて`MATCH`で`on.pull_request.branches`が一致（`[main, develop, Misaki-develop]`または`[develop, main, Misaki-develop]`）。`go run`は公開feature worktreeのmodule context（`gopkg.in/yaml.v3`は直接依存）で動作し、`os.Args[1]`（=`$env:TEMP`）配下の`base_*`/`feat_*`を読む。不一致がある場合、または比較が実行できない場合はpushせず停止。
+Expected: `FILTER_CMP_EXIT=0`。6 fileすべて`MATCH`（`-v`で`branches=[main develop Misaki-develop]`または`[develop main Misaki-develop]`を出力）で`on.pull_request.branches`が一致。一時`_test.go`は公開feature worktreeのモジュール内（`internal/entitycompat`、`gopkg.in/yaml.v3`は直接依存）にあり、`go test`は**worktree自身のモジュールcontext**で動作し、`$env:TMP_PRFILTER_CMP`（=`$env:TEMP`）配下の`base_*`/`feat_*`を読む。不一致がある場合、または比較が実行できない場合はexit非0で停止（pushしない）。一時`_test.go`と`base_*`/`feat_*`は`finally`で削除済み（residue 0、commit対象外）。
 
 - [ ] **Step 2: fork feature branchをfast-forward pushする**
 

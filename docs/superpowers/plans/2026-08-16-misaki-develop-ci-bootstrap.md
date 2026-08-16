@@ -34,19 +34,21 @@
 - Consume: `docs/superpowers/specs/2026-08-16-misaki-develop-ci-bootstrap-design.md`
 
 **Interfaces:**
-- Consumes: 公開feature worktree `feature/cherrypick-compatibility-foundation-public`（HEAD `da6765b4d89521cedf9069729bcb2b4a865bf19e`、設計/計画docsはcommit済み）
+- Consumes: 公開feature worktree `feature/cherrypick-compatibility-foundation-public`（clean、設計/計画docsはcommit済み。実行開始時HEADは固定せず、Step 1で`$preFeatureHead`へ動的記録）
 - Produces: コミット`CI: Misaki-develop向けPR workflow triggerとregression testを追加する`（test + 6 workflow編集のみ。docsは含めない）
 - Produces: `TestWorkflowBranchFiltersIncludeMisakiDevelop` — `gopkg.in/yaml.v3`で6 fileの`on.pull_request.branches`をisolateし、`Misaki-develop`の包含を検証する。`on.push.branches`は見ない。
 
-- [ ] **Step 1: 事前状態を確認する**
+- [ ] **Step 1: 事前状態を確認し、実行開始時HEADを記録する**
 
 Run:
 ```powershell
 git status --short
-git rev-parse HEAD
+$preFeatureHead = git rev-parse HEAD
+Write-Output "PRE_FEATURE_HEAD=$preFeatureHead"
+git log --oneline -3
 ```
 
-Expected: worktreeはclean、HEADは`da6765b4d89521cedf9069729bcb2b4a865bf19e`。設計/計画docs（`docs/superpowers/specs/2026-08-16-misaki-develop-ci-bootstrap-design.md`等）は既にcommit済み。
+Expected: worktreeはclean。`$preFeatureHead`へ**実行開始時点の動的HEAD SHA**を記録する（本planのcommit群により実行中にHEADは前進するため、固定SHAは書かない）。`git log`で設計/計画docs（`docs/superpowers/specs/2026-08-16-misaki-develop-ci-bootstrap-design.md`、`docs/superpowers/plans/2026-08-16-misaki-develop-ci-bootstrap.md`）がHEAD履歴にcommit済みであることを確認する。歴史的なpre-NO-CHECK head `0cfeb133d98250d7f026d1ff127ba9e733503df2`は参考情報として扱い、**現在のTask 1 HEADとしては断定しない**。
 
 - [ ] **Step 2: 失敗するtestを追加する**
 
@@ -193,7 +195,7 @@ go test ./internal/entitycompat -run 'TestWorkflowBranchFiltersIncludeMisakiDeve
 go vet ./internal/entitycompat/...
 ```
 
-Expected: build成功、新test PASS、vet clean。本変更はworkflow YAMLのみでGoコードに触れないため、Goテストへの影響はない。entitycompat内のDB-backed test（`cherrypick_avatar_decoration_migration_test.go`、`note_relation_schema_test.go`）は`testutil.OpenTestDB`（testcontainers/Docker）を要するため本手順では実行しない。YAMLのみの変更ではこれらに影響しない。CI（test-shards）がカバーする。
+Expected: build成功、新test PASS、vet clean。**本taskは新規Goテストコード（`workflow_branch_filter_test.go`）を追加する**ため、上記のfocused build/test/vetは新testがコンパイル・実行可能であることを直接検証する（workflow YAMLのみの変更ではない）。entitycompat内のDB-backed test（`cherrypick_avatar_decoration_migration_test.go`、`note_relation_schema_test.go`）は`testutil.OpenTestDB`（testcontainers/Docker）を要するため本手順では実行しない。新testはそれらの実行を必要としない。DB-backed testを含むfull package実行はCI（test-shards）がカバーする。
 
 - [ ] **Step 8: commitする**
 
@@ -227,6 +229,8 @@ Expected: commit成功。**このcommitにはtest + 6 workflow編集のみを含
 - Produces: `Misaki-Project/mk:Misaki-develop`がbootstrap commitへfast-forwardされた状態（pre-SHA/post-SHAを記録）
 - Produces: default branchでのstatic workflow登録確認
 
+**実行セッション契約:** Task 2の各stepは単一のPowerShellセッションで順に実行する。`$tmp`（Step 2作成のdisposable clone dir）と`$baseRepo`はtask内で共有する意図的な状態であり、Step 3〜5・7・10で使用する。remote由来の`$preSha`はStep 6で`ls-remote`により再確認し、`$postSha`はStep 8で再取得する。複数taskに跨る変数は共有しない（Task 3は独自に再取得する）。
+
 - [ ] **Step 1: live base SHAを取得して記録する**
 
 Run:
@@ -256,9 +260,9 @@ Expected: clone成功、`$preSha`でdetached HEAD、author設定が`Misaki <6012
 
 Task 1 Step 4の表と同一の変更を、`$tmp`内の6 fileへ適用する（`on.pull_request.branches`へ`Misaki-develop`を追加。他は変更しない）。
 
-- [ ] **Step 4: YAMLを検証する**
+- [ ] **Step 4: YAMLを検証する（disposable clone内の6 fileを対象）**
 
-disposable clone内に一時的な検証スクリプトを作成し、6 fileをyaml.v3でパースして`on.pull_request.branches`に`Misaki-develop`があることを確認する。
+disposable clone内に一時的な検証スクリプトを作成し、**`$tmp`を引数で渡して**6 fileをyaml.v3でパースし、`on.pull_request.branches`に`Misaki-develop`があることを確認する。検証対象は必ず`$tmp`（disposable clone）内のファイルであり、公開feature worktree側のファイルを読まない。
 
 Run:
 ```powershell
@@ -268,22 +272,22 @@ package main
 import (
 	"fmt"
 	"os"
-
-	"gopkg.in/yaml.v3"
+	"path/filepath"
 )
 
 func main() {
+	dir := os.Args[1]
 	files := []string{
-		".github/workflows/ci.yml",
-		".github/workflows/diff-e2e.yml",
-		".github/workflows/docker.yml",
-		".github/workflows/dropin-e2e.yml",
-		".github/workflows/playwright.yml",
-		".github/workflows/upstream-backend-e2e.yml",
+		"ci.yml",
+		"diff-e2e.yml",
+		"docker.yml",
+		"dropin-e2e.yml",
+		"playwright.yml",
+		"upstream-backend-e2e.yml",
 	}
 	fail := false
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		data, err := os.ReadFile(filepath.Join(dir, ".github", "workflows", f))
 		if err != nil {
 			fmt.Printf("READ-ERR %s: %v\n", f, err)
 			fail = true
@@ -315,13 +319,13 @@ func main() {
 }
 '@
 Set-Content -Path "$tmp\bootstrap_check.go" -Value $tmpCheck -Encoding utf8
-go run "$tmp\bootstrap_check.go"
+go run "$tmp\bootstrap_check.go" "$tmp"
 $yamlExit = $LASTEXITCODE
 Remove-Item "$tmp\bootstrap_check.go" -Force
 Write-Output "YAML_CHECK_EXIT=$yamlExit"
 ```
 
-Expected: 6 fileすべて`hasMisakiDevelop=true`でexit 0。一時ファイルは削除済み（residue 0）。
+Expected: 6 fileすべて`hasMisakiDevelop=true`でexit 0。`go run`は公開feature worktreeのmodule context（`gopkg.in/yaml.v3`は直接依存）で動作し、`os.Args[1]`（=`$tmp`）配下の`.github/workflows/`を読み、**public worktree側のファイルは読まない**。一時ファイルは削除済み（residue 0）。
 
 - [ ] **Step 5: diffのscopeを検証する**
 
@@ -366,21 +370,31 @@ Write-Output "POST_SHA=$postSha"
 
 Expected: `POST_SHA`がbootstrap commitのSHA。`PRE_SHA`と異なること。両者をレポートへ記録する。
 
-- [ ] **Step 9: default branchのworkflow登録をpollする**
+- [ ] **Step 9: default branchのworkflow登録をpollする（exactly 6 workflow）**
 
 Run:
 ```powershell
 $deadline = (Get-Date).AddMinutes(5)
+$want = @(
+  '.github/workflows/ci.yml',
+  '.github/workflows/diff-e2e.yml',
+  '.github/workflows/docker.yml',
+  '.github/workflows/dropin-e2e.yml',
+  '.github/workflows/playwright.yml',
+  '.github/workflows/upstream-backend-e2e.yml'
+)
 $registered = $false
 while ((Get-Date) -lt $deadline) {
-  $names = gh api "repos/Misaki-Project/mk/actions/workflows" --jq '.workflows[].path' 2>$null
-  if ($names -match '\.github/workflows/ci\.yml') { $registered = $true; break }
+  $names = @(gh api "repos/Misaki-Project/mk/actions/workflows" --jq '.workflows[].path' 2>$null)
+  $missing = @($want | Where-Object { $names -notcontains $_ })
+  if ($missing.Count -eq 0) { $registered = $true; break }
   Start-Sleep -Seconds 15
 }
 Write-Output "STATIC_WORKFLOW_REGISTERED=$registered"
+Write-Output "MISSING=$($missing -join ', ')"
 ```
 
-Expected: `STATIC_WORKFLOW_REGISTERED=True`（`.github/workflows/ci.yml`等のstatic workflowがactions/workflows APIに現れる）。5分待っても登録されない場合は停止し、Task 3へ進まない（mergeしない）。
+Expected: `STATIC_WORKFLOW_REGISTERED=True`かつ`MISSING`が空。**exactly 6 workflowすべて**（`.github/workflows/ci.yml`、`diff-e2e.yml`、`docker.yml`、`dropin-e2e.yml`、`playwright.yml`、`upstream-backend-e2e.yml`）がactions/workflows APIに現れることを確認する。`ci.yml`だけの確認では不足。5分待っても6件すべて揃わない場合は停止し、Task 3へ進まない（mergeしない）。
 
 - [ ] **Step 10: cleanup（residue 0）**
 
@@ -414,16 +428,24 @@ Expected: disposable cloneが削除済み。作業dirに残存なし。
 - Produces: PR #2 headが新SHAへ同期された状態（base `Misaki-develop`のまま）
 - Produces: core check（`build` / `test` / `lint`）の成功確認とnon-core checkの分類
 
+**実行セッション契約:** Task 3の各stepは単一のPowerShellセッションで順に実行するが、変数の残存には依存しない。remote由来の値（`$postSha`、`$fetchHead`、`$featureHead`、`$prNumber`）は、使用する各step内で再取得・再確認する（Step 1で`$postSha`/`$fetchHead`/`$featureHead`、Step 3で`$prNumber`、Step 4で`$prNumber`再取得、Step 5で`$featureHead`再取得）。Task 1・Task 2の変数は共有しない。
+
 - [ ] **Step 1: 6 workflowの`on.pull_request.branches`がbaseと一致することを確認する**
 
 base（post-SHA）とfeature（Task 1後HEAD）の各6 fileについて、`on.pull_request.branches`をyaml.v3で抽出して比較する。ci.ymlはpostgres image version等の既存行がbase（16）とfeature（18）で異なるため**全体blob比較はしない**。`on.pull_request.branches`の一致のみを検証する。`on.push.branches`は比較しない（push filterは全workflowで未変更のため）。
 
+`git show $postSha`を使う前に、`Misaki-Project/mk:Misaki-develop`を`git fetch`で取得し、`FETCH_HEAD`が`$postSha`と一致することを確認する。fetchは**remote-tracking branchを作らずFETCH_HEADのみ**へ取得する（`git fetch <URL> refs/heads/Misaki-develop`形式。`refs/remotes/...`を作るfetch指定にしない）。local branch/refは変更しない。
+
 Run:
 ```powershell
 $featureHead = git rev-parse HEAD
-$postSha = (git ls-remote https://github.com/Misaki-Project/mk.git refs/heads/Misaki-develop | ForEach-Object { ($_ -split '\t')[0] })
 Write-Output "FEATURE_HEAD=$featureHead"
+git fetch https://github.com/Misaki-Project/mk.git refs/heads/Misaki-develop
+$fetchHead = git rev-parse FETCH_HEAD
+$postSha = (git ls-remote https://github.com/Misaki-Project/mk.git refs/heads/Misaki-develop | ForEach-Object { ($_ -split '\t')[0] })
 Write-Output "POST_SHA=$postSha"
+Write-Output "FETCH_HEAD=$fetchHead"
+if ($fetchHead -ne $postSha) { throw "FETCH_HEAD mismatch: $fetchHead != $postSha" }
 $files = @('ci.yml','diff-e2e.yml','docker.yml','dropin-e2e.yml','playwright.yml','upstream-backend-e2e.yml')
 foreach ($f in $files) {
   git show "$postSha`:.github/workflows/$f" | Set-Content -Path "$env:TEMP\base_$f" -Encoding utf8
@@ -435,6 +457,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
@@ -475,11 +498,12 @@ func equal(a, b []string) bool {
 }
 
 func main() {
+	dir := os.Args[1]
 	files := []string{"ci.yml", "diff-e2e.yml", "docker.yml", "dropin-e2e.yml", "playwright.yml", "upstream-backend-e2e.yml"}
 	fail := false
 	for _, f := range files {
-		base := branches(os.Getenv("TEMP") + "\\base_" + f)
-		feat := branches(os.Getenv("TEMP") + "\\feat_" + f)
+		base := branches(filepath.Join(dir, "base_"+f))
+		feat := branches(filepath.Join(dir, "feat_"+f))
 		if !equal(base, feat) {
 			fmt.Printf("MISMATCH %s base=%v feat=%v\n", f, base, feat)
 			fail = true
@@ -493,14 +517,14 @@ func main() {
 }
 '@
 Set-Content -Path "$env:TEMP\pr_filter_compare.go" -Value $cmp -Encoding utf8
-go run "$env:TEMP\pr_filter_compare.go"
+go run "$env:TEMP\pr_filter_compare.go" "$env:TEMP"
 $cmpExit = $LASTEXITCODE
 foreach ($f in $files) { Remove-Item "$env:TEMP\base_$f", "$env:TEMP\feat_$f" -Force -ErrorAction SilentlyContinue }
 Remove-Item "$env:TEMP\pr_filter_compare.go" -Force -ErrorAction SilentlyContinue
 Write-Output "FILTER_CMP_EXIT=$cmpExit"
 ```
 
-Expected: `FILTER_CMP_EXIT=0`。6 fileすべて`MATCH`で`on.pull_request.branches`が一致（`[main, develop, Misaki-develop]`または`[develop, main, Misaki-develop]`）。`go run`は公開feature worktreeのmodule context（`gopkg.in/yaml.v3`は直接依存）で動作する。不一致がある場合、または比較が実行できない場合はpushせず停止。
+Expected: `FILTER_CMP_EXIT=0`。6 fileすべて`MATCH`で`on.pull_request.branches`が一致（`[main, develop, Misaki-develop]`または`[develop, main, Misaki-develop]`）。`go run`は公開feature worktreeのmodule context（`gopkg.in/yaml.v3`は直接依存）で動作し、`os.Args[1]`（=`$env:TEMP`）配下の`base_*`/`feat_*`を読む。不一致がある場合、または比較が実行できない場合はpushせず停止。
 
 - [ ] **Step 2: fork feature branchをfast-forward pushする**
 
@@ -529,20 +553,25 @@ Expected: PR番号が一意で`2`。state OPEN、base `Misaki-develop`、head `M
 
 Run:
 ```powershell
+$prNumber = gh pr list --repo Misaki-Project/mk --state open --head feature/cherrypick-compatibility-foundation --json number --jq '.[] | .number'
+if (@($prNumber).Count -ne 1) { throw 'matching open PR is not unique' }
 gh pr checks --repo Misaki-Project/mk $prNumber --watch --interval 10
 ```
 
-Expected: checkが現れ、core check（`build` / `test` / `lint`）がsuccessへ至る。`--watch`が終わらない場合は一定間隔で状態を再取得し、進行を記録する。
+Expected: checkが現れ、core check（`build` / `test` / `lint`）がsuccessへ至る。`--watch`が終わらない場合は一定間隔で状態を再取得し、進行を記録する。`$prNumber`は変数の残存に依存せず、このstep内で再取得する。
 
 - [ ] **Step 5: core checkの成功を個別に確認する**
 
 Run:
 ```powershell
+$featureHead = git rev-parse HEAD
+$prNumber = gh pr list --repo Misaki-Project/mk --state open --head feature/cherrypick-compatibility-foundation --json number --jq '.[] | .number'
+if (@($prNumber).Count -ne 1) { throw 'matching open PR is not unique' }
 gh pr checks --repo Misaki-Project/mk $prNumber 2>&1
 gh api "repos/Misaki-Project/mk/commits/$featureHead/check-runs" --jq '.check_runs[] | {name, status, conclusion}'
 ```
 
-Expected: `build`、`test`、`lint`の3 checkが`conclusion=success`。**branch protection未設定でもcore checkを必須とみなす**（requiredでなくても本planのgateとする）。
+Expected: `build`、`test`、`lint`の3 checkが`conclusion=success`。**branch protection未設定でもcore checkを必須とみなす**（requiredでなくても本planのgateとする）。`$featureHead`と`$prNumber`は変数の残存に依存せず、このstep内で再取得する。
 
 - [ ] **Step 6: non-core checkを分類する**
 
@@ -572,7 +601,7 @@ Expected:
 - Organization default `Misaki-develop`、`hasIssuesEnabled=true`、parent `shiroha-a/mk`、branch一覧（develop/docker/main/Misaki-Stable/Misaki-develop）不変。
 - fork default `develop`、`hasIssuesEnabled=false`、parent `shiroha-a/mk`、branch一覧（develop/docker/featureのみ）不変。
 - 公開feature worktreeはclean、HEADがTask 1後の新SHA。local feature HEADがfork remote feature SHAと一致すること。
-- pre-bootstrap HEAD（`0cfeb133d98250d7f026d1ff127ba9e733503df2`）とfinal HEADは**異なる値**としてレポートへ記録する。
+- pre-bootstrap HEAD（Task 1 Step 1で記録した`$preFeatureHead`、実行開始時点の動的SHA）とfinal HEADは**異なる値**としてレポートへ記録する。参考情報として、本plan開始前のfork remote feature SHA `0cfeb133d98250d7f026d1ff127ba9e733503df2`をcontextとして併記してもよい（現在のHEADとして断定しない）。
 - privacy監査（branch追加行のartifact / forbidden source / operator absolute path / credentials / local path）が0であること。parent `shiroha-a/mk`は読み取り専用のまま未変更。
 - 未コミット変更・generated artifact・residue 0。
 

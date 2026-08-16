@@ -84,7 +84,7 @@ PRを作り直すわけではない。既存PR #2をそのまま使い、headを
   - 上記6 workflowと**同一の**`pull_request.branches`編集（base側とdiffで消えないように同一内容）
   - `internal/entitycompat/workflow_branch_filter_test.go`（regression test）
   - `docs/superpowers/specs/2026-08-16-misaki-develop-ci-bootstrap-design.md`（本設計）
-  - 対応するplanドキュメント
+  - `docs/superpowers/plans/2026-08-16-misaki-develop-ci-bootstrap.md`（実装plan、本設計に基づく）
 - author: `Misaki0331`。
 
 ## Base bootstrap手順
@@ -133,8 +133,10 @@ PRを作り直すわけではない。既存PR #2をそのまま使い、headを
 ### cleanup
 
 - disposable worktree/cloneを`git worktree remove`またはclone dir削除で撤去する。
-- 公開feature worktreeの`git status --short`が空、HEADが変更前（`0cfeb133d98250d7f026d1ff127ba9e733503df2`）のままであること（本設計の実装でfeature headは更新されるが、worktree作業ツリー自体はclean）。
-- 残存artifact・residue 0。
+- 公開feature worktreeの`git status --short`が空（作業ツリーがclean）であること。
+- 実装後のlocal feature HEADが、fast-forward push後のfork remote `Misaki0331/mk:feature/cherrypick-compatibility-foundation`のSHAと一致すること。
+- pre-bootstrap HEADとfinal HEADは**異なる値として記録**すること。pre-bootstrap HEADは`0cfeb133d98250d7f026d1ff127ba9e733503df2`（実装前の値）、final HEADはfeature commit追加後の新しいSHAであり、両方を報告に含める。旧HEADに留まることを要求しない。
+- 未コミット変更・generated artifact・残存residueは0であること。
 
 ### 完了条件
 

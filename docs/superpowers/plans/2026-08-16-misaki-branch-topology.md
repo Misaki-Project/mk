@@ -2,112 +2,209 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `Misaki0331/mk`へ`Misaki-Stable`と`Misaki-develop`を追加し、`Misaki-develop`をdefault branchにした上で、公開安全なCherryPick移行互換branchのIssueとPull Requestを作成する。
+**Goal:** fork `Misaki0331/mk`の誤作成状態をcleanupし、Organization `Misaki-Project/mk`へ`Misaki-Stable`と`Misaki-develop`を追加して`Misaki-develop`をdefault branchにした上で、公開安全なCherryPick移行互換feature branchのIssueとcross-fork Pull Requestを作成する。
 
-**Architecture:** repository管理操作を3段階に分離する。最初に不変の基準SHAから2 branchを作成してdefault branchを変更し、次にIssueとfeature branchを作成し、最後にPull Requestのmetadata、privacy、CIを検証する。各段階は前段のremote状態を再検証し、失敗時は後続操作を行わない。
+**Architecture:** repository管理操作を3段階に分離する。最初にforkの誤状態（default branch、誤branch、Issues、Issue #1）を事前検証付きでcleanupし、Organizationのbase branchを作成してdefault branchを変更する。次にprivacy/testsを再実行し、既存Organization Issueを更新してfork feature branchをcurrent public HEADへfast-forwardする。最後にOrganizationへcross-fork Pull Requestを作成し、metadata、privacy、CIを検証する。各段階は前段のremote状態を再検証し、失敗時は後続操作を行わない。
 
 **Tech Stack:** Git、GitHub CLI (`gh`)、PowerShell 7、GitHub Pull Requests/Issues
 
 ## Global Constraints
 
-- 対象repositoryはfork側の`Misaki0331/mk`だけとし、fork元`shiroha-a/mk`へ書き込まない。
-- `Misaki-Stable`と`Misaki-develop`は、確認済みの変更前`origin/develop` SHA `ab3bb1493ced07251a40347aa5b06c8351a5d526`から作成する。
-- 既存の`develop`と`docker`は削除せず、force-pushしない。
-- GitHubのdefault branchは`Misaki-develop`へ変更する。
-- GitHub Issuesはfork側`Misaki0331/mk`でのみ有効化する。fork元`shiroha-a/mk`は読み取り専用のままとし、Issues・その他repository設定を変更しない。
+- actorおよびlocal commit authorは`Misaki0331`のみ。Organization `Misaki-Project`はauthorになれず、Issue/PRのactorは`Misaki0331`として表示される（意図した状態）。
+- feature branch repositoryはfork `Misaki0331/mk`だけ。base branch・default branch・Issue・Pull Requestのrepositoryは`Misaki-Project/mk`。
+- fork元`shiroha-a/mk`へは一切書き込まない（読み取り専用のまま）。
+- `Misaki0331/mk`で保持するのは`feature/cherrypick-compatibility-foundation`、`develop`、`docker`のみ。default branchを`develop`へ戻し、Issuesを無効化する。
+- forkの誤作成branch削除は`Misaki-Stable`と`Misaki-develop`の2つだけ。Issue削除はfork Issue #1のみ（exact repo/title/body identity確認後）。
+- `Misaki-Project/mk`の`Misaki-Stable`と`Misaki-develop`は、`develop`のexact SHA `aebdad71ad09ac189a9433abc45559a1374d1c80`からatomicに作成する。
+- `Misaki-Project/mk`の既存`develop`、`docker`、`main`は削除せず保持する。default branchは`Misaki-develop`へ変更する。Issuesは既に有効であり、有効のまま維持する。
 - private branch `feature/cherrypick-compatibility-foundation`のlocal履歴はpushしない。
-- 公開worktreeのHEADだけをremote `feature/cherrypick-compatibility-foundation`へpushする。
+- forkの公開worktree HEADだけをremote `feature/cherrypick-compatibility-foundation`へpushする。
 - dump、credential、local evidence、production由来の値・件数・path・hash・SQLをIssue、Pull Request、commit、artifactへ含めない。
-- IssueとPull Requestのタイトル・本文は日本語にする。
-- branch protectionなど、本planで明示した操作（default branch変更、fork側Issues有効化）以外のrepository設定は変更しない。
+- IssueとPull Requestのタイトル・本文は日本語にする。Organization Issue #1の更新本文はsanitized本文のみを使用する。
+- force-push、削除対象外branchの削除、Issue #1以外のIssue削除は行わない。
+- `gh`のmutationは全て明示的な`--repo`引数を付ける。cross-fork PRのheadは`Misaki0331:feature/cherrypick-compatibility-foundation`形式を使う。
+- branch protectionなど、本planで明示した操作（fork default branch復帰・Issues無効化、fork誤branch/Issue削除、Organization branch作成・default branch変更、Issue更新、PR作成）以外のrepository設定は変更しない。
 
 ---
 
-### Task 1: Misaki branchを作成してdefault branchを変更する
+### Task 1: fork誤状態をcleanupしてOrganization base branchを作成する
 
 **Files:**
 - Consume: `docs/superpowers/specs/2026-08-16-misaki-branch-topology-design.md`
 - Modify: なし
 
 **Interfaces:**
-- Consumes: remote `origin` = `https://github.com/Misaki0331/mk.git`
-- Produces: remote branch `Misaki-Stable` at `ab3bb1493ced07251a40347aa5b06c8351a5d526`
-- Produces: remote branch `Misaki-develop` at `ab3bb1493ced07251a40347aa5b06c8351a5d526`
-- Produces: GitHub default branch `Misaki-develop`
+- Consumes: fork `Misaki0331/mk`（誤状態）、Organization `Misaki-Project/mk`
+- Produces: fork `Misaki0331/mk` の default branch `develop`・Issues無効・誤branch/Issue削除（feature/develop/dockerのみ保持）
+- Produces: Organization `Misaki-Project/mk` の `Misaki-Stable`・`Misaki-develop` at `aebdad71ad09ac189a9433abc45559a1374d1c80`、default branch `Misaki-develop`
 
-- [ ] **Step 1: remote所有者と基準branchを再確認する**
+- [ ] **Step 1: forkの誤状態を事前確認する**
 
 Run:
 
 ```powershell
-git remote get-url origin
-git ls-remote --heads origin refs/heads/develop refs/heads/docker refs/heads/Misaki-Stable refs/heads/Misaki-develop
-gh repo view Misaki0331/mk --json nameWithOwner,isFork,parent,defaultBranchRef
-gh repo view shiroha-a/mk --json nameWithOwner,defaultBranchRef
+gh repo view Misaki0331/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
+git ls-remote --heads origin refs/heads/develop refs/heads/docker refs/heads/feature/cherrypick-compatibility-foundation refs/heads/Misaki-Stable refs/heads/Misaki-develop
+gh issue view --repo Misaki0331/mk 1 --json number,title,body,state
 ```
 
 Expected:
 
-- `origin`は`Misaki0331/mk`を指す。
-- `develop`は`ab3bb1493ced07251a40347aa5b06c8351a5d526`を指す。
-- `docker`が存在する。
-- `Misaki-Stable`と`Misaki-develop`はまだ存在しない。
-- parentは`shiroha-a/mk`、default branchは`develop`。
-- fork元`shiroha-a/mk`のdefault branchも`develop`。
+- `Misaki0331/mk`のdefault branchは`Misaki-develop`（誤）、`hasIssuesEnabled`は`true`（誤）。
+- `develop`、`docker`、`feature/cherrypick-compatibility-foundation`、`Misaki-Stable`、`Misaki-develop`が存在する。
+- Issue #1が存在し、title=`Phase 1 CherryPick移行互換基盤`、state=OPEN、bodyがsanitized本文と完全一致する。
 
-いずれかが異なる場合はpushせず停止する。
+いずれかが異なる場合はcleanupせず停止する。
 
-- [ ] **Step 2: 2つのbranchを同じ基準SHAへpushする**
+- [ ] **Step 2: forkのdefault branchを`develop`へ戻す**
 
 Run:
 
 ```powershell
-git push --atomic origin ab3bb1493ced07251a40347aa5b06c8351a5d526:refs/heads/Misaki-Stable ab3bb1493ced07251a40347aa5b06c8351a5d526:refs/heads/Misaki-develop
-```
-
-Expected: 両branchが新規作成され、既存branchは更新されない。
-
-- [ ] **Step 3: branch作成結果を検証する**
-
-Run:
-
-```powershell
-git ls-remote --heads origin refs/heads/develop refs/heads/docker refs/heads/Misaki-Stable refs/heads/Misaki-develop
-```
-
-Expected:
-
-- `develop`、`Misaki-Stable`、`Misaki-develop`が全て`ab3bb1493ced07251a40347aa5b06c8351a5d526`を指す。
-- `docker`が変更されず存在する。
-
-- [ ] **Step 4: default branchを変更する**
-
-Run:
-
-```powershell
-gh repo edit Misaki0331/mk --default-branch Misaki-develop
+gh repo edit --repo Misaki0331/mk --default-branch develop
 ```
 
 Expected: exit 0。
 
-- [ ] **Step 5: default branchとfork元非変更を検証する**
+- [ ] **Step 3: forkのdefault branch復帰を検証する**
 
 Run:
 
 ```powershell
 gh repo view Misaki0331/mk --json nameWithOwner,isFork,parent,defaultBranchRef
-gh repo view shiroha-a/mk --json nameWithOwner,defaultBranchRef
 ```
 
 Expected:
 
-- `Misaki0331/mk`のdefault branchは`Misaki-develop`。
+- `Misaki0331/mk`のdefault branchは`develop`。
 - parentは引き続き`shiroha-a/mk`。
-- fork元のdefault branchは操作前から変更されていない。
+
+- [ ] **Step 4: fork Issue #1をexact identity確認後に削除する**
+
+Run:
+
+```powershell
+$issue = gh issue view --repo Misaki0331/mk 1 --json number,title,body,state
+# number==1, title=='Phase 1 CherryPick移行互換基盤', state=='OPEN', body==sanitized本文 を検査する
+# 一致しない場合は削除せず停止する
+gh issue delete --repo Misaki0331/mk 1 --yes
+```
+
+Expected: exit 0、Issue #1が削除される。
+
+- [ ] **Step 5: fork Issue #1の削除を検証する**
+
+Run:
+
+```powershell
+gh issue view --repo Misaki0331/mk 1
+```
+
+Expected: Issueが存在せず失敗（exit 1相当）。存在する場合は停止する。
+
+- [ ] **Step 6: forkのIssuesを無効化する**
+
+Run:
+
+```powershell
+gh repo edit --repo Misaki0331/mk --enable-issues=false
+```
+
+Expected: exit 0。
+
+- [ ] **Step 7: forkのIssues無効化を検証する**
+
+Run:
+
+```powershell
+gh repo view Misaki0331/mk --json nameWithOwner,defaultBranchRef,hasIssuesEnabled
+```
+
+Expected: `hasIssuesEnabled`は`false`、default branchは`develop`。
+
+- [ ] **Step 8: forkの誤作成2 branchを削除する**
+
+Run:
+
+```powershell
+git push origin --delete refs/heads/Misaki-Stable refs/heads/Misaki-develop
+```
+
+Expected: 両branchが削除される。`feature/cherrypick-compatibility-foundation`、`develop`、`docker`は削除されない。
+
+- [ ] **Step 9: forkのpost-stateを検証する**
+
+Run:
+
+```powershell
+gh repo view Misaki0331/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
+git ls-remote --heads origin refs/heads/develop refs/heads/docker refs/heads/feature/cherrypick-compatibility-foundation refs/heads/Misaki-Stable refs/heads/Misaki-develop
+```
+
+Expected:
+
+- default branchは`develop`、`hasIssuesEnabled`は`false`。
+- `develop`、`docker`、`feature/cherrypick-compatibility-foundation`のみ存在する。
+- `Misaki-Stable`と`Misaki-develop`は存在しない。
+- parentは引き続き`shiroha-a/mk`。
+
+- [ ] **Step 10: Organizationのbase stateを事前確認する**
+
+Run:
+
+```powershell
+gh repo view Misaki-Project/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
+git ls-remote https://github.com/Misaki-Project/mk.git refs/heads/develop refs/heads/docker refs/heads/main refs/heads/Misaki-Stable refs/heads/Misaki-develop
+```
+
+Expected:
+
+- `Misaki-Project/mk`の`hasIssuesEnabled`は`true`、parentは`shiroha-a/mk`。
+- `develop`は`aebdad71ad09ac189a9433abc45559a1374d1c80`、`docker`と`main`が存在する。
+- `Misaki-Stable`と`Misaki-develop`はまだ存在しない。
+
+いずれかが異なる場合はbranch作成せず停止する。
+
+- [ ] **Step 11: Organizationに2 branchをatomicに作成する**
+
+Run:
+
+```powershell
+git fetch https://github.com/Misaki-Project/mk.git refs/heads/develop
+if ((git rev-parse FETCH_HEAD) -ne 'aebdad71ad09ac189a9433abc45559a1374d1c80') { throw 'develop SHA mismatch' }
+git push --atomic https://github.com/Misaki-Project/mk.git aebdad71ad09ac189a9433abc45559a1374d1c80:refs/heads/Misaki-Stable aebdad71ad09ac189a9433abc45559a1374d1c80:refs/heads/Misaki-develop
+```
+
+Expected: 両branchが新規作成され、既存branchは更新されない。
+
+- [ ] **Step 12: Organizationのdefault branchを`Misaki-develop`へ変更する**
+
+Run:
+
+```powershell
+gh repo edit --repo Misaki-Project/mk --default-branch Misaki-develop
+```
+
+Expected: exit 0。
+
+- [ ] **Step 13: Organizationのpost-stateを検証する**
+
+Run:
+
+```powershell
+gh repo view Misaki-Project/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
+git ls-remote https://github.com/Misaki-Project/mk.git refs/heads/develop refs/heads/docker refs/heads/main refs/heads/Misaki-Stable refs/heads/Misaki-develop
+```
+
+Expected:
+
+- default branchは`Misaki-develop`、`hasIssuesEnabled`は`true`。
+- `develop`、`docker`、`main`、`Misaki-Stable`、`Misaki-develop`が全て存在する。
+- parentは引き続き`shiroha-a/mk`。
 
 ---
 
-### Task 2: 日本語Issueを作成して公開feature branchをpushする
+### Task 2: privacy/testsを再実行しOrganization Issue #1を更新してfeature branchをfast-forwardする
 
 **Files:**
 - Consume: `docs/superpowers/specs/2026-08-15-production-data-nondisclosure-design.md`
@@ -116,10 +213,10 @@ Expected:
 - Modify: なし
 
 **Interfaces:**
-- Consumes: Task 1のremote `Misaki-develop`
+- Consumes: Organization Issue #1（更新前title `Phase 1 CherryPick互換基盤`）
 - Consumes: current public worktree HEAD
-- Produces: open Issue `Phase 1 CherryPick移行互換基盤`
-- Produces: remote branch `feature/cherrypick-compatibility-foundation` = public HEAD
+- Produces: 更新済みOrganization Issue #1 `Phase 1 CherryPick移行互換基盤`
+- Produces: fork feature branch `feature/cherrypick-compatibility-foundation` = current public HEAD
 
 - [ ] **Step 1: public HEADとprivacy前提を再確認する**
 
@@ -171,35 +268,17 @@ branch-added operator absolute paths = 0
 private commit ancestry = false
 ```
 
-Expected: 全categoryが安全（operator absolute path categoryはbranch追加行のみを対象に判定する）。問題があればIssue作成・pushを行わず停止する。
+Expected: 全categoryが安全（operator absolute path categoryはbranch追加行のみを対象に判定する）。問題があればIssue更新・pushを行わず停止する。
 
-- [ ] **Step 3: fork側Issuesを有効化して検証する**
-
-Run:
-
-```powershell
-gh repo edit Misaki0331/mk --enable-issues
-gh repo view Misaki0331/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
-gh repo view shiroha-a/mk --json nameWithOwner,defaultBranchRef
-```
-
-Expected:
-
-- `gh repo edit Misaki0331/mk --enable-issues`はexit 0。
-- `Misaki0331/mk`の`hasIssuesEnabled`が`true`。
-- parentは引き続き`shiroha-a/mk`で、default branchは`Misaki-develop`のまま。
-- fork元`shiroha-a/mk`は読み取り専用のままで変更されていない。
-
-有効化・検証に失敗した場合はfeature push前に停止する。
-
-- [ ] **Step 4: 日本語Issueを作成する**
+- [ ] **Step 3: Organization Issue #1をexact identity確認後にsanitized title/bodyへ更新する**
 
 Run:
 
 ```powershell
-$existingIssueCount = [int](gh issue list --repo Misaki0331/mk --state open --search '"Phase 1 CherryPick移行互換基盤" in:title' --json number,title --jq '[.[] | select(.title == "Phase 1 CherryPick移行互換基盤")] | length')
-if ($existingIssueCount -ne 0) { throw 'matching open issue already exists' }
-gh issue create --repo Misaki0331/mk --title "Phase 1 CherryPick移行互換基盤" --body "## 背景・目的
+$issue = gh issue view --repo Misaki-Project/mk 1 --json number,title,state
+# number==1, title=='Phase 1 CherryPick互換基盤', state=='OPEN' を検査する
+# 一致しない場合は更新せず停止する
+gh issue edit --repo Misaki-Project/mk 1 --title "Phase 1 CherryPick移行互換基盤" --body "## 背景・目的
 CherryPickからmk-goへ移行する際の認証・migration互換性と、個別データを公開しない隔離検証手順を整備します。
 
 ## 作業内容
@@ -226,44 +305,44 @@ CherryPickからmk-goへ移行する際の認証・migration互換性と、個�
 - docs/superpowers/specs/2026-08-16-database-internal-orphan-repair-design.md"
 ```
 
-Expected: 新規Issue URLが返る。本文にproduction由来情報を含まない。
+Expected: exit 0、既存Issue #1が更新され、新規Issueは作成されない（複製なし）。
 
-- [ ] **Step 5: Issueを読み戻して監査する**
+- [ ] **Step 4: Organization Issue #1を読み戻して監査する**
 
 Run:
 
 ```powershell
-$issueNumber = gh issue list --repo Misaki0331/mk --state open --search '"Phase 1 CherryPick移行互換基盤" in:title' --json number,title --jq '.[] | select(.title == "Phase 1 CherryPick移行互換基盤") | .number'
+$issueNumber = gh issue list --repo Misaki-Project/mk --state open --search '"Phase 1 CherryPick移行互換基盤" in:title' --json number,title --jq '.[] | select(.title == "Phase 1 CherryPick移行互換基盤") | .number'
 if (@($issueNumber).Count -ne 1) { throw 'matching issue is not unique' }
-gh issue view --repo Misaki0331/mk $issueNumber --json number,title,body,state,url
+gh issue view --repo Misaki-Project/mk $issueNumber --json number,title,body,state,url
 ```
 
 Expected: title/bodyは日本語、stateはOPEN、privacy禁止categoryは0。
 
-- [ ] **Step 6: public HEADだけをremote feature branchへpushする**
+- [ ] **Step 5: fork feature branchをcurrent public HEADへfast-forwardする**
 
 Run:
 
 ```powershell
-git push -u origin HEAD:refs/heads/feature/cherrypick-compatibility-foundation
+git push origin HEAD:refs/heads/feature/cherrypick-compatibility-foundation
 ```
 
-Expected: remote feature branchが新規作成される。private local branchはpushされない。
+Expected: fork feature branchがcurrent public HEADへfast-forwardされる。private local branchはpushされない。既に一致していればno-op。
 
-- [ ] **Step 7: remote feature branchのSHAとbranch一覧を検証する**
+- [ ] **Step 6: fork feature branchのSHAとbranch一覧を検証する**
 
 Run:
 
 ```powershell
-git ls-remote --heads origin refs/heads/feature/cherrypick-compatibility-foundation refs/heads/Misaki-Stable refs/heads/Misaki-develop refs/heads/develop refs/heads/docker
+git ls-remote --heads origin refs/heads/feature/cherrypick-compatibility-foundation refs/heads/develop refs/heads/docker refs/heads/Misaki-Stable refs/heads/Misaki-develop
 git rev-parse HEAD
 ```
 
-Expected: remote feature SHAとlocal public HEADが一致し、5つの対象branchが存在する。
+Expected: fork feature SHAとlocal public HEADが一致し、forkには`feature/cherrypick-compatibility-foundation`、`develop`、`docker`の3 branchのみ存在する。
 
 ---
 
-### Task 3: Pull Requestを作成してCIを確認する
+### Task 3: cross-fork Pull Requestを作成してCIを確認する
 
 **Files:**
 - Consume: `docs/superpowers/specs/2026-08-16-misaki-branch-topology-design.md`
@@ -271,9 +350,9 @@ Expected: remote feature SHAとlocal public HEADが一致し、5つの対象bran
 - Modify: なし
 
 **Interfaces:**
-- Consumes: Task 2のIssue番号
-- Consumes: remote base `Misaki-develop`
-- Consumes: remote head `feature/cherrypick-compatibility-foundation`
+- Consumes: 更新済みOrganization Issue #1
+- Consumes: Organization base `Misaki-develop`
+- Consumes: fork head `Misaki0331:feature/cherrypick-compatibility-foundation`
 - Produces: open Pull Request `Phase 1 CherryPick移行互換基盤`
 - Produces: GitHub CI結果
 
@@ -282,30 +361,31 @@ Expected: remote feature SHAとlocal public HEADが一致し、5つの対象bran
 Run:
 
 ```powershell
-gh pr list --repo Misaki0331/mk --state open --head feature/cherrypick-compatibility-foundation --json number,title,baseRefName,headRefName,url
-git ls-remote --heads origin refs/heads/Misaki-develop refs/heads/feature/cherrypick-compatibility-foundation
+gh pr list --repo Misaki-Project/mk --state open --head Misaki0331:feature/cherrypick-compatibility-foundation --json number,title,baseRefName,headRefName,url
+git ls-remote https://github.com/Misaki-Project/mk.git refs/heads/Misaki-develop
+git ls-remote --heads origin refs/heads/feature/cherrypick-compatibility-foundation
 ```
 
 Expected: 同じheadのopen PRはなく、base/head SHAが取得できる。
 
-- [ ] **Step 2: Issue番号を取得する**
+- [ ] **Step 2: Organization Issue番号を取得する**
 
 Run:
 
 ```powershell
-gh issue list --repo Misaki0331/mk --state open --search '"Phase 1 CherryPick移行互換基盤" in:title' --json number,title,url
+gh issue list --repo Misaki-Project/mk --state open --search '"Phase 1 CherryPick移行互換基盤" in:title' --json number,title,url
 ```
 
 Expected: exact titleのIssueが1件だけ存在する。その番号を`$issueNumber`へ保持してStep 3で使用する。
 
-- [ ] **Step 3: 日本語Pull Requestを作成する**
+- [ ] **Step 3: 日本語cross-fork Pull Requestを作成する**
 
 Run:
 
 ```powershell
-$issueNumber = gh issue list --repo Misaki0331/mk --state open --search '"Phase 1 CherryPick移行互換基盤" in:title' --json number,title --jq '.[] | select(.title == "Phase 1 CherryPick移行互換基盤") | .number'
+$issueNumber = gh issue list --repo Misaki-Project/mk --state open --search '"Phase 1 CherryPick移行互換基盤" in:title' --json number,title --jq '.[] | select(.title == "Phase 1 CherryPick移行互換基盤") | .number'
 if (@($issueNumber).Count -ne 1) { throw 'matching issue is not unique' }
-gh pr create --repo Misaki0331/mk --base Misaki-develop --head feature/cherrypick-compatibility-foundation --title "Phase 1 CherryPick移行互換基盤" --body "## 概要
+gh pr create --repo Misaki-Project/mk --base Misaki-develop --head Misaki0331:feature/cherrypick-compatibility-foundation --title "Phase 1 CherryPick移行互換基盤" --body "## 概要
 CherryPickからmk-goへ移行するための認証・migration互換基盤と、privacyを維持する隔離検証手順を追加します。
 
 ## 主な変更点
@@ -331,45 +411,51 @@ CherryPickからmk-goへ移行するための認証・migration互換基盤と�
 Closes #$issueNumber"
 ```
 
-Expected: `Misaki-develop`向けの新規Pull Request URLが返る。
+Expected: `Misaki-Project/mk`の`Misaki-develop`向け新規cross-fork Pull Request URLが返る。
 
 - [ ] **Step 4: Pull Request metadataと本文を読み戻す**
 
 Run:
 
 ```powershell
-gh pr view --repo Misaki0331/mk feature/cherrypick-compatibility-foundation --json number,title,body,state,isDraft,baseRefName,headRefName,url,commits,files
+gh pr view --repo Misaki-Project/mk Misaki0331:feature/cherrypick-compatibility-foundation --json number,title,body,state,isDraft,baseRefName,headRefName,url,commits,files
 ```
 
 Expected:
 
 - stateはOPEN、isDraftはfalse。
-- baseは`Misaki-develop`、headは`feature/cherrypick-compatibility-foundation`。
+- baseは`Misaki-develop`、headは`Misaki0331:feature/cherrypick-compatibility-foundation`。
 - title/bodyは日本語。
 - Issue本文から取得した番号の`Closes #番号`が存在する。
 - privacy禁止categoryは0。
 
-- [ ] **Step 5: remote branchとdefault branchの最終状態を確認する**
+- [ ] **Step 5: Organizationとforkの最終repository状態を確認する**
 
 Run:
 
 ```powershell
-gh repo view Misaki0331/mk --json defaultBranchRef,hasIssuesEnabled
-git ls-remote --heads origin refs/heads/develop refs/heads/docker refs/heads/Misaki-Stable refs/heads/Misaki-develop refs/heads/feature/cherrypick-compatibility-foundation
+gh repo view Misaki-Project/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
+gh repo view Misaki0331/mk --json nameWithOwner,isFork,parent,defaultBranchRef,hasIssuesEnabled
+git ls-remote https://github.com/Misaki-Project/mk.git refs/heads/develop refs/heads/docker refs/heads/main refs/heads/Misaki-Stable refs/heads/Misaki-develop
+git ls-remote --heads origin refs/heads/develop refs/heads/docker refs/heads/feature/cherrypick-compatibility-foundation refs/heads/Misaki-Stable refs/heads/Misaki-develop
 ```
 
-Expected: default branchは`Misaki-develop`で、`hasIssuesEnabled`は`true`、既存branchと新規branchが全て存在する。
+Expected:
+
+- `Misaki-Project/mk`: default branchは`Misaki-develop`、`hasIssuesEnabled`は`true`、`develop`/`docker`/`main`/`Misaki-Stable`/`Misaki-develop`が全て存在。
+- `Misaki0331/mk`: default branchは`develop`、`hasIssuesEnabled`は`false`、`develop`/`docker`/`feature/cherrypick-compatibility-foundation`のみ存在。
+- 両repoのparentは`shiroha-a/mk`のまま。
 
 - [ ] **Step 6: CIを監視する**
 
 Run:
 
 ```powershell
-gh pr checks --repo Misaki0331/mk feature/cherrypick-compatibility-foundation --watch --interval 10
+gh pr checks --repo Misaki-Project/mk Misaki0331:feature/cherrypick-compatibility-foundation --watch --interval 10
 ```
 
 Expected: required checksが成功する。non-required checkが失敗した場合はログを確認し、branch変更との関連を判定する。required check失敗時はmergeせず、固定されたcheck名と原因categoryだけを報告する。
 
 - [ ] **Step 7: 完了結果を報告する**
 
-default branch、fork側Issues有効状態、branch作成・既存branch保持、実際のIssue URL、実際のPull Request URL、required CIの状態、privacy結果を報告する。production由来情報、local path、private branch SHA、local evidenceは報告しない。
+Organizationのdefault branch、fork default branch復帰、Organization branch作成・既存branch保持、fork誤branch/Issue削除・Issues無効化、Issues有効状態、実際のIssue URL、実際のPull Request URL、required CIの状態、privacy結果を報告する。production由来情報、local path、private branch SHA、local evidenceは報告しない。

@@ -22,7 +22,7 @@ name: Diff e2e
 
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, Misaki-develop]
     # レスポンスの値に影響しうる変更だけを対象にする。
     paths:
       - "internal/**"

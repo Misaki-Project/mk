@@ -17,7 +17,7 @@ on:
     # 将来 `v` 付きで打たれても拾えるよう両方を条件に残す。
     tags: ["[0-9]+.[0-9]+.[0-9]+", "v*"]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, Misaki-develop]
   # push 済みのタグから image を publish し直すための入口。
   #
   # `--ref <tag>` では実行できない。workflow_dispatch は **dispatch 対象の ref に

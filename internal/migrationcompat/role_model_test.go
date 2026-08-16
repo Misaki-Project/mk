@@ -78,3 +78,22 @@ func TestParseLevelPolicies_EmptyPolicies(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, got.ExperiencePolicies)
 }
+
+// TestParseLevelPolicies_NullStrictness proves a present baseLevel:null is
+// NOT silently decoded to the zero value: it must be rejected. JSON null into
+// an int field is a no-op for encoding/json, so without an explicit raw-null
+// guard a role pinned at "baseLevel:null" would be misread as base level 0.
+func TestParseLevelPolicies_BaseLevelNullRejected(t *testing.T) {
+	got, err := model.ParseLevelPolicies([]byte(`{"baseLevel":null,"experiencePolicies":[]}`))
+	require.Error(t, err, "baseLevel:null must be rejected, not treated as empty")
+	assert.Nil(t, got)
+}
+
+// TestParseLevelPolicies_ExperiencePoliciesNullRejected documents the existing
+// rejection of experiencePolicies:null: the field decodes to a nil slice and
+// the explicit nil-array guard already fails closed.
+func TestParseLevelPolicies_ExperiencePoliciesNullRejected(t *testing.T) {
+	got, err := model.ParseLevelPolicies([]byte(`{"baseLevel":0,"experiencePolicies":null}`))
+	require.Error(t, err)
+	assert.Nil(t, got)
+}

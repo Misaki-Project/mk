@@ -127,6 +127,13 @@ func (l *Lock) CheckLevelRolePreflight(ctx context.Context) error {
 	if !hasLevelPolicies || !hasExp || !hasHide || !hasCanHide {
 		return tx.Commit(ctx)
 	}
+	// 5. shape 検証と data 検証の間に同時書込が割り込まないよう role /
+	//    role_assignment を固定する (既存 CheckPreflight と同じ手順順序)。
+	//    SHARE ROW EXCLUSIVE は読み書きを両方防ぐが、他トランザクションの
+	//    SHARE 系ロックとは相容れず migration 前の書き込みを直列化する。
+	if _, err := tx.Exec(ctx, `LOCK TABLE "role", role_assignment IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return fmt.Errorf("lock level role preflight tables: %w", err)
+	}
 	checks := []struct {
 		category string
 		query    string
@@ -204,12 +211,24 @@ func (l *Lock) CheckLevelRolePreflight(ctx context.Context) error {
 							CASE WHEN jsonb_typeof(r."policies") = 'object'
 								 THEN r."policies" ELSE '{}'::jsonb END
 						) pol
+						WHERE pol.value ? 'policyAsLevel'
+						  AND jsonb_typeof(pol.value->'policyAsLevel') IS DISTINCT FROM 'array'
+					)
+					OR EXISTS (
+						SELECT 1
+						FROM jsonb_each(
+							CASE WHEN jsonb_typeof(r."policies") = 'object'
+								 THEN r."policies" ELSE '{}'::jsonb END
+						) pol
 						CROSS JOIN LATERAL jsonb_array_elements(
 							CASE WHEN jsonb_typeof(pol.value->'policyAsLevel') = 'array'
 								 THEN pol.value->'policyAsLevel' ELSE '[]'::jsonb END
 						) pa
 						WHERE pol.value ? 'policyAsLevel'
 						  AND (
+							-- present だが array でない policyAsLevel (object / string /
+							-- number / null) は上段の EXISTS で reject する。
+							-- jsonb_array_elements は array の場合にだけ実行される。
 							jsonb_typeof(pa->'type') IS DISTINCT FROM 'string'
 							OR (pa->>'type') NOT IN ('base','const','multiplier')
 							OR jsonb_typeof(pa->'level') IS DISTINCT FROM 'number'

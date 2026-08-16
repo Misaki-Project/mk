@@ -2,6 +2,8 @@ package migrationcompat
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -387,6 +389,41 @@ func TestCheckLevelRolePreflight_MalformedPolicyAsLevel(t *testing.T) {
 	}
 }
 
+// TestCheckLevelRolePreflight_NonArrayPolicyAsLevel proves a *present*
+// policyAsLevel value that is an object, string, number, or null is categorized
+// as invalid-policy-as-level rather than silently treated as an empty array.
+// 承認済み contract は「policyAsLevel が存在して array でない」を reject する
+// (present-but-non-array を空扱いしない)。jsonb_array_elements は array の
+// 場合にだけ走らせる (非 array 上で unsafe cast を実行しない)。
+func TestCheckLevelRolePreflight_NonArrayPolicyAsLevel(t *testing.T) {
+	cases := []struct {
+		name     string
+		palValue string
+	}{
+		{"object", `{"level":1,"type":"const","base":10}`},
+		{"string", `"not-an-array"`},
+		{"number", `42`},
+		{"null", `null`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := mustLevelRoleConn(t)
+			setupLevelRoleFixture(t, conn)
+			_, err := conn.Exec(context.Background(), `
+				INSERT INTO "role" (id, name, target, "levelPolicies", "policies") VALUES
+				('r1', 'Level', 'manualLevel',
+				 '{"baseLevel":0,"experiencePolicies":[]}'::jsonb,
+				 '{"canPublicNote":{"policyAsLevel":`+tc.palValue+`}}'::jsonb);
+			`)
+			require.NoError(t, err)
+			lock := &Lock{conn: conn}
+			err = lock.CheckLevelRolePreflight(context.Background())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid-policy-as-level")
+		})
+	}
+}
+
 // TestCheckLevelRolePreflight_NonObjectPolicies proves non-object role.policies
 // (JSON null / array / scalar) is detected as invalid-policy-as-level without
 // invoking jsonb_each unsafely (which would raise a raw pgx error instead of
@@ -471,7 +508,8 @@ func TestCheckLevelRolePreflightFailsClosedOnTransactionalStepError(t *testing.T
 		{"table existence check", 1, "check level role preflight tables"},
 		{"column existence check", 2, "check level role preflight columns"},
 		{"column definition read", 3, "read level role preflight columns"},
-		{"data invariant check", 4, "level role preflight query"},
+		{"table lock", 4, "lock level role preflight tables"},
+		{"data invariant check", 5, "level role preflight query"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -509,4 +547,24 @@ func TestCheckLevelRolePreflight_FixedCategoryErrorLeaksNoIdentifiers(t *testing
 		assert.NotContains(t, err.Error(), leaked, "error must not leak %q", leaked)
 	}
 	assert.Equal(t, "level role preflight: invalid-assignment-experience", err.Error())
+}
+
+// TestLevelRolePreflightLockOrdering is a source contract that mirrors the
+// existing CheckPreflight race-parity: CheckLevelRolePreflight must take a
+// SHARE ROW EXCLUSIVE table lock on role / role_assignment between the shape
+// validation and the data-invariant checks, so a concurrent writer cannot slip
+// a violating row in between the column spec read and the data SELECT. ロック
+// 文が無ければ本 test は RED になる (既存 CheckPreflight と同じ手順順序)。
+func TestLevelRolePreflightLockOrdering(t *testing.T) {
+	src := readFileOrFail(t, filepath.Join(repoRoot(t), "internal", "migrationcompat", "levelrole.go"))
+
+	shapeIdx := strings.Index(src, "checkLevelRoleColumns(ctx, tx)")
+	lockIdx := strings.Index(src, `LOCK TABLE "role", role_assignment IN SHARE ROW EXCLUSIVE MODE`)
+	dataIdx := strings.Index(src, `checks := []struct {`)
+
+	require.GreaterOrEqual(t, shapeIdx, 0, "shape-check call must exist")
+	require.GreaterOrEqual(t, lockIdx, 0, "level role preflight must lock role tables before data checks")
+	require.GreaterOrEqual(t, dataIdx, 0, "data-invariant checks must exist")
+	require.Less(t, shapeIdx, lockIdx, "table lock must come after column shape validation")
+	require.Less(t, lockIdx, dataIdx, "table lock must come before the data-invariant queries")
 }

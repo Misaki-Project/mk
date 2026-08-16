@@ -62,14 +62,25 @@ func ParseLevelPolicies(raw []byte) (*LevelPolicies, error) {
 	if err := json.Unmarshal(raw, &presence); err != nil {
 		return nil, fmt.Errorf("level policies: not a json object: %w", err)
 	}
-	if _, ok := presence["baseLevel"]; !ok {
+	baseRaw, hasBase := presence["baseLevel"]
+	if !hasBase {
 		return nil, fmt.Errorf("level policies: missing baseLevel")
 	}
 	if _, ok := presence["experiencePolicies"]; !ok {
 		return nil, fmt.Errorf("level policies: missing experiencePolicies")
 	}
-	// baseLevel は整数・experiencePolicies は配列でなければならない
-	// (1.5 / 文字列 / null / object は typed Unmarshal が拒否する)。
+	// baseLevel は integer・experiencePolicies は array でなければならない。
+	// typed Unmarshal は 1.5 / 文字列 / object を拒否するが、JSON null は
+	// int/slice フィールドへ黙って zero / nil に丸めるため、null はここで
+	// 先に reject する (baseLevel:null を base level 0 と誤読しない)。
+	// experiencePolicies:null は下の nil-array guard でも fail-closed になるが、
+	// 一貫性のため baseLevel と同系統の raw-null 検査で受け付ける。
+	if string(baseRaw) == "null" {
+		return nil, fmt.Errorf("level policies: baseLevel must be a number")
+	}
+	if string(presence["experiencePolicies"]) == "null" {
+		return nil, fmt.Errorf("level policies: experiencePolicies must be an array")
+	}
 	var lp LevelPolicies
 	if err := json.Unmarshal(raw, &lp); err != nil {
 		return nil, fmt.Errorf("level policies: invalid shape: %w", err)

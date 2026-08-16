@@ -13,6 +13,7 @@ import (
 )
 
 const upFile = "000076_cherrypick_level_role.up.sql"
+const downFile = "000076_cherrypick_level_role.down.sql"
 
 // applyUpFile executes the 000076 up migration against db.
 func applyUpFile(t *testing.T, db *gorm.DB) {
@@ -52,6 +53,16 @@ func mustColumnShape(t *testing.T, db *gorm.DB, table, column string) (dataType 
 		table, column).Row().Scan(&dataTypeRaw, &nullableRaw)
 	require.NoError(t, err)
 	return dataTypeRaw, nullableRaw == "YES"
+}
+
+// columnExists reports whether a column is present in the package schema.
+func columnExists(t *testing.T, db *gorm.DB, table, column string) bool {
+	t.Helper()
+	var count int
+	require.NoError(t, db.Raw(`SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
+		table, column).Row().Scan(&count))
+	return count == 1
 }
 
 // resetSchema drops and recreates the package schema so each subtest starts
@@ -191,4 +202,117 @@ func TestMigration076_ShapeMismatchAborts(t *testing.T) {
 
 	dt, _ := mustColumnShape(t, db, "role_assignment", "experience")
 	assert.Equal(t, "integer", dt, "migration must not auto-change a mismatched column")
+}
+
+// TestMigration076_DownRestoresPre076Shape is a DB-backed down round-trip:
+// a fresh mk-go schema (000012 role + 000076 additions) after down returns to
+// the pre-076 shape — the enum regains only manual/conditional with the
+// default restored, and the four added columns plus the self-created
+// experience index are gone.
+func TestMigration076_DownRestoresPre076Shape(t *testing.T) {
+	db, err := testutil.OpenTestDB()
+	require.NoError(t, err)
+
+	resetSchema(t, db)
+	applyAllMigrations(t, db)
+
+	require.True(t, columnExists(t, db, "role", "levelPolicies"), "up-added column must exist before down")
+	require.True(t, columnExists(t, db, "role_assignment", "experience"), "up-added column must exist before down")
+
+	require.NoError(t, db.Exec(readMigration(t, downFile)).Error, "apply %s on fresh migrated schema", downFile)
+
+	var enumLabels string
+	require.NoError(t, db.Raw(`
+		SELECT COALESCE(string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder), '')
+		FROM pg_enum e
+		JOIN pg_type t ON t.oid = e.enumtypid
+		JOIN pg_namespace n ON n.oid = t.typnamespace
+		WHERE n.nspname = current_schema() AND t.typname = 'role_target_enum'`).Row().Scan(&enumLabels))
+	assert.Equal(t, "manual,conditional", enumLabels, "manualLevel must be removed on down")
+
+	var targetDefault string
+	require.NoError(t, db.Raw(`SELECT column_default FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'role' AND column_name = 'target'`).Row().Scan(&targetDefault))
+	assert.Equal(t, "'manual'::role_target_enum", targetDefault, "target default restored to manual")
+
+	for _, tc := range []struct{ table, column string }{
+		{"role", "levelPolicies"},
+		{"role", "canHideProfileByUser"},
+		{"role_assignment", "experience"},
+		{"role_assignment", "isHideProfile"},
+	} {
+		assert.False(t, columnExists(t, db, tc.table, tc.column),
+			"column %s.%s must be absent after down", tc.table, tc.column)
+	}
+
+	var indexCount int
+	require.NoError(t, db.Raw(`SELECT count(*) FROM pg_indexes
+		WHERE schemaname = current_schema() AND tablename = 'role_assignment'
+		AND indexname = 'IDX_role_assignment_experience'`).Row().Scan(&indexCount))
+	assert.Zero(t, indexCount, "self-created experience index removed on down")
+}
+
+// TestMigration076_DownDataGuardProhibitsRollback proves the down SQL's data
+// guard fails closed when a manualLevel role exists: the fixed error is raised
+// and both the schema and the row are left untouched.
+func TestMigration076_DownDataGuardProhibitsRollback(t *testing.T) {
+	db, err := testutil.OpenTestDB()
+	require.NoError(t, err)
+
+	resetSchema(t, db)
+	applyAllMigrations(t, db)
+
+	require.NoError(t, db.Exec(`INSERT INTO "role" (id, name, target, "levelPolicies") VALUES
+		('down-guard-r1', 'Level', 'manualLevel', '{"baseLevel":0,"experiencePolicies":[]}'::jsonb)`).Error)
+
+	err = db.Exec(readMigration(t, downFile)).Error
+	require.Error(t, err, "down must be blocked when level role data exists")
+	assert.Contains(t, err.Error(), "cherrypick level role migration down: level role data present; rollback blocked")
+
+	assert.True(t, columnExists(t, db, "role", "levelPolicies"), "schema must remain intact after blocked down")
+	var count int
+	require.NoError(t, db.Raw(`SELECT count(*) FROM "role" WHERE id = 'down-guard-r1'`).Row().Scan(&count))
+	assert.Equal(t, 1, count, "the manualLevel role row must remain after blocked down")
+}
+
+// TestMigration076_DownPreservesImportedIndexAndExperience proves that on an
+// empty imported CherryPick schema, down removes only the safely-owned
+// additions while preserving the differently named CherryPick experience index
+// and, because that index still references (experience), the experience column
+// itself.
+func TestMigration076_DownPreservesImportedIndexAndExperience(t *testing.T) {
+	db, err := testutil.OpenTestDB()
+	require.NoError(t, err)
+
+	resetSchema(t, db)
+	require.NoError(t, db.Exec(cherrypickRoleDDL).Error, "create imported schema fixture")
+	applyUpFile(t, db)
+	require.NoError(t, db.Exec(readMigration(t, downFile)).Error, "apply down on empty imported schema")
+
+	var cpIndex int
+	require.NoError(t, db.Raw(`SELECT count(*) FROM pg_indexes
+		WHERE schemaname = current_schema() AND tablename = 'role_assignment'
+		AND indexname = 'IDX_3a2b1f9d4e8c0f7b5a6d2e9c4f8b3'`).Row().Scan(&cpIndex))
+	assert.Equal(t, 1, cpIndex, "CherryPick experience index must be preserved on down")
+
+	assert.True(t, columnExists(t, db, "role_assignment", "experience"),
+		"experience column must be preserved while its index references it")
+
+	for _, tc := range []struct{ table, column string }{
+		{"role", "levelPolicies"},
+		{"role", "canHideProfileByUser"},
+		{"role_assignment", "isHideProfile"},
+	} {
+		assert.False(t, columnExists(t, db, tc.table, tc.column),
+			"cleared owned addition %s.%s must be gone after down", tc.table, tc.column)
+	}
+
+	var enumLabels string
+	require.NoError(t, db.Raw(`
+		SELECT COALESCE(string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder), '')
+		FROM pg_enum e
+		JOIN pg_type t ON t.oid = e.enumtypid
+		JOIN pg_namespace n ON n.oid = t.typnamespace
+		WHERE n.nspname = current_schema() AND t.typname = 'role_target_enum'`).Row().Scan(&enumLabels))
+	assert.Equal(t, "manual,conditional", enumLabels, "manualLevel must be removed on down")
 }

@@ -59,6 +59,9 @@ func run() error {
 		if err := lock.CheckPreflight(ctx); err != nil {
 			return fmt.Errorf("migration compatibility preflight failed: %w", err)
 		}
+		if err := lock.CheckLevelRolePreflight(ctx); err != nil {
+			return fmt.Errorf("level role migration preflight failed: %w", err)
+		}
 	}
 
 	m, err := migrate.New("file://migration", dbURL)

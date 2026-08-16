@@ -330,6 +330,9 @@ func TestCheckLevelRolePreflight_MalformedExperiencePolicyJSON(t *testing.T) {
 		{"additional string", `[{"level":1,"type":"linear","base":10,"additional":"x"}]`, "invalid-experience-policy"},
 		{"exponential zero", `[{"level":1,"type":"exponential","base":10,"exponential":0}]`, "invalid-experience-policy"},
 		{"exponential negative", `[{"level":1,"type":"exponential","base":10,"exponential":-1}]`, "invalid-experience-policy"},
+		{"type missing", `[{"level":1,"base":10}]`, "invalid-experience-policy"},
+		{"type null", `[{"level":1,"type":null,"base":10}]`, "invalid-experience-policy"},
+		{"type non-string", `[{"level":1,"type":42,"base":10}]`, "invalid-experience-policy"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -361,6 +364,9 @@ func TestCheckLevelRolePreflight_MalformedPolicyAsLevel(t *testing.T) {
 		{"level zero", `[{"level":0,"type":"const","base":10}]`},
 		{"const without base", `[{"level":1,"type":"const"}]`},
 		{"multiplier base not number", `[{"level":1,"type":"multiplier","base":true,"additional":1}]`},
+		{"type missing", `[{"level":1,"base":10}]`},
+		{"type null", `[{"level":1,"type":null,"base":10}]`},
+		{"scalar element", `[5]`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -371,6 +377,38 @@ func TestCheckLevelRolePreflight_MalformedPolicyAsLevel(t *testing.T) {
 				('r1', 'Level', 'manualLevel',
 				 '{"baseLevel":0,"experiencePolicies":[{"level":1,"type":"const","base":10}]}'::jsonb,
 				 '{"canPublicNote":{"policyAsLevel":`+tc.json+`}}'::jsonb);
+			`)
+			require.NoError(t, err)
+			lock := &Lock{conn: conn}
+			err = lock.CheckLevelRolePreflight(context.Background())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid-policy-as-level")
+		})
+	}
+}
+
+// TestCheckLevelRolePreflight_NonObjectPolicies proves non-object role.policies
+// (JSON null / array / scalar) is detected as invalid-policy-as-level without
+// invoking jsonb_each unsafely (which would raise a raw pgx error instead of
+// the fixed category).
+func TestCheckLevelRolePreflight_NonObjectPolicies(t *testing.T) {
+	cases := []struct {
+		name     string
+		policies string
+	}{
+		{"json null", `'null'::jsonb`},
+		{"array", `'[1,2]'::jsonb`},
+		{"scalar string", `'"scalar"'::jsonb`},
+		{"scalar number", `'42'::jsonb`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := mustLevelRoleConn(t)
+			setupLevelRoleFixture(t, conn)
+			_, err := conn.Exec(context.Background(), `
+				INSERT INTO "role" (id, name, target, "levelPolicies", "policies") VALUES
+				('r1', 'Level', 'manualLevel',
+				 '{"baseLevel":0,"experiencePolicies":[]}'::jsonb, `+tc.policies+`);
 			`)
 			require.NoError(t, err)
 			lock := &Lock{conn: conn}

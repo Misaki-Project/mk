@@ -58,9 +58,11 @@ var levelRoleColumnSpecs = []columnSpec{
 //  1. manualLevel role だけが level data を持つこと
 //  2. levelPolicies が {baseLevel, experiencePolicies} として解釈できること
 //     (baseLevel は 0..MaxInt64 の整数)
-//  3. experience policy の type が const/linear/exponential、level/base/
-//     additional/exponential が許容範囲にあること
-//  4. policyAsLevel の構造 (type / level / base / additional) が valid であること
+//  3. experience policy の type が string かつ const/linear/exponential、
+//     level/base/additional/exponential が許容範囲にあること
+//  4. role.policies が object であること、かつ policyAsLevel の構造
+//     (type が string かつ base/const/multiplier、level / base / additional)
+//     が valid であること
 //  5. assignment experience が非負かつ Number.MAX_SAFE_INTEGER 以下
 //  6. isHideProfile=true の assignment が canHideProfileByUser=true の
 //     role を参照すること
@@ -165,7 +167,8 @@ func (l *Lock) CheckLevelRolePreflight(ctx context.Context) error {
 				) p
 				WHERE r.target = 'manualLevel'
 				  AND (
-					(p->>'type') NOT IN ('const','linear','exponential')
+					jsonb_typeof(p->'type') IS DISTINCT FROM 'string'
+					OR (p->>'type') NOT IN ('const','linear','exponential')
 					OR jsonb_typeof(p->'level') IS DISTINCT FROM 'number'
 					OR CASE WHEN jsonb_typeof(p->'level') = 'number' THEN (p->>'level')::numeric ELSE NULL END < 1
 					OR CASE WHEN jsonb_typeof(p->'level') = 'number' THEN (p->>'level')::numeric ELSE NULL END
@@ -193,22 +196,32 @@ func (l *Lock) CheckLevelRolePreflight(ctx context.Context) error {
 				SELECT 1 FROM "role" r
 				WHERE r.target = 'manualLevel'
 				  AND r."policies" IS NOT NULL
-				  AND EXISTS (
-					  SELECT 1 FROM jsonb_each(r."policies") pol
-					  WHERE pol.value ? 'policyAsLevel'
-						AND jsonb_typeof(pol.value->'policyAsLevel') = 'array'
-						AND EXISTS (
-							SELECT 1 FROM jsonb_array_elements(pol.value->'policyAsLevel') pa
-							WHERE (pa->>'type') NOT IN ('base','const','multiplier')
-							   OR jsonb_typeof(pa->'level') IS DISTINCT FROM 'number'
-							   OR CASE WHEN jsonb_typeof(pa->'level') = 'number' THEN (pa->>'level')::numeric ELSE NULL END < 1
-							   OR CASE WHEN jsonb_typeof(pa->'level') = 'number' THEN (pa->>'level')::numeric ELSE NULL END
-									!= floor(CASE WHEN jsonb_typeof(pa->'level') = 'number' THEN (pa->>'level')::numeric ELSE NULL END)
-							   OR ((pa->>'type') = 'const' AND NOT (pa ? 'base'))
-							   OR ((pa->>'type') = 'multiplier' AND (
-									jsonb_typeof(pa->'base') IS DISTINCT FROM 'number'
-									OR jsonb_typeof(pa->'additional') IS DISTINCT FROM 'number'))
+				  AND (
+					jsonb_typeof(r."policies") IS DISTINCT FROM 'object'
+					OR EXISTS (
+						SELECT 1
+						FROM jsonb_each(
+							CASE WHEN jsonb_typeof(r."policies") = 'object'
+								 THEN r."policies" ELSE '{}'::jsonb END
+						) pol
+						CROSS JOIN LATERAL jsonb_array_elements(
+							CASE WHEN jsonb_typeof(pol.value->'policyAsLevel') = 'array'
+								 THEN pol.value->'policyAsLevel' ELSE '[]'::jsonb END
+						) pa
+						WHERE pol.value ? 'policyAsLevel'
+						  AND (
+							jsonb_typeof(pa->'type') IS DISTINCT FROM 'string'
+							OR (pa->>'type') NOT IN ('base','const','multiplier')
+							OR jsonb_typeof(pa->'level') IS DISTINCT FROM 'number'
+							OR CASE WHEN jsonb_typeof(pa->'level') = 'number' THEN (pa->>'level')::numeric ELSE NULL END < 1
+							OR CASE WHEN jsonb_typeof(pa->'level') = 'number' THEN (pa->>'level')::numeric ELSE NULL END
+								 != floor(CASE WHEN jsonb_typeof(pa->'level') = 'number' THEN (pa->>'level')::numeric ELSE NULL END)
+							OR ((pa->>'type') = 'const' AND NOT (pa ? 'base'))
+							OR ((pa->>'type') = 'multiplier' AND (
+								jsonb_typeof(pa->'base') IS DISTINCT FROM 'number'
+								OR jsonb_typeof(pa->'additional') IS DISTINCT FROM 'number'))
 						)
+					)
 				  )
 			)`},
 		{levelRoleCatInvalidAssignmentExperience, fmt.Sprintf(`

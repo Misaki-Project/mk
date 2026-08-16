@@ -362,21 +362,27 @@ func TestCheckPreflightFailsClosedOnTransactionalStepError(t *testing.T) {
 }
 
 // TestMigrateMainPreflightOrdering is a source contract: cmd/migrate must call
-// CheckPreflight after Acquire, before migrate.New, and only for direction "up".
-// down 方向で preflight を呼ばないことを、呼び出し順序の形で固定する。
+// CheckPreflight and CheckLevelRolePreflight after Acquire, before migrate.New,
+// and only for direction "up". down 方向で preflight を呼ばないことを、呼び出し
+// 順序の形で固定する。level role preflight は decoration preflight の直後に
+// 並ぶ。
 func TestMigrateMainPreflightOrdering(t *testing.T) {
 	src := readFileOrFail(t, filepath.Join(repoRoot(t), "cmd", "migrate", "main.go"))
 
 	acquireIdx := strings.Index(src, "migrationcompat.Acquire(ctx, dbURL)")
 	preflightIdx := strings.Index(src, "lock.CheckPreflight(ctx)")
+	levelPreflightIdx := strings.Index(src, "lock.CheckLevelRolePreflight(ctx)")
 	migrateIdx := strings.Index(src, `migrate.New("file://migration", dbURL)`)
 	require.GreaterOrEqual(t, acquireIdx, 0, "cmd/migrate must acquire the migration lock")
 	require.GreaterOrEqual(t, preflightIdx, 0, "cmd/migrate must call lock.CheckPreflight")
+	require.GreaterOrEqual(t, levelPreflightIdx, 0, "cmd/migrate must call lock.CheckLevelRolePreflight")
 	require.GreaterOrEqual(t, migrateIdx, 0, "cmd/migrate must create the golang-migrate migrator")
 
 	require.Less(t, acquireIdx, preflightIdx, "CheckPreflight must run after Acquire")
-	require.Less(t, preflightIdx, migrateIdx, "CheckPreflight must run before migrate.New")
+	require.Less(t, preflightIdx, levelPreflightIdx, "CheckLevelRolePreflight must run after CheckPreflight")
+	require.Less(t, levelPreflightIdx, migrateIdx, "CheckLevelRolePreflight must run before migrate.New")
 	require.Contains(t, src[:preflightIdx], `if *direction == "up" {`, "CheckPreflight must sit inside the up guard")
+	require.Contains(t, src[:levelPreflightIdx], `if *direction == "up" {`, "CheckLevelRolePreflight must sit inside the up guard")
 }
 
 // repoRoot finds the module root by walking up until go.mod is found.

@@ -6,12 +6,21 @@ import (
 )
 
 // columnSpec pins one consumed column's exact type/length/nullability.
+//
+// defaultExpr が非 nil のときは information_schema.columns.column_default の
+// 完全一致 ("" は「default を持たない」を意味する) も検証する。nil なら
+// default の検証は skip する。columnDefault は DB から読んだ実測値で、
+// 照合の対象物 (expected spec) ではない。
 type columnSpec struct {
 	table    string
 	column   string
 	dataType string
 	maxLen   int // 0 = length is not constrained (jsonb)
 	nullable bool
+	// defaultExpr は期待する column_default の完全一致文字列 (nil で検証 skip)。
+	defaultExpr *string
+	// columnDefault は DB から読んだ実際の column_default 文字列。
+	columnDefault string
 }
 
 // preflightColumnSpecs is the exact schema shape CheckPreflight requires before

@@ -24,7 +24,7 @@ name: Upstream backend e2e
 
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, Misaki-develop]
     # backend の挙動・DB schema・e2e ハーネスを触る変更だけを対象にする。
     # frontend / ドキュメントのみの PR で 20 分待たされないようにする。
     paths:

@@ -39,7 +39,7 @@ name: Drop-in e2e
 
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, Misaki-develop]
     # backend の挙動・DB schema・drop-in harness を触る変更だけを対象にする。
     # ドキュメントのみの PR で待たされないようにする。
     paths:

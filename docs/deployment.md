@@ -1,5 +1,73 @@
 # デプロイ
 
+## PostgreSQL 16 → 18 への移行 (既存環境)
+
+compose 群と CI は PostgreSQL 18 に統一した (#2513)。**既存の 16 の data volume はイメージを上げるだけでは開けない** — メジャーアップグレードには dump→restore (または pg_upgrade) が必要で、そのまま起動すると `database files are incompatible` で crash loop になる。
+
+さらに `postgres:18` イメージは **data layout が変わった** (default PGDATA が `/var/lib/postgresql/18/docker`、`VOLUME` 宣言が `/var/lib/postgresql` 親ディレクトリへ)。compose 群のマウント先はこれに合わせて `/var/lib/postgresql` に変更済み。旧パス (`/var/lib/postgresql/data`) のままイメージだけ上げると、**新規デプロイでは匿名 volume 側に initdb され、`down` で全データが静かに消える**。自前 compose を使っている場合はマウント先を確認すること。
+
+既存環境の移行手順 (ダウンタイム = dump + restore の時間)。サービス名は
+`docker-compose.yml` (TCP 構成) のもの (`app` / `db`)。UDS 構成は `mkgo` /
+`postgres` に読み替える (UDS は明示 `PGDATA` なのでマウント先は旧パスのまま
+変えなくてよい):
+
+```bash
+# 0. 先に compose を 18 版 (イメージ + マウント先) へ更新しておく
+#    (git pull。ここを忘れて古い compose のまま進めると 16 で init し直すだけになる)
+
+# 1. アプリを止めて書き込みを停止 (postgres は起動したまま)
+docker compose stop app
+
+# 2. dump を取る
+docker compose exec -T db pg_dumpall -U <user> > pg16-dump.sql
+
+# 3. 全体を止め、volume 自体もバックアップしてから作り直す
+#    (tar は postgres 停止後に取る。稼働中に取ると crash-consistent ですらない)
+docker compose down
+docker run --rm -v <pg-volume>:/from -v "$PWD":/to alpine tar czf /to/pg16-data.tar.gz -C /from .
+docker volume rm <pg-volume>
+docker compose up -d db          # ここで postgres:18 が新規 initdb する
+
+# 4. restore (init が作った空 DB を落としてから dump を流す)
+docker compose exec -T db psql -U <user> -d postgres -c 'DROP DATABASE <db>;'
+docker compose exec -T db psql -U <user> -d postgres < pg16-dump.sql
+docker compose exec -T db vacuumdb -U <user> --all --analyze-in-stages
+
+# 5. アプリ再開・確認
+docker compose up -d
+```
+
+## pg_bigm (日本語の部分一致検索を高速化)
+
+pg_bigm は 2-gram の GIN インデックスで `LIKE` 部分一致を加速する PostgreSQL 拡張。mk-go の `sqlLike` 検索 (デフォルト) は upstream と同じ `lower(text) LIKE ...` 形なので、**拡張とインデックスを作るだけで provider の変更なしに** インデックスが効く (#2514)。
+
+1. pg_bigm 入りイメージを使う。UDS 構成 (`compose.uds.yaml.example`) は既定でこれをビルドする。他の構成では postgres サービスを差し替える:
+
+```yaml
+  db:
+    build:
+      context: deploy/postgres-bigm   # postgres:18-alpine + pg_bigm
+```
+
+既存の稼働環境で postgres サービスをこのイメージへ差し替えると、コンテナが recreate される (data volume は残るが短い停止を伴う)。
+
+2. 拡張とインデックスを作る (**インデックス作成は opt-in。migration には入れない** — 拡張の無い環境で落ちるため、pgroonga と同じく operator 責務)。`CREATE INDEX CONCURRENTLY` はトランザクション内で実行できないので、**2 文を別々に実行する** (`psql -c "A;B"` や `-1` でまとめると単一トランザクション扱いになりエラー):
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_bigm;
+CREATE INDEX CONCURRENTLY idx_note_text_bigm ON note USING gin (lower(text) gin_bigm_ops);
+```
+
+3. 効いていることを確認:
+
+```sql
+EXPLAIN SELECT id FROM note WHERE lower(text) LIKE '%検索語%';
+-- → Bitmap Index Scan on idx_note_text_bigm が出れば OK
+--   (小さいテーブルでは planner が seq scan を選ぶこともある)
+```
+
+`fulltextSearch.provider` は `sqlLike` のままでよい。拡張を外す場合はインデックスを落とすだけで検索自体は動き続ける (seq scan に戻る)。
+
 ## Docker Compose (TCP)
 
 最も簡単な起動方法。PostgreSQL、Redis、mk-goの3サービスをTCPで接続する。
@@ -31,7 +99,7 @@ docker compose up -d
 
 `docker-compose.yml`の構成:
 - **app**: mk-goコンテナ (ポート3000)
-- **db**: PostgreSQL 16 Alpine
+- **db**: PostgreSQL 18 Alpine
 - **redis**: Redis 7 Alpine
 
 ファイルストレージは`./files`にマウントされる。
@@ -169,7 +237,7 @@ make migrate-up
 ./built/misskey -config .config/default.yml
 ```
 
-前提条件: Go 1.26+ (ビルド時)、PostgreSQL 16+、Redis 7+。
+前提条件: Go 1.26+ (ビルド時)、PostgreSQL 18推奨 (16以降で動作、CI検証は18)、Redis 7+。
 
 設定ファイルの詳細は[設定リファレンス](configuration.md)を参照。
 

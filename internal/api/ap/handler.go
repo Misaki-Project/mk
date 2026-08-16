@@ -319,14 +319,36 @@ func (h *Handler) User(c echo.Context) error {
 		return c.NoContent(http.StatusForbidden)
 	}
 
-	// リモートユーザーへのリダイレクト相当は将来対応
-	if bundle.User.Host != nil {
+	return h.apUserInfo(c, bundle)
+}
+
+// apUserInfo serves the AP branch shared by User (/users/:id) and UserByAcct
+// (/@:acct)。upstream ActivityPubServerService.userInfo に相当する。
+func (h *Handler) apUserInfo(c echo.Context, bundle *coreuser.UserWithProfile) error {
+	// suspended は upstream の route query (isSuspended: false) 相当で、
+	// ローカル・リモートを問わず 404 (Person も redirect も返さない)。
+	if bundle.User.IsSuspended {
 		return c.NoContent(http.StatusNotFound)
+	}
+	// リモート actor は原本 URI へリダイレクトする。無いと他サーバーがこの
+	// インスタンスの URL 経由で第三サーバーの actor を解決できない (#2506、
+	// note の #2505 と同じ故障モード)。**note は 302 だが user は 301**
+	// (upstream の使い分けに合わせる)。
+	if bundle.User.Host != nil {
+		// uri が無い・host が自ホストを指すのはデータ異常。upstream と同じく
+		// 500 にする (自ホスト照合の割り切りは Note と同じ)。
+		if bundle.User.URI == nil || *bundle.User.URI == "" ||
+			(h.localHost != "" && strings.EqualFold(*bundle.User.Host, h.localHost)) {
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		return c.Redirect(http.StatusMovedPermanently, *bundle.User.URI)
 	}
 	keypair, err := h.keypairRepo.FindByUserID(bundle.User.ID)
 	if err != nil {
 		return c.NoContent(http.StatusInternalServerError)
 	}
+	// upstream と同じキャッシュ指示 (public, max-age=180)。
+	c.Response().Header().Set("Cache-Control", "public, max-age=180")
 	person := h.renderer.RenderPerson(bundle.User, bundle.Profile, keypair.PublicKey, h.lookupEd25519PublicKey(bundle.User.ID))
 	return writeActivityJSON(c, person)
 }
@@ -338,6 +360,9 @@ func (h *Handler) User(c echo.Context) error {
 // delegate to the non-AP fallback so browser reloads render the SPA
 // frontend instead of a bare 404.
 func (h *Handler) UserByAcct(c echo.Context) error {
+	// Vary: Accept は AP / browser の両分岐を持つすべての response に必要
+	// (User と同じ規約。upstream も /@:acct の先頭で立てる)。
+	c.Response().Header().Set("Vary", "Accept")
 	if !wantsActivityJSON(c.Request().Header.Get("Accept")) {
 		return h.serveNonAP(c)
 	}
@@ -347,25 +372,35 @@ func (h *Handler) UserByAcct(c echo.Context) error {
 	if h.federationDisabled() {
 		return c.NoContent(http.StatusForbidden)
 	}
-	acct := c.Param("acct")
-	// /@alice or /@alice@host 形式。ローカルのみ扱う。
+	// /@alice or /@alice@host 形式。**host 部を捨てない** (#2506) — upstream は
+	// acct の host でリモート actor を照合し、userInfo が原本へ 301 する。
+	// 捨てると /@alice@remote.example がローカルの alice の Person を返す
+	// 取り違えになる (要求した URL と id の一致しない document を配る)。
+	//
+	// 解析は upstream の Acct.parse に合わせる: 先頭の @ を 1 枚剥がし、
+	// 2 分割 (2 個目以降の @ は捨てる)。
+	acct := strings.TrimPrefix(c.Param("acct"), "@")
 	username := acct
+	var host *string
 	if idx := strings.Index(acct, "@"); idx >= 0 {
 		username = acct[:idx]
+		rest := acct[idx+1:]
+		if j := strings.Index(rest, "@"); j >= 0 {
+			rest = rest[:j]
+		}
+		// 自ホストはローカル扱いに正規化する (upstream の isSelfHost 相当)。
+		if rest != "" && !(h.localHost != "" && strings.EqualFold(rest, h.localHost)) {
+			host = &rest
+		}
 	}
-	bundle, err := h.userService.ShowByUsername(username, nil)
+	// **DB 照合のみ** (upstream と同じ)。ShowByUsername の remote fallback を
+	// 使うと、認証不要の GET が WebFinger + actor fetch の outbound を外部から
+	// 強制できる増幅面になる。
+	bundle, err := h.userService.ShowByUsernameDB(username, host)
 	if err != nil {
 		return c.NoContent(http.StatusNotFound)
 	}
-	if bundle.User.Host != nil {
-		return c.NoContent(http.StatusNotFound)
-	}
-	keypair, err := h.keypairRepo.FindByUserID(bundle.User.ID)
-	if err != nil {
-		return c.NoContent(http.StatusInternalServerError)
-	}
-	person := h.renderer.RenderPerson(bundle.User, bundle.Profile, keypair.PublicKey, h.lookupEd25519PublicKey(bundle.User.ID))
-	return writeActivityJSON(c, person)
+	return h.apUserInfo(c, bundle)
 }
 
 // writeActivityJSON serializes v and writes it with the ActivityPub
@@ -648,6 +683,10 @@ func (h *Handler) packUserForAPI(viewer *model.User, u *model.User, profile *mod
 // AP clients receive the AS Note object; browser reloads are handed
 // off to the frontend fallback so the SPA renders the note permalink.
 func (h *Handler) Note(c echo.Context) error {
+	// Vary: Accept は AP / browser の両分岐を持つすべての response に必要
+	// (upstream も /notes/:note の先頭で立てる)。302 が加わったことで、これが
+	// 無いと中間キャッシュが AP 向け 302 をブラウザに配る混線が現実になる。
+	c.Response().Header().Set("Vary", "Accept")
 	if !wantsActivityJSON(c.Request().Header.Get("Accept")) {
 		return h.serveNonAP(c)
 	}
@@ -657,15 +696,43 @@ func (h *Handler) Note(c echo.Context) error {
 		return c.NoContent(http.StatusForbidden)
 	}
 	noteID := c.Param("id")
-	// 公開ノートのみAPでフェッチ可能 (非ログインから取得されるため viewer=nil)
+	// 公開ノートのみAPでフェッチ可能 (非ログインから取得されるため viewer=nil)。
+	// CanSeeNote(nil) は public / home を通すので、upstream の
+	// visibility ∈ {public, home} フィルタと一致する。
 	n, err := h.queryService.Show(nil, noteID)
 	if err != nil {
 		return c.NoContent(http.StatusNotFound)
 	}
-	// リモートノートはホスト元へリダイレクトすべきだが現状は404
-	if n.UserHost != nil {
+	// **localOnly は AP で serve しない** (upstream は query で localOnly: false
+	// を強制)。CanSeeNote は可視性しか見ず、連合可否である localOnly を
+	// 通してしまうため、ここで明示的に弾く。
+	if n.LocalOnly {
 		return c.NoContent(http.StatusNotFound)
 	}
+	// リモートノートは原本 URI へリダイレクトする (upstream
+	// ActivityPubServerService の /notes/:note と同じ)。これが無いと、他サーバー
+	// がこのインスタンスの URL 経由で第三サーバーの投稿を照会したとき、
+	// リダイレクトを辿って権威サーバーから取得する経路が 404 で途切れる (#2505)。
+	if n.UserHost != nil {
+		// uri が無い・userHost が自ホストを指す、はデータ異常。upstream と
+		// 同じく 500 にする (404 だと「無い」と区別できず調査の足掛かりを失う)。
+		// 空文字列も弾くのは upstream との意図的な差 (upstream は null しか見ず
+		// Location が空になる)。
+		//
+		// 自ホスト照合は素の比較 (EqualFold)。upstream の isSelfHost は puny
+		// 正規化 + port 込みだが、この分岐はデータ異常の検出であって可視性の
+		// 境界ではないので、既存の federation gate (h.localHost の比較) と
+		// 同じ割り切りに揃える。
+		if n.URI == nil || *n.URI == "" ||
+			(h.localHost != "" && strings.EqualFold(*n.UserHost, h.localHost)) {
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		// fastify の reply.redirect 既定と同じ 302。
+		return c.Redirect(http.StatusFound, *n.URI)
+	}
+	// upstream と同じキャッシュ指示 (public, max-age=180)。Vary: Accept を
+	// 立てているので AP 変種としてキャッシュされる。
+	c.Response().Header().Set("Cache-Control", "public, max-age=180")
 	note := h.renderer.RenderNote(n, h.idGen)
 	return writeActivityJSON(c, note)
 }
@@ -933,13 +1000,49 @@ func (h *Handler) Outbox(c echo.Context) error {
 	return writeActivityJSON(c, page)
 }
 
+// NoteActivity handles GET /notes/:id/activity (upstream
+// ActivityPubServerService の /notes/:note/activity、#2507)。
+//
+// renderer は Create / Announce の activity id として `<note URI>/activity` を
+// **外向きに広告している** (RenderCreate / RenderAnnounce)。この route が無いと、
+// 広告した id を dereference しに来た他サーバーが 404 を受け取る。
+func (h *Handler) NoteActivity(c echo.Context) error {
+	// upstream も vary(Accept) を立てる。この route は AP 専用で HTML 変種は
+	// 無く、Accept で分岐しない点も upstream と同じ。
+	c.Response().Header().Set("Vary", "Accept")
+	if h.federationDisabled() {
+		return c.NoContent(http.StatusForbidden)
+	}
+	n, err := h.queryService.Show(nil, c.Param("id"))
+	if err != nil {
+		return c.NoContent(http.StatusNotFound)
+	}
+	// upstream は userHost: IsNull で**ローカル専用** (リモートノートの activity
+	// はこのサーバーの発行物ではないので、redirect でなく 404)。visibility ∈
+	// {public, home} は CanSeeNote(nil) が担保し、localOnly はここで弾く
+	// (Note と同じ)。
+	if n.UserHost != nil || n.LocalOnly {
+		return c.NoContent(http.StatusNotFound)
+	}
+	author := n.User
+	if author == nil {
+		// preload が無い経路でも activity は author の ID しか使わない。
+		author = &model.User{ID: n.UserID}
+	}
+	activity := h.packOutboxActivity(author, n)
+	// 単体で返すので @context を付け直す (outbox 埋め込みでは外している)。
+	activitypub.AddContext(activity)
+	c.Response().Header().Set("Cache-Control", "public, max-age=180")
+	return writeActivityJSON(c, activity)
+}
+
 // packOutboxActivity renders an outbox item: a pure renote becomes an Announce,
 // everything else a Create (upstream packActivity, #1878)。embed するので
 // per-activity @context は外す (collection 側が持つ)。
 func (h *Handler) packOutboxActivity(author *model.User, n *model.Note) any {
 	if corenote.IsPureRenote(n) && n.RenoteID != nil && *n.RenoteID != "" {
 		if targetURI := h.renoteTargetURI(*n.RenoteID); targetURI != "" {
-			ann := h.renderer.RenderAnnounce(author, n.ID, targetURI, n.Visibility)
+			ann := h.renderer.RenderAnnounce(author, n.ID, targetURI, n.Visibility, h.idGen)
 			ann.Context = nil
 			return ann
 		}
@@ -953,6 +1056,11 @@ func (h *Handler) packOutboxActivity(author *model.User, n *model.Note) any {
 // renoteTargetURI resolves a renote target note id to its AP URI
 // (local → /notes/<id>, remote → stored uri)。
 func (h *Handler) renoteTargetURI(targetID string) string {
+	// 未配線なら解決不能として扱う (呼び出し側が Create にフォールバックする)。
+	// panic で 500 になるより shape の valid な Create を返す方が良い。
+	if h.noteRepo == nil {
+		return ""
+	}
 	t, err := h.noteRepo.FindByID(targetID)
 	if err != nil || t == nil {
 		return ""

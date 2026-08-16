@@ -7,10 +7,10 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
+	authpassword "github.com/shiroha-a/mk/internal/auth/password"
 	coreemail "github.com/shiroha-a/mk/internal/core/email"
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
 	"github.com/shiroha-a/mk/internal/server/middleware"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // generateVerifyCode returns a random 16-char hex code for email verification.
@@ -65,7 +65,7 @@ func (h *Handler) UpdateEmail(c echo.Context) error {
 	// パスワード検証。upstream Misskey TS は ApiError(meta.errors.incorrectPassword)
 	// を framework が 400 (= client error) に変換する (#885)。mk-go も
 	// drop-in 互換のため 400 に揃える (旧 mk-go は 403)。
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.Password)); err != nil {
+	if !authpassword.Verify(req.Password, *profile.Password) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "e54c1d7e-e7d6-4103-86b6-0a95069b4ad3"))
 	}
 

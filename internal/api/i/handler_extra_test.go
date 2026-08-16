@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alexedwards/argon2id"
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/core/notification"
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
@@ -72,7 +73,33 @@ func hashPassword(pw string) string {
 	return string(h)
 }
 
+// argon2PasswordHash returns a CherryPick-migration shaped Argon2id hash
+// (Task 3: verify accepts Argon2id, but writes must stay bcrypt).
+func argon2PasswordHash(t *testing.T, plain string) string {
+	t.Helper()
+	h, err := argon2id.CreateHash(plain, &argon2id.Params{
+		Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
+	})
+	require.NoError(t, err)
+	return h
+}
+
 // --- ChangePassword ---
+
+// Task 3: 現在パスワードが移行 hash (Argon2id) でも change-password が成功し、
+// 新パスワードは bcrypt で保存される (Argon2id は検証専用、生成は禁止)。
+func TestChangePassword_MigratedArgon2CurrentPasswordWritesBcrypt(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := &model.User{ID: "u1", Username: "u1"}
+	repo.Users[user.ID] = user
+	hash := argon2PasswordHash(t, "oldpass")
+	repo.Profiles[user.ID] = &model.UserProfile{UserID: user.ID, Password: &hash}
+
+	rec := postExtra(h.ChangePassword, `{"currentPassword":"oldpass","newPassword":"newpass"}`, user)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.NotNil(t, repo.Profiles[user.ID].Password)
+	require.NoError(t, bcrypt.CompareHashAndPassword([]byte(*repo.Profiles[user.ID].Password), []byte("newpass")))
+}
 
 func TestChangePassword_Success(t *testing.T) {
 	h, repo := newExtraHandler(t)

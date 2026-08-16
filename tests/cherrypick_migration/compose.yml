@@ -1,0 +1,80 @@
+name: mk-cherrypick-migration
+
+services:
+  db:
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    pull_policy: never
+    environment:
+      POSTGRES_DB: misskey
+      POSTGRES_USER: misskey
+      POSTGRES_PASSWORD: ${MK_MIGRATION_DB_PASSWORD}
+    volumes:
+      - pg18data:/var/lib/postgresql
+    networks:
+      - private
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    pull_policy: never
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks:
+      - private
+  restore:
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    pull_policy: never
+    environment:
+      PGHOST: db
+      PGDATABASE: misskey
+      PGUSER: misskey
+      PGPASSWORD: ${MK_MIGRATION_DB_PASSWORD}
+    working_dir: /backup
+    volumes:
+      - ${MK_MIGRATION_BACKUP_PATH}:/backup/source.sql.gz:ro
+    networks:
+      - private
+  aggregate:
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    pull_policy: never
+    working_dir: /runtime
+    volumes:
+      - ${MK_MIGRATION_RUNTIME_PATH}:/runtime:ro
+    networks:
+      - private
+  migration:
+    image: golang:1.26@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647
+    pull_policy: never
+    working_dir: /migration
+    environment:
+      DATABASE_URL: "postgres://misskey:${MK_MIGRATION_DB_PASSWORD}@db:5432/misskey?sslmode=disable"
+    volumes:
+      - ../../migration:/migration:ro
+      - ${MK_MIGRATION_RUNTIME_PATH}/migrate:/usr/local/bin/migrate:ro
+    networks:
+      - private
+  app:
+    image: golang:1.26@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647
+    pull_policy: never
+    working_dir: /app
+    environment:
+      MK_DB_HOST: db
+      MK_DB_DB: misskey
+      MK_DB_USER: misskey
+      MK_DB_PASS: ${MK_MIGRATION_DB_PASSWORD}
+      MK_REDIS_HOST: redis
+    volumes:
+      - ${MK_MIGRATION_RUNTIME_PATH}/misskey:/usr/local/bin/misskey:ro
+      - ${MK_MIGRATION_CONFIG_PATH}:/app/config.yml:ro
+    networks:
+      - private
+  probe:
+    image: mcr.microsoft.com/devcontainers/javascript-node:4.0.3-24-trixie@sha256:fd373e0409247e4ba0b03bcbe97419437caeaa71a8ccd835836a94a4a36820fb
+    pull_policy: never
+    volumes:
+      - ${MK_MIGRATION_RUNTIME_PATH}/probe.mjs:/probe.mjs:ro
+      - ${MK_MIGRATION_CREDENTIAL_PATH}:/run/secrets/login.json:ro
+    networks:
+      - private
+networks:
+  private:
+    internal: true
+volumes:
+  pg18data:

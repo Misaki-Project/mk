@@ -91,6 +91,8 @@ func TestUser_Success(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Contains(t, rec.Body.String(), "Person")
 	assert.Contains(t, rec.Body.String(), "alice")
+	// upstream userInfo と同じキャッシュ指示 (#2506)。
+	assert.Equal(t, "public, max-age=180", rec.Header().Get("Cache-Control"))
 }
 
 func TestUser_NotFound(t *testing.T) {
@@ -100,13 +102,48 @@ func TestUser_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-func TestUser_Remote(t *testing.T) {
+// リモート actor は原本 URI へ 301 リダイレクトする (upstream userInfo と同じ。
+// note の 302 とは status が違う点に注意、#2506)。
+func TestUser_RemoteRedirectsToOrigin(t *testing.T) {
+	h, userRepo, _, _ := newHandler(t)
+	host := "remote.example"
+	uri := "https://remote.example/users/abc"
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", Host: &host, URI: &uri}
+	c, rec := newReq(t, "id", "u1")
+	require.NoError(t, h.User(c))
+	assert.Equal(t, http.StatusMovedPermanently, rec.Code)
+	assert.Equal(t, uri, rec.Header().Get("Location"))
+	assert.Equal(t, "Accept", rec.Header().Get("Vary"))
+}
+
+// uri の無いリモート actor はデータ異常。upstream と同じく 500。
+func TestUser_RemoteWithoutURIIs500(t *testing.T) {
 	h, userRepo, _, _ := newHandler(t)
 	host := "remote.example"
 	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", Host: &host}
 	c, rec := newReq(t, "id", "u1")
 	require.NoError(t, h.User(c))
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// suspended は upstream の isSuspended: false フィルタ相当で、AP には Person も
+// redirect も返さない (ローカル・リモートとも 404)。
+func TestUser_SuspendedIsNotServedAP(t *testing.T) {
+	h, userRepo, _, keypairRepo := newHandler(t)
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", IsSuspended: true}
+	keypairRepo.items["u1"] = &model.UserKeypair{UserID: "u1", PublicKey: "PUB"}
+	c, rec := newReq(t, "id", "u1")
+	require.NoError(t, h.User(c))
 	assert.Equal(t, http.StatusNotFound, rec.Code)
+
+	host := "remote.example"
+	uri := "https://remote.example/users/abc"
+	userRepo.Users["u2"] = &model.User{
+		ID: "u2", Username: "bob", Host: &host, URI: &uri, IsSuspended: true,
+	}
+	c, rec = newReq(t, "id", "u2")
+	require.NoError(t, h.User(c))
+	assert.Equal(t, http.StatusNotFound, rec.Code, "suspended なリモートは redirect もしない")
 }
 
 func TestUser_KeypairFetchError(t *testing.T) {
@@ -405,11 +442,77 @@ func TestNote_NotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-func TestNote_Remote(t *testing.T) {
+// リモートノートは原本 URI へ 302 リダイレクトする (upstream の /notes/:note と
+// 同じ)。404 にすると、他サーバーがこのインスタンスの URL 経由で第三サーバーの
+// 投稿を照会したときに解決が途切れる (#2505、実際に本番で発生)。
+func TestNote_RemoteRedirectsToOrigin(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	host := "remote.example"
+	uri := "https://remote.example/notes/abc"
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
+		UserHost: &host, URI: &uri,
+	}
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.Note(c))
+	assert.Equal(t, http.StatusFound, rec.Code)
+	assert.Equal(t, uri, rec.Header().Get("Location"))
+	// 302 にも Vary が要る。無いと中間キャッシュが AP 向け 302 をブラウザに
+	// 配ってしまい、permalink が原本サーバーへ飛ぶ。
+	assert.Equal(t, "Accept", rec.Header().Get("Vary"))
+}
+
+// 空文字列の uri も nil と同じくデータ異常として 500。upstream は null しか
+// 見ないため Location が空の自己相対リダイレクトになるが、そちらに合わせる
+// 意味は無い。
+func TestNote_RemoteWithEmptyURIIs500(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	host := "remote.example"
+	empty := ""
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
+		UserHost: &host, URI: &empty,
+	}
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.Note(c))
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// uri の無いリモートノートはデータ異常。upstream と同じく 500 にして
+// 「無い」(404) と区別する。
+func TestNote_RemoteWithoutURIIs500(t *testing.T) {
 	h, _, noteRepo, _ := newHandler(t)
 	host := "remote.example"
 	noteRepo.Notes["n1"] = &model.Note{
 		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, UserHost: &host,
+	}
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.Note(c))
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// userHost が自ホストを指すのもデータ異常 (ローカルノートなら UserHost は nil
+// のはず)。リダイレクトするとループになり得るので upstream と同じく 500。
+func TestNote_RemoteSelfHostIs500(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	h.SetFederationGate(nil, "self.example")
+	host := "SELF.example" // 大文字小文字は無視して照合する
+	uri := "https://self.example/notes/n1"
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
+		UserHost: &host, URI: &uri,
+	}
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.Note(c))
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// **localOnly は AP で serve しない** (upstream は localOnly: false を query で
+// 強制)。連合しない指定のノートが AP で取得できると leak になる。
+func TestNote_LocalOnlyIsNotServed(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, LocalOnly: true,
 	}
 	c, rec := newReq(t, "id", "n1")
 	require.NoError(t, h.Note(c))
@@ -980,15 +1083,95 @@ func TestUserByAcct_LDJSON(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestUserByAcct_WithHostSuffix(t *testing.T) {
+// /@alice@<自ホスト> はローカル扱いに正規化する (upstream の isSelfHost 相当)。
+// 逆に**未知の host は捨てずにリモート照合する** — 捨てるとリモート acct で
+// ローカルの Person を返す取り違えになる (#2506)。
+func TestUserByAcct_SelfHostSuffixIsLocal(t *testing.T) {
 	h, userRepo, _, keypairRepo := newHandler(t)
+	h.SetFederationGate(nil, "self.example")
 	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", UsernameLower: "alice"}
 	keypairRepo.items["u1"] = &model.UserKeypair{UserID: "u1", PublicKey: "PUB"}
 
-	// /@alice@example.com — local lookup should still work (host suffix is ignored).
-	c, rec := newAcctReq(t, "application/activity+json", "alice@example.com")
+	c, rec := newAcctReq(t, "application/activity+json", "alice@SELF.example")
 	require.NoError(t, h.UserByAcct(c))
 	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), "Person")
+}
+
+// リモート acct はそのホストで照合し、原本 URI へ 301 する (#2506)。
+func TestUserByAcct_RemoteAcctRedirects(t *testing.T) {
+	h, userRepo, _, _ := newHandler(t)
+	host := "remote.example"
+	uri := "https://remote.example/users/abc"
+	userRepo.Users["u1"] = &model.User{
+		ID: "u1", Username: "alice", UsernameLower: "alice", Host: &host, URI: &uri,
+	}
+
+	c, rec := newAcctReq(t, "application/activity+json", "alice@remote.example")
+	require.NoError(t, h.UserByAcct(c))
+	assert.Equal(t, http.StatusMovedPermanently, rec.Code)
+	assert.Equal(t, uri, rec.Header().Get("Location"))
+	assert.Equal(t, "Accept", rec.Header().Get("Vary"))
+}
+
+// 未知のリモート acct (キャッシュしていない) は 404。**resolve までは行わない**
+// (ShowByUsernameDB を使う。upstream も DB 照合のみで、未認証 GET が
+// WebFinger + actor fetch の outbound を発火できてはならない、#2506)。
+func TestUserByAcct_UnknownRemoteAcctIs404(t *testing.T) {
+	h, userRepo, _, _ := newHandler(t)
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", UsernameLower: "alice"}
+
+	// ローカルに alice はいるが、acct は別ホストを指しているので取り違えない。
+	c, rec := newAcctReq(t, "application/activity+json", "alice@unknown.example")
+	require.NoError(t, h.UserByAcct(c))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// acct 解析は upstream の Acct.parse に合わせる: 先頭の @ を 1 枚剥がし、
+// 2 分割で 2 個目以降の @ は捨てる。
+func TestUserByAcct_ParsesLikeUpstreamAcct(t *testing.T) {
+	h, userRepo, _, keypairRepo := newHandler(t)
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", UsernameLower: "alice"}
+	keypairRepo.items["u1"] = &model.UserKeypair{UserID: "u1", PublicKey: "PUB"}
+	host := "remote.example"
+	uri := "https://remote.example/users/abc"
+	userRepo.Users["u2"] = &model.User{
+		ID: "u2", Username: "bob", UsernameLower: "bob", Host: &host, URI: &uri,
+	}
+
+	// /@@alice → 先頭の @ を剥がしてローカル alice。
+	c, rec := newAcctReq(t, "application/activity+json", "@alice")
+	require.NoError(t, h.UserByAcct(c))
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// /@bob@remote.example@evil → host は最初の区切りまで (remote.example)。
+	c, rec = newAcctReq(t, "application/activity+json", "bob@remote.example@evil")
+	require.NoError(t, h.UserByAcct(c))
+	assert.Equal(t, http.StatusMovedPermanently, rec.Code)
+	assert.Equal(t, uri, rec.Header().Get("Location"))
+}
+
+// 自ホスト指しのリモート user はデータ異常として 500 (Note と同じ)。
+func TestUser_RemoteSelfHostIs500(t *testing.T) {
+	h, userRepo, _, _ := newHandler(t)
+	h.SetFederationGate(nil, "self.example")
+	host := "SELF.example"
+	uri := "https://self.example/users/u1"
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", Host: &host, URI: &uri}
+	c, rec := newReq(t, "id", "u1")
+	require.NoError(t, h.User(c))
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// 空文字列の uri も nil と同じくデータ異常として 500 (Note と同じ)。
+func TestUser_RemoteWithEmptyURIIs500(t *testing.T) {
+	h, userRepo, _, _ := newHandler(t)
+	host := "remote.example"
+	empty := ""
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", Host: &host, URI: &empty}
+	c, rec := newReq(t, "id", "u1")
+	require.NoError(t, h.User(c))
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
 func TestUserByAcct_UserNotFound(t *testing.T) {
@@ -998,19 +1181,18 @@ func TestUserByAcct_UserNotFound(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-func TestUserByAcct_RemoteUser(t *testing.T) {
+// uri を持たないリモート user が返るのはデータ異常。upstream と同じく 500 に
+// する (以前はここで一律 404 にしていたが、リダイレクト対応 (#2506) に伴い
+// 「異常」(500) と「無い」(404) を区別する)。
+func TestUserByAcct_RemoteWithoutURIIs500(t *testing.T) {
 	h, userRepo, _, _ := newHandler(t)
 	host := "remote.example"
-	// The local FindByUsernameLower filter treats host=nil as "local only" so a
-	// remote user would normally be unreachable. We override the lookup here
-	// to force-return a user with Host != nil and exercise the defensive
-	// Host != nil guard in UserByAcct.
 	userRepo.FindByUsernameLowerFn = func(_ string, _ *string) (*model.User, error) {
 		return &model.User{ID: "u1", Username: "alice", UsernameLower: "alice", Host: &host}, nil
 	}
 	c, rec := newAcctReq(t, "application/activity+json", "alice")
 	require.NoError(t, h.UserByAcct(c))
-	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
 func TestUserByAcct_KeypairError(t *testing.T) {
@@ -1585,4 +1767,85 @@ func TestUser_FederationDisabled_BrowserStillRedirects(t *testing.T) {
 	c, rec := newBrowserReq(t, "id", "u1")
 	require.NoError(t, h.User(c))
 	assert.Equal(t, http.StatusFound, rec.Code, "browser path must redirect even when federation disabled")
+}
+
+// --- NoteActivity (#2507) ---
+
+// renderer が広告する <note URI>/activity の dereference 先。通常ノートは
+// Create、@context・Cache-Control・Vary 付きで返る。
+func TestNoteActivity_LocalNoteIsCreate(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	text := "hello"
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, Text: &text,
+	}
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.NoteActivity(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"Create"`)
+	assert.Contains(t, rec.Body.String(), "/notes/n1/activity")
+	assert.Contains(t, rec.Body.String(), "@context")
+	assert.Equal(t, "public, max-age=180", rec.Header().Get("Cache-Control"))
+	assert.Equal(t, "Accept", rec.Header().Get("Vary"))
+}
+
+// pure renote は Announce になる (upstream packActivity)。
+func TestNoteActivity_PureRenoteIsAnnounce(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	// renote target の解決 (renoteTargetURI) は outbox と共有の noteRepo を使う。
+	h.SetNoteRepo(noteRepo)
+	target := "t1"
+	noteRepo.Notes["t1"] = &model.Note{
+		ID: "t1", UserID: "u2", Visibility: model.NoteVisibilityPublic,
+	}
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic, RenoteID: &target,
+	}
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.NoteActivity(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"Announce"`)
+	assert.Contains(t, rec.Body.String(), "/notes/t1")
+}
+
+// upstream は userHost: IsNull のローカル専用。リモートノートの activity は
+// このサーバーの発行物ではないので、redirect でなく 404。
+func TestNoteActivity_RemoteIs404(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	host := "remote.example"
+	uri := "https://remote.example/notes/abc"
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
+		UserHost: &host, URI: &uri,
+	}
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.NoteActivity(c))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// localOnly / followers-only / 不在は 404 (upstream の query filter 相当)。
+func TestNoteActivity_HiddenNotesAre404(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	noteRepo.Notes["lo"] = &model.Note{
+		ID: "lo", UserID: "u1", Visibility: model.NoteVisibilityPublic, LocalOnly: true,
+	}
+	noteRepo.Notes["fo"] = &model.Note{
+		ID: "fo", UserID: "u1", Visibility: model.NoteVisibilityFollowers,
+	}
+	for _, id := range []string{"lo", "fo", "ghost"} {
+		c, rec := newReq(t, "id", id)
+		require.NoError(t, h.NoteActivity(c))
+		assert.Equalf(t, http.StatusNotFound, rec.Code, "id=%s", id)
+	}
+}
+
+func TestNoteActivity_FederationDisabledIs403(t *testing.T) {
+	h, _, noteRepo, _ := newHandler(t)
+	noteRepo.Notes["n1"] = &model.Note{
+		ID: "n1", UserID: "u1", Visibility: model.NoteVisibilityPublic,
+	}
+	h.SetFederationGate(apShowHostBlocker{fedDisabled: true}, "local.example")
+	c, rec := newReq(t, "id", "n1")
+	require.NoError(t, h.NoteActivity(c))
+	assert.Equal(t, http.StatusForbidden, rec.Code)
 }

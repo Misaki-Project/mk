@@ -2219,13 +2219,20 @@ func (s *Server) setupRoutes() {
 	ssrMeta := newSSRMetaHandler(
 		s.config, metaRepo, proxyAccountResolver, chunkedUploadCapability,
 		userRepo, noteRepo, pageRepo, clipRepo, flashRepo, repository.NewGalleryRepository(s.db),
+		driveFileRepo, idGen,
 	)
 	s.echo.GET("/notes/:id", func(c echo.Context) error {
+		// 同一 URL が Accept 次第で HTML / AP JSON / 302 を返すので、HTML 変種
+		// (ssrMeta 側) にも Vary が要る。閉包で立てれば両分岐に載る (#2506)。
+		c.Response().Header().Set("Vary", "Accept")
 		if prefersHTML(c) {
 			return ssrMeta.NotePage(c)
 		}
 		return apHandler.Note(c)
 	})
+	// Create / Announce の activity id (renderer が広告する <note URI>/activity)
+	// の dereference 先 (#2507)。upstream と同じくローカルノート専用。
+	s.echo.GET("/notes/:id/activity", apHandler.NoteActivity)
 	// ユーザーフィード (#2345)。upstream ClientServerService と同じく
 	// /@:user.rss / .atom / .json を返す。
 	feedHost := s.config.URL
@@ -2260,6 +2267,10 @@ func (s *Server) setupRoutes() {
 	// Fastify と違い `/@:user.rss` のようなセグメント内リテラルを解釈できない
 	// ので、ここで拡張子を見て振り分ける (#2345)。
 	s.echo.GET("/@:acct", func(c echo.Context) error {
+		// 同一 URL が Accept 次第で HTML / AP JSON / 301 を返すので、HTML 変種
+		// (ssrMeta 側) にも Vary が要る (#2506)。feed は拡張子で URL 自体が
+		// 変わるが、同じ閉包を通るので付いていて害は無い。
+		c.Response().Header().Set("Vary", "Accept")
 		if handled, err := feedH.TryServe(c, c.Param("acct")); handled {
 			return err
 		}

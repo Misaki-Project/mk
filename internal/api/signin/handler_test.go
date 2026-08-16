@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alexedwards/argon2id"
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/signin"
 	"github.com/shiroha-a/mk/internal/core/captcha"
@@ -594,4 +595,51 @@ func TestSignin_LegacyTwoFactorNotBypassed(t *testing.T) {
 	assert.Equal(t, "totp", resp["next"])
 	_, hasToken := resp["i"]
 	assert.False(t, hasToken, "2FA user must NOT receive a session token via legacy /signin")
+}
+
+// CherryPick 移行 hash (Argon2id) のログイン。bcrypt 専用の比較では弾かれる
+// 移行アカウントが legacy /api/signin でログインできることを保証する (Task 3)。
+func TestSignin_Argon2idMigratedHash(t *testing.T) {
+	h, repo := newTestHandler(t)
+	hash, err := argon2id.CreateHash("legacy-pass", &argon2id.Params{
+		Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
+	})
+	require.NoError(t, err)
+	token := "tok12345678901234"
+	user := &model.User{ID: "legacy", Username: "legacy", UsernameLower: "legacy", Token: &token}
+	repo.Users[user.ID] = user
+	repo.Profiles[user.ID] = &model.UserProfile{UserID: user.ID, Password: &hash}
+
+	rec := doPost(h.Signin, `{"username":"legacy","password":"legacy-pass"}`)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"finished":true`)
+	// 成功ログインは保存済みハッシュを書き換えない (マイグレーション互換は検証のみ)
+	require.Equal(t, hash, *repo.Profiles[user.ID].Password)
+
+	rec = doPost(h.Signin, `{"username":"legacy","password":"wrong-pass"}`)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "932c904e-9460-45b7-9ce6-7ed33be7eb2c")
+}
+
+// SigninFlow (多段階ログイン) でも移行 hash (Argon2id) が通ることの保証。
+func TestSigninFlow_Argon2idMigratedHash(t *testing.T) {
+	h, repo := newTestHandler(t)
+	hash, err := argon2id.CreateHash("legacy-pass", &argon2id.Params{
+		Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
+	})
+	require.NoError(t, err)
+	token := "tok12345678901234"
+	user := &model.User{ID: "legacy2", Username: "legacy2", UsernameLower: "legacy2", Token: &token}
+	repo.Users[user.ID] = user
+	repo.Profiles[user.ID] = &model.UserProfile{UserID: user.ID, Password: &hash}
+
+	rec := doPost(h.SigninFlow, `{"username":"legacy2","password":"legacy-pass"}`)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"finished":true`)
+	// 成功ログインは保存済みハッシュを書き換えない
+	require.Equal(t, hash, *repo.Profiles[user.ID].Password)
+
+	rec = doPost(h.SigninFlow, `{"username":"legacy2","password":"wrong-pass"}`)
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "932c904e-9460-45b7-9ce6-7ed33be7eb2c")
 }

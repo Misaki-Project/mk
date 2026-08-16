@@ -150,13 +150,14 @@ Run:
 $addedFiles = @(git diff --diff-filter=A --name-only origin/develop...HEAD)
 $artifactNameCount = @($addedFiles | Where-Object { $_ -match '(?i)(\.dump$|\.backup$|\.sql\.gz$|credential|evidence|session\.json$|password\.txt$|\.log$)' }).Count
 $forbiddenSourceCount = @(git grep -l -E 'approvedAvatarPairs|approvedPairsSQL|deterministic_data_hash' HEAD -- migration tests/cherrypick_migration/aggregate.sql tests/cherrypick_migration/verify.ps1 tests/cherrypick_migration/compose.yml docs/migration-from-cherrypick.md 2>$null).Count
-$absoluteOperatorPathCount = @(git grep -l -E '([A-Za-z]:\\Users\\[^<]|/home/[^<]+/|/Users/[^<]+/)' HEAD -- docs migration internal cmd tests/cherrypick_migration/verify.ps1 tests/cherrypick_migration/compose.yml 2>$null).Count
+$addedDiffLines = @(git diff --unified=0 origin/develop...HEAD -- docs migration internal cmd tests/cherrypick_migration/verify.ps1 tests/cherrypick_migration/compose.yml ':(exclude)docs/superpowers/plans/2026-08-16-misaki-branch-topology.md' 2>$null | Where-Object { $_ -match '^\+(?!\+\+\+)' })
+$absoluteOperatorPathCount = @($addedDiffLines | Where-Object { $_ -cmatch '([A-Za-z]:\\Users\\[^<]|/home/[^<]+/|/Users/[^<]+/)' }).Count
 go test ./internal/entitycompat -run TestCherryPickAvatarDecorationMigration -count=1
 pwsh -NoProfile -File tests/cherrypick_migration/verify.test.ps1
 if ($artifactNameCount -ne 0 -or $forbiddenSourceCount -ne 0 -or $absoluteOperatorPathCount -ne 0) { throw 'privacy category count is nonzero' }
 ```
 
-match本文は表示せず、category件数だけを判定する。
+operator absolute path gateは`origin/develop...HEAD`の**branch追加行のみ**を検査し、`git grep`によるHEAD全体走査は行わない。`$addedDiffLines`は`git diff --unified=0`の`+`始まりの追加行のみ（hunk headerの`+++`は除外）を対象とし、source path scopeは`docs`、`migration`、`internal`、`cmd`、`tests/cherrypick_migration/verify.ps1`、`tests/cherrypick_migration/compose.yml`に限定する。本planファイル自体はpathspec excludeで対象外とし（文書化したregexのself-match防止）、`tests/cherrypick_migration/verify.test.ps1`も意図的なsynthetic negative fixtureのため対象外のままとする。operator path regexは`-cmatch`（大文字小文字区別あり）で適用し、従来の`git grep -E`と同義の判定を維持する。match本文は表示せず、category件数だけを判定する。
 
 Required categories:
 
@@ -169,7 +170,7 @@ branch-added operator absolute paths = 0
 private commit ancestry = false
 ```
 
-Expected: 全categoryが安全。問題があればIssue作成・pushを行わず停止する。
+Expected: 全categoryが安全（operator absolute path categoryはbranch追加行のみを対象に判定する）。問題があればIssue作成・pushを行わず停止する。
 
 - [ ] **Step 3: 日本語Issueを作成する**
 

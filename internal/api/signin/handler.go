@@ -26,6 +26,19 @@ import (
 	"gorm.io/gorm"
 )
 
+type pendingPasswordMigration struct {
+	stored string
+	plain  string
+}
+
+const pendingPasswordMigrationKey = "signin.pendingPasswordMigration"
+
+func setPendingPasswordMigration(c echo.Context, scheme password.Scheme, verified bool, stored, plain string) {
+	if verified && scheme == password.SchemeArgon2id {
+		c.Set(pendingPasswordMigrationKey, pendingPasswordMigration{stored: stored, plain: plain})
+	}
+}
+
 // IPLogger records user IPs on successful authentication.
 type IPLogger interface {
 	Upsert(userID, ip string) error
@@ -164,10 +177,15 @@ func (h *Handler) Signin(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, errBody("932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(*req.Password)); err != nil {
+	storedPassword := *profile.Password
+	scheme, passwordOK := password.Verify(storedPassword, *req.Password)
+	setPendingPasswordMigration(c, scheme, passwordOK, storedPassword, *req.Password)
+	if !passwordOK {
 		return h.fail(c, user, http.StatusForbidden, "932c904e-9460-45b7-9ce6-7ed33be7eb2c")
 	}
-	h.maybeRehashPassword(user.ID, *profile.Password, *req.Password)
+	if scheme == password.SchemeBcrypt {
+		h.maybeRehashPassword(user.ID, storedPassword, *req.Password)
+	}
 
 	// #2106 H2 (CRITICAL): 2FA 有効ユーザーには password のみで token を発行しない。
 	// レガシー /api/signin は 2 要素を完遂できない (req に token/credential が無い)
@@ -255,9 +273,11 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, errBody("932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
-	passwordOK := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(*req.Password)) == nil
-	if passwordOK {
-		h.maybeRehashPassword(user.ID, *profile.Password, *req.Password)
+	storedPassword := *profile.Password
+	scheme, passwordOK := password.Verify(storedPassword, *req.Password)
+	setPendingPasswordMigration(c, scheme, passwordOK, storedPassword, *req.Password)
+	if passwordOK && scheme == password.SchemeBcrypt {
+		h.maybeRehashPassword(user.ID, storedPassword, *req.Password)
 	}
 
 	// CAPTCHA 検証 (password step 完了後、2FA 無しの場合のみ)。
@@ -379,6 +399,7 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 // ok returns the standard "logged in" response. 認証経路 (TOTP / WebAuthn /
 // pwd-only) すべてで同じ shape を返したいのでヘルパに切り出している。
 func (h *Handler) ok(c echo.Context, user *model.User) error {
+	h.migratePendingPassword(c, user.ID)
 	h.RecordSuccessfulSignin(user.ID, c.RealIP(), c.Request().Header.Clone())
 	token := ""
 	if user.Token != nil {
@@ -389,6 +410,30 @@ func (h *Handler) ok(c echo.Context, user *model.User) error {
 		"id":       user.ID,
 		"i":        token,
 	})
+}
+
+func (h *Handler) migratePendingPassword(c echo.Context, userID string) {
+	pending, ok := c.Get(pendingPasswordMigrationKey).(pendingPasswordMigration)
+	if !ok {
+		return
+	}
+	fresh, err := password.Hash(pending.plain)
+	if err != nil {
+		category := "hash_error"
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			category = "password_too_long"
+		}
+		slog.Warn("signin: Argon2 password migration skipped", "userId", userID, "category", category)
+		return
+	}
+	updated, err := h.userRepo.UpdatePasswordIfCurrent(userID, pending.stored, fresh)
+	if err != nil {
+		slog.Warn("signin: Argon2 password migration skipped", "userId", userID, "category", "persistence_error")
+		return
+	}
+	if !updated {
+		slog.Warn("signin: Argon2 password migration skipped", "userId", userID, "category", "concurrent_update")
+	}
 }
 
 // RecordSuccessfulSignin fires the side-effects of a successful login:

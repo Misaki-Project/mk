@@ -112,3 +112,20 @@ func TestValidatePolicyValue(t *testing.T) {
 		})
 	}
 }
+
+func TestCanDeleteAccountPolicyContract(t *testing.T) {
+	defaults := Defaults()
+	require.Equal(t, true, defaults["canDeleteAccount"])
+
+	resolver := func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+		return []plugin.EffectivePolicyContribution{{Key: "canDeleteAccount", Value: false}}, nil
+	}
+	require.NoError(t, ValidateRegistration(plugin.EffectivePolicyRegistration{
+		Keys:    []string{"canDeleteAccount"},
+		Resolve: resolver,
+	}))
+	require.True(t, ValidateContributions(
+		[]string{"canDeleteAccount"},
+		[]plugin.EffectivePolicyContribution{{Key: "canDeleteAccount", Value: false}},
+	))
+}

@@ -229,6 +229,22 @@ func TestEffectivePolicy_ProviderContributionHonored(t *testing.T) {
 	assert.Equal(t, true, p["canSearchNotes"], "default false -> provider granted true")
 }
 
+func TestEffectivePolicy_CanDeleteAccountProviderCanDeny(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+	registerProvider(t, svc, "account-policy", []string{role.PolicyCanDeleteAccount},
+		func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			return []plugin.EffectivePolicyContribution{{
+				Key:      role.PolicyCanDeleteAccount,
+				Priority: 2,
+				Value:    false,
+			}}, nil
+		})
+
+	policies, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, false, policies[role.PolicyCanDeleteAccount])
+}
+
 func TestEffectivePolicy_UseDefaultFallsBackToNative(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
 	registerProvider(t, svc, "p", []string{"canSearchNotes"}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {

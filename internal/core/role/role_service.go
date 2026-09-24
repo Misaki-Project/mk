@@ -224,6 +224,10 @@ const (
 	// 値を見る pattern (空文字 userID で同等)。
 	PolicyLtlAvailable = "ltlAvailable"
 	PolicyGtlAvailable = "gtlAvailable"
+
+	// PolicyCanDeleteAccount gates a user's own i/delete-account request. Unlike
+	// HasRolePolicy consumers, this policy does not grant administrators a bypass.
+	PolicyCanDeleteAccount = "canDeleteAccount"
 )
 
 // roleCacheTTL は GetUserRoles キャッシュの有効期限。Misskey TS 同等の

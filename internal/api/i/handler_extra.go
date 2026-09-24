@@ -14,6 +14,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/notehide"
 	"github.com/shiroha-a/mk/internal/api/pagination"
 	"github.com/shiroha-a/mk/internal/core/notification"
+	"github.com/shiroha-a/mk/internal/core/role"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc"
 	"github.com/shiroha-a/mk/internal/misc/achievement"
@@ -126,6 +127,27 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 // DeleteAccount handles POST /api/i/delete-account.
 func (h *Handler) DeleteAccount(c echo.Context) error {
 	u := middleware.GetUser(c)
+
+	// Resolve the effective canDeleteAccount policy before touching credentials
+	// or 2FA. Checked resolution fails closed: an unwired provider or a provider
+	// error yields 500, never an implicit allow. No administrator bypass — a
+	// resolved deny (or a non-bool / missing value) is 403 for everyone.
+	checked, ok := h.roleProvider.(checkedRoleProvider)
+	if !ok {
+		slog.Error("i/delete-account: checked role provider is not wired")
+		return apierr.JSONInternalError(c)
+	}
+	policies, err := checked.GetUserPoliciesChecked(u.ID)
+	if err != nil {
+		// Keep plugin / policy / credential detail out of the log.
+		slog.Error("i/delete-account: cannot resolve effective policies", "err", err)
+		return apierr.JSONInternalError(c)
+	}
+	allowed, valid := policies[role.PolicyCanDeleteAccount].(bool)
+	if !valid || !allowed {
+		return apierr.JSONRolePermissionDenied(c)
+	}
+
 	var req struct {
 		Password string `json:"password"`
 		Token    string `json:"token"`

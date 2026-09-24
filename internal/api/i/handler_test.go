@@ -547,6 +547,7 @@ type stubRoleProvider struct {
 	silenced  bool
 	roles     []*model.Role
 	policies  map[string]any
+	policyErr error
 }
 
 func (s *stubRoleProvider) IsAdministrator(_ string) bool { return s.admin }
@@ -560,6 +561,14 @@ func (s *stubRoleProvider) GetUserPolicies(_ string) map[string]any {
 		return s.policies
 	}
 	return map[string]any{}
+}
+
+// GetUserPoliciesChecked mirrors role.Service.GetUserPoliciesChecked: it returns
+// the same effective map as GetUserPolicies plus any injected resolution error.
+// Intentionally does NOT apply the admin bypass (the checked resolver used by
+// i/delete-account must not let administrators through).
+func (s *stubRoleProvider) GetUserPoliciesChecked(userID string) (map[string]any, error) {
+	return s.GetUserPolicies(userID), s.policyErr
 }
 
 // HasRolePolicy mirrors core/role.Service: admin / moderator は常に true、

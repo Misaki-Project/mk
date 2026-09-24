@@ -1,7 +1,6 @@
 package repository
 
 import (
-	"errors"
 	"regexp"
 	"strings"
 	"time"
@@ -68,11 +67,19 @@ type UserRepository interface {
 	SearchByUsernameAndHost(query string, host *string, localOnly bool, limit int) ([]*model.User, error)
 	UpdateUser(userID string, fields map[string]any) error
 	UpdateProfile(userID string, fields map[string]any) error
+	// UpdatePasswordIfCurrent replaces a profile password only when the stored
+	// hash still equals currentHash. The bool reports whether one row changed.
+	UpdatePasswordIfCurrent(userID, currentHash, newHash string) (bool, error)
+	// RemoveBackupCode atomically deletes one single-use 2FA backup code.
+	RemoveBackupCode(userID, code string) error
 	CreateProfile(profile *model.UserProfile) error
 	ListUsers(filter model.UserListFilter) ([]*model.User, error)
 	ListRemoteInboxes() ([]model.RemoteInbox, error)
 	FindProfileByVerifyCode(code string) (*model.UserProfile, error)
 	FindProfileByEmail(email string) (*model.UserProfile, error)
+	// EmailVerifiedInUse reports whether a confirmed account already uses
+	// the address. 登録・変更の**書き込み側**で使う。
+	EmailVerifiedInUse(email string) (bool, error)
 	CountOnlineUsers() (int64, error)
 	// CountLocalUsers returns the number of non-deleted local users, used by
 	// nodeinfo `usage.users.total` (#403).
@@ -118,6 +125,9 @@ func (r *userRepository) Create(u *model.User) error {
 }
 
 func (r *userRepository) FindByID(id string) (*model.User, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var user model.User
 	if err := r.db.First(&user, "id = ?", id).Error; err != nil {
 		return nil, err
@@ -126,6 +136,9 @@ func (r *userRepository) FindByID(id string) (*model.User, error) {
 }
 
 func (r *userRepository) FindByURI(uri string) (*model.User, error) {
+	if !storable(uri) {
+		return nil, ErrNotFound
+	}
 	var user model.User
 	if err := r.db.Where("uri = ?", uri).First(&user).Error; err != nil {
 		return nil, err
@@ -134,6 +147,9 @@ func (r *userRepository) FindByURI(uri string) (*model.User, error) {
 }
 
 func (r *userRepository) FindByToken(token string) (*model.User, error) {
+	if !storable(token) {
+		return nil, ErrNotFound
+	}
 	var user model.User
 	if err := r.db.Where("token = ?", token).First(&user).Error; err != nil {
 		return nil, err
@@ -142,6 +158,9 @@ func (r *userRepository) FindByToken(token string) (*model.User, error) {
 }
 
 func (r *userRepository) FindByUsernameLower(username string, host *string) (*model.User, error) {
+	if !storable(username) || (host != nil && !storable(*host)) {
+		return nil, ErrNotFound
+	}
 	if host == nil {
 		var user model.User
 		if err := r.db.Where("\"usernameLower\" = lower(?)", username).
@@ -150,71 +169,36 @@ func (r *userRepository) FindByUsernameLower(username string, host *string) (*mo
 		}
 		return &user, nil
 	}
-	// 完全一致 → 正規化形の順に引く。1 つ目で当たれば 2 回目は投げないが、
-	// **miss のときは候補の数だけ投げる** (正規化形が生と違うときだけ 2 回)。
-	var lastErr error
-	for _, h := range hostCandidates(*host) {
-		// **dest はループごとに作る。** GORM の `First` は dest の primary key が
-		// 非ゼロだとそれを条件に足すので、使い回すと 2 回目が 1 回目の行の id に
-		// 縛られる。今は 1 回目が not-found ならゼロのままだが、候補が増えたり
-		// 部分 scan する変更で発火する。
-		var user model.User
-		err := r.db.Where("\"usernameLower\" = lower(?)", username).
-			Where("host = ?", h).First(&user).Error
-		if err == nil {
-			return &user, nil
-		}
-		// **not-found 以外は次を試さない。** 接続断などを次の試行の結果で
-		// 上書きすると、呼び出し側には record-not-found に見える。
-		// `ShowByUsername` はそれを DB miss と解釈して WebFinger へ落ちるので、
-		// DB の一過性障害が outbound 増幅に化ける。
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-		lastErr = err
+	// **引く前に正規化する (#2704)。** 呼び出し側は正規化されていない形で来る
+	// ことがある (フロントの mention リンクは `toUnicode(host)` で URL を組むし、
+	// 投稿本文の mention は書き手が打ったまま)。保存側も #2706 で同じ正規化を
+	// 掛けるので、正規形どうしの完全一致で引ける。
+	//
+	// **host の述語は `hostMatch` に一本化する。** 2 箇所で組むと片方だけ直す事故に
+	// なる (ポートの扱いを足すときに実際に踏む形)。
+	var user model.User
+	q := hostMatch(r.db.Where(`"usernameLower" = lower(?)`, username), *host)
+	if err := q.First(&user).Error; err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	return &user, nil
 }
 
-// hostMatch scopes a user query to one host, matching both the normalized
-// (punycode, lowercase) form and the string as given.
+// hostMatch scopes a user query to one host.
 //
-// **正規化形だけに当てると回帰する。** 呼び出し側は正規化されていない形で来る
-// ことがある (フロントの mention リンクは `toUnicode(host)` で URL を組むし、
-// 投稿本文の mention は書き手が打ったまま) ので、upstream と同じく引く前に
-// punycode へ揃える必要がある (#2704)。**保存側も #2706 で正規化するようになった**
-// が、それ以前に取り込んだ行は `Mixed.Example` のような非正規化の形で残っている。
-// 正規化形だけを引くとそういう行が**どの acct 経路からも引けなくなる**ので、
-// 両方に当てる。
+// **引く前に正規化する (#2704)。** 呼び出し側は正規化されていない形で来ることが
+// ある (フロントの mention リンクは `toUnicode(host)`、投稿本文の mention は
+// 書き手が打ったまま) ので、upstream と同じく punycode へ揃えてから当てる。
 //
-// `IN` にしてあるのは `(usernameLower, host)` の index を効かせたままにするため。
-// `lower(host) = ?` のような式にすると index が使えない。
+// **生の形にも当てる互換経路は #2996 で撤去した。** #2706 以降は保存側
+// (`hostFromURI`) が正規化するので、新しく入る行は正規形しか持たない。それ以前に
+// 取り込んだ非正規化の行が残っている環境では**その行がどの acct 経路からも
+// 引けなくなる**ので、アップグレード前に `backfill-remote-host` を流すこと
+// (`-dry-run` で `updated=0` を確認できる。手順は docs/deployment.md)。
 //
-// **この両当たりは backfill 前の行のための互換経路** (#2706)。撤去してよいのは
-// `cmd/backfill-remote-host` を流し終えた環境だけ。詳細は hostCandidates の doc。
+// 式にせず値で比べるのは `(usernameLower, host)` の index を効かせたままにするため。
 func hostMatch(q *gorm.DB, host string) *gorm.DB {
-	// 候補集合は hostCandidates に一本化する。2 箇所で組むと片方だけ直す事故になる。
-	return q.Where("host IN ?", hostCandidates(host))
-}
-
-// hostCandidates lists the host values to try, exact match first.
-//
-// **順序は SQL に任せない。** `First` は自前で primary key 昇順を付けるので、
-// `Order` を足しても完全一致が先に来る保証がない。同じリモートが actor URI の
-// host 表記を変えると `IDX_user_usernameLower_host_unique` は表記違いを別行として
-// 許すため、`Mixed.Example` と `mixed.example` が共存しうる (#2704 review
-// MEDIUM-2)。候補を明示して順に引く。
-//
-// **これは backfill 前の行のための互換経路** (#2706)。保存側 (`hostFromURI`) は
-// 正規化済みなので、新しく入る行は正規化形しか持たない。撤去してよいのは
-// **`cmd/backfill-remote-host` を流し終えた環境だけ**で、流していない環境で外すと
-// 非正規化で保存された行が引けなくなる。migration は自動で流れるがバッチは手動な
-// ので、撤去は別 PR にしてある。
-func hostCandidates(host string) []string {
-	if p := idnhost.Puny(host); p != host {
-		return []string{host, p}
-	}
-	return []string{host}
+	return q.Where("host = ?", idnhost.Puny(host))
 }
 
 // FindManyByUsernamesAndHost batches the case-insensitive username lookup
@@ -240,34 +224,24 @@ func (r *userRepository) FindManyByUsernamesAndHost(usernames []string, host *st
 	if err := q.Find(&users).Error; err != nil {
 		return nil, err
 	}
-	if host == nil {
-		return users, nil
-	}
-	// **username ごとに 1 行へ畳む。** hostMatch は host 表記の違う 2 行に
-	// 当たりうるので、そのまま返すと呼び出し側 (mention 解決) が
-	// `m[usernameLower] = id` で後勝ちに潰し、通知先が DB の行順で決まる。
-	// FindByUsernameLower と同じ行が選ばれるよう、完全一致を優先する。
-	best := make(map[string]*model.User, len(users))
-	for _, u := range users {
-		cur, ok := best[u.UsernameLower]
-		if !ok {
-			best[u.UsernameLower] = u
-			continue
-		}
-		if u.Host != nil && *u.Host == *host && (cur.Host == nil || *cur.Host != *host) {
-			best[u.UsernameLower] = u
-		}
-	}
-	out := users[:0]
-	for _, u := range users {
-		if best[u.UsernameLower] == u {
-			out = append(out, u)
-		}
-	}
-	return out, nil
+	// **host 表記の違う 2 行に当たることは無くなった (#2996)。** `hostMatch` は
+	// 正規形の完全一致で引くので、username ごとに高々 1 行になる。畳み直す処理は
+	// 消してある。
+	//
+	// 一意性を保証する index は経路で名前が違う。mk-go の migration で作った DB は
+	// `IDX_user_usernameLower_host_unique` (`("usernameLower", "host") WHERE "host"
+	// IS NOT NULL`) と `IDX_user_usernameLower_local_unique` (`("usernameLower")
+	// WHERE "host" IS NULL`) の 2 本で、**TS 生まれの DB では前者が `000068` で
+	// 落ちる** — upstream が持つ hash 名の full unique index が同じ役割を担うため。
+	// どちらの経路でも、host 指定ありなら `(usernameLower, host)`、host nil なら
+	// `usernameLower` 単独で一意になる。
+	return users, nil
 }
 
 func (r *userRepository) FindProfileByUserID(userID string) (*model.UserProfile, error) {
+	if !storable(userID) {
+		return nil, ErrNotFound
+	}
 	var profile model.UserProfile
 	if err := r.db.First(&profile, "\"userId\" = ?", userID).Error; err != nil {
 		return nil, err
@@ -279,6 +253,7 @@ func (r *userRepository) FindProfileByUserID(userID string) (*model.UserProfile,
 // Used together with FindProfilesByUserIDs by core/user.Service.ShowManyByIDs
 // to eliminate the user/show bulk N+1 (#503).
 func (r *userRepository) FindManyByIDs(ids []string) ([]*model.User, error) {
+	ids = storableIDs(ids)
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -337,6 +312,11 @@ func (r *userRepository) IncrementNotesCount(userID string, delta int) error {
 // when meID is set, ordered by updatedAt DESC NULLS LAST. query is the raw user
 // input (with any leading @ and original case preserved).
 func (r *userRepository) SearchUsers(query, meID string, limit, offset int, origin string) ([]*model.User, error) {
+	// 列に入らない文字は保存された値に現れないので、一致しえない (#3025)。
+	// **引く前に弾く** — LIKE のパターンに載せるとクエリごと落ちて 500 になる。
+	if !storable(query) || !storable(meID) {
+		return nil, nil
+	}
 	if limit <= 0 {
 		limit = 10
 	}
@@ -479,6 +459,11 @@ func applyUserSearchOrigin(q *gorm.DB, origin string) *gorm.DB {
 // 意図的な divergence として docs/divergence.md に記録済み (#2286)。並び順の
 // 優先度付けを入れる場合も、NULL 除外は持ち込まないこと。
 func (r *userRepository) SearchByUsernameAndHost(query string, host *string, localOnly bool, limit int) ([]*model.User, error) {
+	// 列に入らない文字は保存された値に現れないので、一致しえない (#3025)。
+	// **引く前に弾く** — LIKE のパターンに載せるとクエリごと落ちて 500 になる。
+	if !storable(query) || (host != nil && !storable(*host)) {
+		return nil, nil
+	}
 	var users []*model.User
 	q := r.db.Where("\"isSuspended\" = false")
 	// upstream generateUserQueryBuilder は `if (params.username)` で falsy を
@@ -527,6 +512,29 @@ func (r *userRepository) UpdateProfile(userID string, fields map[string]any) err
 	return r.db.Model(&model.UserProfile{}).Where("\"userId\" = ?", userID).Updates(fields).Error
 }
 
+// RemoveBackupCode deletes one backup code from the stored array in SQL.
+//
+// **読んだ配列を書き戻さない** (#2852)。gate で読んだスナップショットから
+// `remaining` を組み立てて丸ごと UPDATE すると、別のコードを使う同時実行が
+// 互いの消費を打ち消し合い、**使ったはずのコードが復活する**。`array_remove`
+// なら interleaving に関係なく冪等に消える。
+func (r *userRepository) RemoveBackupCode(userID, code string) error {
+	return r.db.Model(&model.UserProfile{}).
+		Where(`"userId" = ?`, userID).
+		Update("twoFactorBackupSecret", gorm.Expr(`array_remove("twoFactorBackupSecret", ?)`, code)).
+		Error
+}
+
+func (r *userRepository) UpdatePasswordIfCurrent(userID, currentHash, newHash string) (bool, error) {
+	tx := r.db.Model(&model.UserProfile{}).
+		Where(`"userId" = ? AND "password" = ?`, userID, currentHash).
+		Update("password", newHash)
+	if tx.Error != nil {
+		return false, tx.Error
+	}
+	return tx.RowsAffected == 1, nil
+}
+
 // CreateProfile inserts a new user_profile row.
 func (r *userRepository) CreateProfile(profile *model.UserProfile) error {
 	return r.db.Create(profile).Error
@@ -534,6 +542,9 @@ func (r *userRepository) CreateProfile(profile *model.UserProfile) error {
 
 // FindProfileByVerifyCode looks up a user_profile by emailVerifyCode.
 func (r *userRepository) FindProfileByVerifyCode(code string) (*model.UserProfile, error) {
+	if !storable(code) {
+		return nil, ErrNotFound
+	}
 	var p model.UserProfile
 	if err := r.db.Where(`"emailVerifyCode" = ?`, code).First(&p).Error; err != nil {
 		return nil, err
@@ -546,11 +557,40 @@ func (r *userRepository) FindProfileByVerifyCode(code string) (*model.UserProfil
 // email 列は nullable + case-insensitive 検索にしたいが、本家 DB は
 // unique index を張っていないので「最初に見つかった 1 件」を返す。
 func (r *userRepository) FindProfileByEmail(email string) (*model.UserProfile, error) {
+	if !storable(email) {
+		return nil, ErrNotFound
+	}
 	var p model.UserProfile
 	if err := r.db.Where(`"email" = ?`, email).First(&p).Error; err != nil {
 		return nil, err
 	}
 	return &p, nil
+}
+
+// EmailVerifiedInUse reports whether a confirmed account already uses email.
+//
+// **書き込み側で使う。** かつて重複判定は `email-address/available` にしか
+// 実装がなく、実際に書く 3 経路 (signup / `i/update-email` /
+// `signup-application/register`) はどれも通っていなかった。DB にも UNIQUE が
+// 無いので、1 つのメールボックスから無制限にアカウントを作れたうえ、他人が
+// 確認済みのアドレスを自分のプロフィールに設定できた。
+//
+// upstream は `EmailService.validateEmailForAccount` の
+// `countBy({emailVerified:true, email})` を全経路が通る。
+//
+// **確認済みの行だけを見る** — 未認証の行まで見ると、他人のアドレスを登録途中で
+// 放置するだけで本人の登録を妨害できる。
+func (r *userRepository) EmailVerifiedInUse(email string) (bool, error) {
+	if !storable(email) {
+		return false, nil
+	}
+	var count int64
+	if err := r.db.Model(&model.UserProfile{}).
+		Where(`"email" = ? AND "emailVerified" = ?`, email, true).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // ListRemoteInboxes returns a deduplicated list of inbox URLs belonging to
@@ -587,6 +627,11 @@ WHERE host IS NOT NULL
 
 // ListUsers returns users matching the filter.
 func (r *userRepository) ListUsers(filter model.UserListFilter) ([]*model.User, error) {
+	// 列に入らない文字は保存された値に現れないので、一致しえない (#3025)。
+	// **引く前に弾く** — LIKE のパターンに載せるとクエリごと落ちて 500 になる。
+	if !storable(filter.Username) || !storable(filter.ExcludeRelatedTo) || !storable(filter.Hostname) {
+		return nil, nil
+	}
 	q := r.db.Model(&model.User{})
 
 	switch filter.Origin {
@@ -596,8 +641,13 @@ func (r *userRepository) ListUsers(filter model.UserListFilter) ([]*model.User, 
 		q = q.Where("host IS NOT NULL")
 	}
 	if filter.Hostname != "" {
-		// upstream show-users.ts:97 / users.ts は hostname を lowercase 化して
+		// upstream show-users.ts:97 / users.ts:71 は hostname を lowercase 化して
 		// 突合する。host は lowercase 保存なので大文字混在でも match させる。
+		// **ここは idnhost.Puny にしない (#2996)。** 引き当て経路 (hostMatch) は
+		// 問い合わせ側を punycode へ正規化するが、この filter は管理画面 /
+		// 公開 /users の絞り込みで、upstream も lowercase しか掛けない。揃えると
+		// Unicode 表記の IDN でも当たるようになって upstream と差が出るため、
+		// ここは parity 側に倒してある。
 		q = q.Where("host = ?", strings.ToLower(filter.Hostname))
 	}
 	// public /users endpoint の base filter (upstream users.ts:58-59、#1957-b)。

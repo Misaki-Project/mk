@@ -239,7 +239,21 @@ Misskeyのエラーは`{code, message, id}`形式で、クライアントは`cod
 
 echo wrapperはhandlerの最頻送出経路なので外すとgateが大半のrouteを素通しする(実例: これを足すと解決数が577→652に増え、未検出だったdrift 25件が露出した)。
 
-`router.go`の`path→handler`登録(import alias→pkg、`xxx := pkg.NewHandler()`のvar→pkg、ルート登録)を解決して各methodをendpointへ対応づけ、`(endpoint, code)`をgoldenの値と突合する。regexベースの抽出が空振りした場合の **silent-zero** を防ぐため、解決できたemissionが下限(400)を下回ったらgateを失敗させる。
+**`internal/server/router.go`のインラインendpointは0件**。#2791で全14件を`internal/api`配下へ移設したので、上のapi walkがそのまま拾う。
+
+gateは「golden と突合できた数の下限」から**「inlineが復活したら落とす」向きに反転**させた。判定に使うのは`countInlineHandlers`で、`/api` group tree配下のroute登録のうち**`handlerVar.Method`で解決できない形**を数える:
+
+- closure直書き (`api.POST("/x", func(c echo.Context) error {...})`)
+- ident束縛のclosure (`h := func(...); api.GET("/x", h)`)
+- **コンストラクタ直渡し** (`api.POST("/x", pkg.NewHandler(a).Read)`)。closureではないが`parseRoutes`の解決からも外れるので、error idが丸ごと無検査になる
+
+レシーバは`api`から派生したgroupを推移的に辿り、**チェーン呼び出し** (`api.Group("/x").POST(...)`) も見る。メソッドは`Match` / `Any` / `Add`も対象 (GET+POSTの両登録に使われうる)。**`/api`配下に限る** — レシーバを一切問わないと`/healthz`やpprof、frontendのcatchallまで拾い、あれらは移設対象ではない。
+
+`scanInlineRoutes` / `scanBodyEmissions`は**inlineが復活したときのdrift突合用**に残してある (現在の寄与は0件)。復活の検出そのものは`countInlineHandlers`が担う。抽出器自体は`inline_scan_test.go`でテストしてある — guardが「0件ならPASS」の向きなので、**抽出が壊れると空振りする**。
+
+移設先を書くときは**ハンドラを変数に代入してから渡す**。gateは`handlerVar.Method`の形しか解決しない。
+
+なお上の**インライン復活の検出は id gateだけ**が持つ。status / kind gateは`internal/api`のみを見る。
 
 ### golden
 
@@ -270,9 +284,9 @@ upstream bump時は`make shapecheck-gen`で全goldenを再生成してcommit。�
 
 `TestErrorHTTPStatusDrift`は、エラーレスポンスの**HTTPステータス**をgateする。ただし**Misskeyが明示的にステータスを固定しているエラーだけ**を対象にする。
 
-Misskeyの`ApiCallService`は`httpStatusCode` → 無ければ`kind`既定(`client`→400 / `permission`→403 / `server`→500)でステータスを決め、`kind`既定値は`client`。実態として**448エラー中425件(95%)が未指定=400**で、mk-goは`NO_SUCH_*`に404、`ACCESS_DENIED`に403というセマンティックなステータスを返す。misskey-jsは`status===200`以外を一律errorとしてbodyを読むため400/404を区別せず、**全部400に倒すのは設計上の損失**(REST的セマンティクスを失う)。
+Misskeyの`ApiCallService`は`httpStatusCode` → 無ければ`kind`既定(`client`→400 / `permission`→403 / `server`→500)でステータスを決め、`kind`既定値は`client`。実態として**459エラー中431件(93.9%)が未指定=400**で、mk-goは`NO_SUCH_*`に404、`ACCESS_DENIED`に403というセマンティックなステータスを返す。misskey-jsは`status===200`以外を一律errorとしてbodyを読むため400/404を区別せず、**全部400に倒すのは設計上の損失**(REST的セマンティクスを失う)。
 
-そこで本gateは「Misskeyが`httpStatusCode`または非デフォルト`kind`を明示している」契約(23件)だけを golden 化(`tools/erroriddiff`が`golden_error_status.json`に出力、暗黙400は記録しない)。mk-goが各endpointで返すステータス(inline `c.JSON(http.StatusX, ...)` / `JSONXxx` wrapper)を解決して突合する。
+そこで本gateは「Misskeyが`httpStatusCode`または非デフォルト`kind`を明示している」契約(28件)だけを golden 化(`tools/erroriddiff`が`golden_error_status.json`に出力、暗黙400は記録しない)。mk-goが各endpointで返すステータス(inline `c.JSON(http.StatusX, ...)` / `JSONXxx` wrapper)を解決して突合する。
 
 検出・整合した実例(本gate新設時):
 
@@ -289,7 +303,7 @@ Misskeyの`ApiCallService.send()`は全エラーenvelopeに`kind`を必ず含め
 
 gateは2方向:
 
-- **明示kind**: `tools/erroriddiff`がupstreamのエラー定義から`kind`明示エントリだけを`golden_error_kinds.json`へ抽出(現行7件: `NO_SUCH_ABUSE_REPORT`等が`server`、`i`の`USER_IS_DELETED`が`permission`)。解決できたemissionのkindはこれと一致しなければならない。
+- **明示kind**: `tools/erroriddiff`がupstreamのエラー定義から`kind`明示エントリだけを`golden_error_kinds.json`へ抽出(現行9件: `NO_SUCH_ABUSE_REPORT`等が`server`、`i`の`USER_IS_DELETED`が`permission`)。解決できたemissionのkindはこれと一致しなければならない。
 - **暗黙client**: kind goldenに無くても`golden_error_ids.json`にcodeがある(=upstreamがそのendpointで定義する)エラーは、既定の`client`を要求する。mk-go独自code・route未解決はid gateと同じ方針で対象外。
 
 実行・golden再生成はid gateと同じ`make errorid-check` / `make shapecheck-gen`。
@@ -344,17 +358,28 @@ make shapecheck-gen   # golden_permissions.json も再生成
 
 ## Secure drift gate（app token 制限）
 
-`TestSecureDrift`は、Misskeyの`secure: true` endpoint(password変更 / 2FA / data export-import / authorized-apps 等のaccount-security系、52件)が、mk-goで`middleware.RequireSecure`を適用していることを検証する。
+`TestSecureDrift`は、Misskeyの`secure: true` endpoint(password変更 / 2FA / data export-import / authorized-apps 等のaccount-security系、51件)が、mk-goで`middleware.RequireSecure`を適用していることを検証する。
+
+**逆向きも見る (#2877)。** golden に無い endpoint に `RequireSecure` が付いていたら落とす。片方向のままだと、upstream が `secure` を外したとき (2026.9.0 の `i/revoke-token` がまさにそれ) に golden から消えるだけで、mk-go 側に `RequireSecure` が残っていても緑のまま通る = サードパーティアプリから叩けるようにする変更が**機能していなくても検出できない**。意図的に厳しくする場合は `secureStricterThanUpstream` に理由付きで登録する (現在は空)。
 
 Misskeyの`secure`は「native session token のみ許可、第三者app/OAuth/MiAuth access token 不可」(ApiCallServiceの`isSecure = user != null && token == null`)。これが無いと、有効なaccess tokenを持つ第三者appがpassword変更や2FA解除を駆動できてしまう。
 
 mk-goは全認証がtoken経由(session無し)で、native token = `users.token`、app/MiAuthは別の`access_tokens`行。`RequireSecure`は`*user.Token == GetToken(c)`でnative判定し、一致しなければ403 ACCESS_DENIED(Misskey id `56f35758-...`)。`tools/securespec`が`secure: true` endpointのgolden(`golden_secure_endpoints.json`)を生成し、gateがrouter登録(複数行inline含む括弧バランスparse)に`RequireSecure`があるか突合する。
 
+## OAuth scope drift gate（meta.kind）
+
+`TestPermissionDrift` が見るのは `public|auth|moderator|admin` の粗い段だけで、**OAuth scope (`meta.kind`) の取り違えは素通りする**。実際 `admin/queue/stats` は `read:admin:emoji` のまま出荷されていた (upstream 自身の typo をそのまま移植したもので、upstream は 2026.9.0 で修正)。絵文字の scope しか持たないアプリが queue の統計を読め、queue の scope を持つアプリが読めない状態だった。
+
+`tools/permspec` が upstream の `meta.kind` を `golden_oauth_kinds.json` (297件) に出し、router の `middleware.RequireScope` と突き合わせる。**値の不一致と、kind があるのに `RequireScope` が無い方の両方**を見る (後者は app token が scope 無しで叩ける)。意図的に付けない場合は `kindMissingScope` に upstream の kind を添えて登録する (現在は空)。
+
+数え方: golden は endpoint 単位の map で、`kind` は **meta 直下 (タブ 1 つ) の宣言のみ**を拾う (`meta.errors` の中にも `kind: 'server'` があるため)。**クォートは 2 種類あることに注意** — `endpoints/i.ts` だけが `kind: "read:account"` とダブルクォートで、シングル限定にすると**最も広く叩かれる `/api/i` が丸ごと検査対象から外れる** (#2877 で実際に取りこぼし、scope を変異させても gate が緑のままだった)。
+
 ### 運用
 
 ```bash
-make perm-check       # permission + secure gate をローカル実行
-make shapecheck-gen   # golden_secure_endpoints.json も再生成
+make perm-check       # permission / secure / OAuth scope の 3 gate をローカル実行
+make shapecheck-gen   # golden_permissions.json / golden_secure_endpoints.json /
+                      # golden_oauth_kinds.json をまとめて再生成
 ```
 
 ## Schema drift gate（drop-in で生えない列）

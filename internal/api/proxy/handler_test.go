@@ -95,7 +95,7 @@ func setupHandler(t *testing.T, allowedURLs map[string]bool) (*Handler, *echo.Ec
 			return
 		}
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 
 	cfg := &config.Config{
@@ -432,8 +432,12 @@ func TestHandle_PathBasedURL(t *testing.T) {
 
 	// HTTPS URL won't connect to the HTTP test server, so it'll fail to fetch.
 	// But the path-based URL extraction + authorization should have been exercised.
-	// The response will be 404 or 500 (connection refused to HTTPS)
-	assert.True(t, rec.Code == http.StatusNotFound || rec.Code == http.StatusInternalServerError)
+	//
+	// **接続できなかったので 502 (#3034)。** 以前は `fetchRemote` が
+	// transport エラーを `ErrNotFound` に潰していたので 404 だった。
+	// **1 点に固定する** — 旧版の `404 || 500` は、まさに今回変わった値を
+	// 選択肢に含んでいたので、挙動が変わっても緑のまま通った。
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
 }
 
 func TestHandle_NotFound_NoFallback(t *testing.T) {
@@ -473,7 +477,7 @@ func TestHandle_InternalError_WithFallback(t *testing.T) {
 	// リモートサーバーが不正なレスポンスを返すケース
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
-		w.Write([]byte("not an image"))
+		_, _ = w.Write([]byte("not an image"))
 	}))
 	defer ts.Close()
 
@@ -508,7 +512,7 @@ func TestHandle_InternalError_WithFallback(t *testing.T) {
 func TestHandle_InternalError_NoFallback(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
-		w.Write([]byte("not an image"))
+		_, _ = w.Write([]byte("not an image"))
 	}))
 	defer ts.Close()
 
@@ -639,4 +643,83 @@ func TestHandle_RecursiveProxy_MkGoUA(t *testing.T) {
 		map[string]string{"User-Agent": "mk-go/0.9.1 (https://other.example)"})
 
 	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// #2905: `static` は mode と直交する軸。
+//
+// **parseMode は emoji を static より先に見る。** `?emoji=1&static=1` は
+// 「emoji のリサイズ寸法で、ただし静止画」なので、mode を ModeStatic に倒すと
+// 寸法まで変わってしまう。静止画かどうかは parseAnimated が別に判定する
+// (upstream の `animated: !('static' in query)` と同じ)。
+func TestParseAnimated(t *testing.T) {
+	e := echo.New()
+
+	tests := []struct {
+		name  string
+		query string
+		want  bool
+		mode  mediaproxy.ProxyMode
+	}{
+		{"クエリ無しはアニメーションを保つ", "/proxy/image.webp?url=x", true, mediaproxy.ModeDefault},
+		{"emoji のみ", "/proxy/image.webp?url=x&emoji=1", true, mediaproxy.ModeEmoji},
+		// **これが #2905 の本体。** mode は ModeEmoji のまま、animated だけ false。
+		{"emoji + static", "/proxy/image.webp?url=x&emoji=1&static=1", false, mediaproxy.ModeEmoji},
+		{"avatar + static", "/proxy/image.webp?url=x&avatar=1&static=1", false, mediaproxy.ModeAvatar},
+		{"static 単独", "/proxy/image.webp?url=x&static=1", false, mediaproxy.ModeStatic},
+		// **値は問わない。** upstream は fastify の `'static' in query` なので、
+		// 空値でも静止画になる。emoji_redirect.go の判定とも揃える。
+		{"static=0 でも静止画扱い", "/proxy/image.webp?url=x&emoji=1&static=0", false, mediaproxy.ModeEmoji},
+		{"static= (空値) でも静止画扱い", "/proxy/image.webp?url=x&emoji=1&static=", false, mediaproxy.ModeEmoji},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.query, nil)
+			c := e.NewContext(req, httptest.NewRecorder())
+			assert.Equal(t, tt.want, parseAnimated(c), "parseAnimated")
+			assert.Equal(t, tt.mode, parseMode(c), "mode は static で変わらないこと")
+		})
+	}
+}
+
+// **`/proxy/*` にも `filesHandler` と同じ 3 点を付ける (#3037)。**
+//
+// `nosniff` は #2782 で全応答に付き、Content-Type も `browsersafeMIMEs` に
+// 絞ってあるので既知の経路は塞がっているが、**この origin は自分のドメイン**
+// なので 1 つ取りこぼすと同一オリジンの XSS になる。mk-go は自分のファイル
+// 配信で 3 重に塞いでいるのだから、こちらだけ 1 枚薄いままにしない。
+func TestHandle_SetsContentSecurityHeaders(t *testing.T) {
+	h, e, imgServer := setupHandler(t, map[string]bool{})
+	defer imgServer.Close()
+
+	url := imgServer.URL + "/avatar.png"
+	sig := mediaproxy.SignURL([]byte("test-secret"), url)
+	rec := doRequest(e, h, http.MethodGet,
+		"/proxy/image.webp?url="+url+"&sig="+sig,
+		map[string]string{"User-Agent": "TestBrowser/1.0"})
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t,
+		"default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'",
+		rec.Header().Get("Content-Security-Policy"))
+	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "inline", rec.Header().Get("Content-Disposition"))
+}
+
+// **ダミー画像に倒れた応答にも付ける。** 失敗経路だけ薄くならないように。
+func TestHandle_FallbackAlsoSetsContentSecurityHeaders(t *testing.T) {
+	h, e, imgServer := setupHandler(t, map[string]bool{})
+	defer imgServer.Close()
+
+	// 署名は通るが取得に失敗する URL は fallback (ダミー PNG) になる。
+	url := imgServer.URL + "/missing.png"
+	sig := mediaproxy.SignURL([]byte("test-secret"), url)
+	rec := doRequest(e, h, http.MethodGet,
+		"/proxy/image.webp?url="+url+"&sig="+sig+"&fallback=1",
+		map[string]string{"User-Agent": "TestBrowser/1.0"})
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t,
+		"default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'",
+		rec.Header().Get("Content-Security-Policy"))
+	assert.Equal(t, "inline", rec.Header().Get("Content-Disposition"))
 }

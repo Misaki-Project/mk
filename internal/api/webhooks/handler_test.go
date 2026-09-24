@@ -2,6 +2,7 @@ package webhooks
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,12 +13,20 @@ import (
 	"github.com/shiroha-a/mk/internal/entitycompat/shapetest"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-var errMock = assert.AnError
+// **not-found を模す。** 汎用 error だと #2792 の「DB 障害は 500」に引っかかる。
+// repository は GORM の error をそのまま返すので、テストもそれに揃える。
+var errMock = repository.ErrNotFound
+
+// errBoom is a generic failure for write paths. **not-found とは分けること** —
+// 同じ値を使い回すと、将来 write path に `IsNotFound` の分岐が入ったときに
+// これらのテストが黙って別の枝を通る (#2792)。
+var errBoom = errors.New("db down")
 
 type mockWebhookRepo struct {
 	webhooks  map[string]*model.Webhook
@@ -172,7 +181,7 @@ func TestCreate_InvalidOnEnum(t *testing.T) {
 
 func TestCreate_Error(t *testing.T) {
 	h, repo := newTestHandler()
-	repo.createErr = errMock
+	repo.createErr = errBoom
 	rec := post(h.Create, `{"name":"test","url":"https://example.com","on":["note"]}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -212,7 +221,7 @@ func TestCreate_WebhookLimit_PassesUnderLimit(t *testing.T) {
 // で count 取得が失敗した場合に 500 を返すパスを検証する。
 type failCountRepo struct{ *mockWebhookRepo }
 
-func (f *failCountRepo) CountByUserID(_ string) (int64, error) { return 0, errMock }
+func (f *failCountRepo) CountByUserID(_ string) (int64, error) { return 0, errBoom }
 
 func TestCreate_WebhookLimit_CountError(t *testing.T) {
 	repo := newMockRepo()
@@ -265,7 +274,7 @@ func TestList_LatestSentAtFormat(t *testing.T) {
 
 type failListRepo struct{ *mockWebhookRepo }
 
-func (f *failListRepo) ListByUserID(_ string) ([]*model.Webhook, error) { return nil, errMock }
+func (f *failListRepo) ListByUserID(_ string) ([]*model.Webhook, error) { return nil, errBoom }
 
 func TestList_Error(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
@@ -372,7 +381,7 @@ func TestUpdate_InvalidOnEnum(t *testing.T) {
 func TestUpdate_Error(t *testing.T) {
 	h, repo := newTestHandler()
 	repo.webhooks["w1"] = &model.Webhook{ID: "w1", UserID: "u1", On: model.StringArray{}}
-	repo.updateErr = errMock
+	repo.updateErr = errBoom
 	rec := post(h.Update, `{"webhookId":"w1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -402,7 +411,7 @@ func TestDelete_InvalidParam(t *testing.T) {
 func TestDelete_Error(t *testing.T) {
 	h, repo := newTestHandler()
 	repo.webhooks["w1"] = &model.Webhook{ID: "w1", UserID: "u1"}
-	repo.deleteErr = errMock
+	repo.deleteErr = errBoom
 	rec := post(h.Delete, `{"webhookId":"w1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }

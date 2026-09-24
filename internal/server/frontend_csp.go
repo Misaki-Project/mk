@@ -1,11 +1,16 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"net/url"
 	"slices"
 	"strings"
 
 	"github.com/labstack/echo/v4"
+
+	"github.com/shiroha-a/mk/internal/config"
+	"github.com/shiroha-a/mk/internal/model"
 )
 
 // CSP modes accepted by the `frontendContentSecurityPolicy` config key.
@@ -25,20 +30,25 @@ const (
 // API 用に組んであり、認証不要で外から叩かれるこの endpoint とは要件が違う。
 const CSPReportPath = "/csp-report"
 
-// frontendCSPDirectives is the policy applied to the SPA shell.
+// frontendCSPDirectives is the policy shared by the SPA shell and the embed shell.
 //
 // **緩すぎると違反が出ず観測の意味が無い**ので、最終的に enforce したい形から
 // 始めている。report-only の間に出た違反を潰してから enforce へ切り替える。
 //
-// `'unsafe-inline'` を script/style に入れているのは、SSR shell が inline script
-// (`VERSION` / `CLIENT_ENTRY` の定義) と SVG の inline style 属性を持つため。
-// **これらを nonce / hash へ移すのは別段階**で、先にそれ以外の違反を見たい。
-// 最初から nonce 化すると、shell 由来の違反ばかりが出て他が埋もれる。
+// **script 側の `'unsafe-inline'` は #2786 で外した。** SPA shell の inline script
+// (`VERSION` / `CLIENT_ENTRY` の定義と bootloader) は内容が起動時に固定なので、
+// SHA-256 hash を `script-src` に足して通す。style 側は Vue の `:style` が
+// 属性として出るため残している (下の style-src のコメントを参照)。
 //
 // `frame-ancestors` は**入れない**。`X-Frame-Options: DENY` を
 // `middleware/frameguard.go` が既に付けており、そちらは `/embed/` を除外する
-// 仕組みを持つ。CSP に重ねると除外を二重管理することになるので、embed の配線が
-// 入るときに一緒に設計する。
+// 仕組みを持つ。CSP に重ねると除外を二重管理することになり、片方だけ更新して
+// 埋め込みが死ぬ。**#2789 で `/embed/` にもこの policy を適用したが、そのときも
+// `frame-ancestors` は入れず除外は frameguard の 1 箇所に残した。**
+//
+// **embed との差は cspExtras 側だけ。** captcha の origin は SPA shell にしか
+// 足さない (embed はサインアップ経路を持たない)。media origin (object storage /
+// 外部 media proxy) と inline script の hash は両方に足す。
 var frontendCSPDirectives = []string{
 	"default-src 'self'",
 	"base-uri 'self'",
@@ -64,7 +74,14 @@ var frontendCSPDirectives = []string{
 	// esm.sh に渡り、CDN 側の可用性と完全性に依存する。
 	//
 	// 言語を絞ってバンドルすれば両立できる可能性はある (未検証)。
-	"script-src 'self' 'unsafe-inline' https://esm.sh",
+	// **`'unsafe-inline'` は入れない** (#2786)。SPA shell の inline script は
+	// `cspScriptHashes` が出す `'sha256-...'` で通す。hash は HTML に埋める
+	// 文字列そのものから導くので、片方だけ変えて壊れることはない。
+	"script-src 'self' https://esm.sh",
+	// **style 側の `'unsafe-inline'` は残す** (#2786)。Vue の `:style` バインディングが
+	// 146 箇所あり、DOM の inline `style` 属性になる。属性は `style-src-attr` の
+	// 管轄で hash では救えず (`'unsafe-hashes'` が要る)、外すと UI が広範に壊れる。
+	// splash の `<style>:root{--splash-color:...}</style>` も meta 由来で動的。
 	"style-src 'self' 'unsafe-inline'",
 	// 画像は media proxy 経由で来る。**internal proxy なら同一オリジン**で、
 	// 外部 media proxy 構成ではその origin を extraMediaOrigins で足す (#2501)。
@@ -117,6 +134,35 @@ type cspExtras struct {
 	// Style is appended to style-src (hCaptcha。公式 CSP ガイダンスが style-src
 	// まで要求しており、資材の変わり方によっては欠けると黙って壊れる、#2502)。
 	Style []string
+	// Image is appended to img-src only (upstream のクレジットページが読む
+	// 外部ホスト、#2892)。**`Media` と分けてある** — あちらは media-src /
+	// connect-src にも足すが、こちらは画像しか読まない。
+	Image []string
+}
+
+// creditImageOrigins are the hosts that upstream's `/about-misskey` reads
+// contributor / sponsor / patron icons from.
+//
+// **実測 62 枚** — `avatars.githubusercontent.com` が 6 (プロジェクトメンバー)、
+// `assets.misskey-hub.net` が 56 (スポンサー 6 + パトロン 50)。`loading="lazy"` も
+// `v-if` も折りたたみも無いので、ページを開いた時点で全部読まれる。
+//
+// #2700 で **upstream の謝辞は消さない**方針にした (頻繁に更新されるファイルなので
+// 書き換えると追従のたびにコンフリクトを手で解くことになる)。この 2 origin を
+// 許さないと、そのページには恒久的に壊れた画像が 62 個並ぶ (#2892)。
+//
+// **media proxy 経由にはできない。** mk-go の proxy は upstream と違い open proxy
+// ではなく、allowlist は **DB に実在する URL** (user の avatar / banner、drive_file、
+// emoji、instance の icon / favicon) だけを通す。静的にハードコードされた URL は
+// 入らないので 403 が返る (実測)。
+//
+// **「外部 origin を許すと投稿経由でトラッキング画像を読ませる経路が開く」は
+// 任意 origin の話。** ここで足すのは固定の 2 つで、投稿から別の host を読ませる
+// ことはできない。**閲覧者の IP はこの 2 host に渡る** — upstream は CSP 自体を
+// 持たないので元から同じ挙動で、mk-go だけが厳しかった箇所を parity に戻す形。
+var creditImageOrigins = []string{
+	"https://avatars.githubusercontent.com",
+	"https://assets.misskey-hub.net",
 }
 
 // buildFrontendCSP renders the policy string.
@@ -139,6 +185,30 @@ func buildFrontendCSP(withReport bool, extras cspExtras) string {
 	return strings.Join(d, "; ")
 }
 
+// cspScriptHashes returns `'sha256-<base64>'` for each non-empty inline script.
+//
+// **呼び出し側は HTML に埋める文字列そのものを渡すこと。** 同じ内容を 2 箇所で
+// 組み立てると、片方だけ変えたときに CSP を有効にしているインスタンスで
+// script が丸ごとブロックされ、画面が真っ白になる (#2786)。
+//
+// 空文字は飛ばす。loader は外部参照になることがあり (`inlineOrLinkJS`)、その
+// ときは inline script が存在しないので hash も要らない。
+//
+// CSP の hash は **script 要素の中身をそのまま** (前後の空白も含めて) 取る。
+// `<script>` タグの属性や改行の入れ方を変えると一致しなくなるので、HTML 側の
+// 埋め込みは `<script>%s</script>` の形を保つこと。
+func cspScriptHashes(scripts ...string) []string {
+	out := make([]string, 0, len(scripts))
+	for _, s := range scripts {
+		if s == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(s))
+		out = append(out, "'sha256-"+base64.StdEncoding.EncodeToString(sum[:])+"'")
+	}
+	return out
+}
+
 // appendExtras adds the configuration-dependent origins to a directive.
 func appendExtras(directive string, ex cspExtras) string {
 	name, _, ok := strings.Cut(directive, " ")
@@ -148,6 +218,9 @@ func appendExtras(directive string, ex cspExtras) string {
 	var add []string
 	if slices.Contains(mediaDirectives, name) {
 		add = append(add, ex.Media...)
+	}
+	if name == "img-src" {
+		add = append(add, ex.Image...)
 	}
 	if name == "script-src" {
 		add = append(add, ex.Script...)
@@ -187,7 +260,10 @@ func captchaCSPExtras(hcaptcha, recaptcha, turnstile bool) cspExtras {
 		// www.gstatic.com/recaptcha/ から読む。公式推奨は path 付きだが、CSP の
 		// path source は redirect 後に無視される仕様で保証にならないため、
 		// objectStorageOrigin と同じく origin 単位で書く。gstatic 全体に script
-		// 実行を許す広さは 'unsafe-inline' が残る現状では実質差が無い。
+		// 実行を許す広さは、CSP の path source が redirect 後に無視される以上
+		// 避けられない。**#2786 で script-src から 'unsafe-inline' を外したので、
+		// これは reCAPTCHA を有効にした instance でだけ script-src を広げる**
+		// (以前は unsafe-inline があるので実質差が無かった)。
 		ex.Script = append(ex.Script, "https://www.recaptcha.net", "https://www.gstatic.com")
 	}
 	if turnstile {
@@ -224,7 +300,9 @@ func objectStorageOrigin(baseURL string) string {
 	return u.Scheme + "://" + u.Host
 }
 
-// applyFrontendCSP sets the CSP header on an SPA shell response.
+// applyFrontendCSP sets the CSP header on a shell response.
+//
+// 呼び出し元は SPA shell (`frontend.go`) と embed shell (`embed.go`) の 2 つ。
 //
 // mode が未知 / off なら何もしない。**判定できない値で enforce に倒さない**の
 // が要点で、設定ミスでフロントが動かなくなるより無効の方が安全。
@@ -239,4 +317,33 @@ func applyFrontendCSP(c echo.Context, mode string, extras cspExtras) {
 		c.Response().Header().Set("Content-Security-Policy",
 			buildFrontendCSP(true, extras))
 	}
+}
+
+// cspMediaExtras returns the media origins that depend on instance settings.
+//
+// SPA shell (`frontend.go`) と embed (`embed.go`) で共通。drive のファイルが
+// object storage から直接配信される構成と、外部 media proxy 構成では `'self'`
+// だけでは足りず、enforce 時に画像・動画・音声が丸ごと表示できなくなる
+// (#2425 / #2501)。embed も同じ経路でリモート画像を出すので同じものが要る (#2789)。
+//
+// **順序は object storage → media proxy で固定する。** header の文字列がこの
+// 順序で決まるので、入れ替えると値だけ変わって差分がノイズになる。
+func cspMediaExtras(cfg *config.Config, m *model.Meta) []string {
+	var out []string
+	// useObjectStorage が false でも baseUrl が残っていることがあるので、
+	// **両方が揃っているときだけ**許可する。使っていない host を CSP に
+	// 載せる必要は無い。
+	if m != nil && m.UseObjectStorage && m.ObjectStorageBaseURL != nil {
+		if origin := objectStorageOrigin(*m.ObjectStorageBaseURL); origin != "" {
+			out = append(out, origin)
+		}
+	}
+	// 外部 media proxy 構成では、リモート画像もカスタム絵文字も proxy の origin
+	// から配信される。internal proxy ('self') なら何も足さない (#2501)。
+	if cfg != nil && cfg.ExternalMediaProxyEnabled {
+		if origin := objectStorageOrigin(cfg.MediaProxy); origin != "" {
+			out = append(out, origin)
+		}
+	}
+	return out
 }

@@ -175,11 +175,18 @@ func (h *Handler) HostMeta(c echo.Context) error {
 }
 
 // NodeInfoDiscovery handles GET /.well-known/nodeinfo.
+//
+// **Cache-Control を付ける。** この文書は origin から組み立てるだけで内容が
+// 変わらないのに、付けていないと crawler の 1 hit ごとに origin まで届いていた
+// (同ファイルの WebFinger は `public, max-age=180` を返している)。max-age は
+// ここが advertise する `/nodeinfo/2.x` と同じ 600 に揃える — 参照先より短く
+// しても、先に discovery だけが失効して得るものが無い。
 func (h *Handler) NodeInfoDiscovery(c echo.Context) error {
 	if h.federationDisabled() {
 		return c.NoContent(http.StatusForbidden)
 	}
 	setDiscoveryCORS(c)
+	c.Response().Header().Set("Cache-Control", "public, max-age=600")
 	resp := map[string]any{
 		"links": []map[string]any{
 			{
@@ -230,6 +237,24 @@ func (h *Handler) OAuthAuthorizationServer(c echo.Context) error {
 		"authorization_response_iss_parameter_supported": true,
 	}
 	return c.JSON(http.StatusOK, resp)
+}
+
+// ChangePassword redirects to the password change page. Implements the W3C
+// "A Well-Known URL for Changing Passwords" spec so that password managers
+// (iCloud Keychain / 1Password / Chrome) can find the page programmatically.
+// Mirrors upstream WellKnownServerService (upstream PR 17901).
+//
+// federationDisabled() は通さない。upstream が federation off で 403 を返すのは
+// host-meta / host-meta.json / nodeinfo / webfinger の 4 本で、この endpoint は
+// 連合ではなくローカル利用者のパスワード変更導線なので対象外。
+func (h *Handler) ChangePassword(c echo.Context) error {
+	// upstream の `fastify.addHook('onRequest')` は plugin scope 全体に張られるので
+	// この endpoint にも discovery 用 CORS が付く。**global CORS middleware は
+	// `/.well-known/` を Skipper で丸ごと除外している** ので、ここで付けないと
+	// ヘッダがゼロになり、cross-origin の fetch が preflight だけ通って本命の GET で
+	// 結果を捨てられる (一番切り分けにくい壊れ方)。
+	setDiscoveryCORS(c)
+	return c.Redirect(http.StatusFound, h.origin+"/settings/security")
 }
 
 // webfingerResolve describes how to resolve a parsed webfinger resource:

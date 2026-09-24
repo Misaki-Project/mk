@@ -12,10 +12,18 @@ type ChatRepository interface {
 	// Room operations
 	CreateRoom(room *model.ChatRoom) error
 	FindRoomByID(id string) (*model.ChatRoom, error)
+	// FindRoomByURI looks up a room by its canonical AP URI. リモート room の
+	// 身元は URI であって room id ではない (#2994) ので、AP 経路の引き当ては
+	// すべてこちらを通す。
+	FindRoomByURI(uri string) (*model.ChatRoom, error)
 	UpdateRoom(room *model.ChatRoom) error
 	DeleteRoom(id string) error
 	ListRoomsByOwner(ownerID, sinceID, untilID string, limit int) ([]*model.ChatRoom, error)
 	ListJoinedRooms(userID, sinceID, untilID string, limit int) ([]*model.ChatRoom, error)
+	// TransferRoomOwnership hands a room over to newOwnerID while keeping the
+	// "owner has no membership row" invariant intact. See the implementation
+	// for why both sides have to move together.
+	TransferRoomOwnership(roomID, oldOwnerID, newOwnerID, oldOwnerMembershipID string) error
 
 	// Message operations
 	CreateMessage(msg *model.ChatMessage) error
@@ -104,7 +112,13 @@ type ChatRepository interface {
 
 	// Reactions
 	AddReaction(messageID, reaction string) error
-	RemoveReaction(messageID, reaction string) error
+	// RemoveReaction removes one reaction and reports whether a row changed.
+	//
+	// **消えたかどうかを返すのが要点 (#3037)。** 呼び出し側はこれを見て
+	// stream への publish を決める。無条件に publish すると、**会話の参加者で
+	// ない利用者**が任意の messageId に対して `unreact` を投げるだけで、
+	// その部屋 / DM のストリームにイベントを注入できる。
+	RemoveReaction(messageID, reaction string) (bool, error)
 }
 
 type chatRepository struct {
@@ -158,6 +172,9 @@ func (r *chatRepository) CreateRoom(room *model.ChatRoom) error {
 }
 
 func (r *chatRepository) FindRoomByID(id string) (*model.ChatRoom, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var room model.ChatRoom
 	if err := r.db.Preload("Owner").Where(`"id" = ?`, id).First(&room).Error; err != nil {
 		return nil, err
@@ -165,8 +182,111 @@ func (r *chatRepository) FindRoomByID(id string) (*model.ChatRoom, error) {
 	return &room, nil
 }
 
+// FindRoomByURI looks up a remote room copy by its canonical AP URI.
+//
+// **ローカル room は `uri` が NULL。** SQL の `=` は NULL に一致しないので、
+// 空文字で引いてもローカル room は返らない (自前のガードは置かない)。
+func (r *chatRepository) FindRoomByURI(uri string) (*model.ChatRoom, error) {
+	if !storable(uri) {
+		return nil, ErrNotFound
+	}
+	var room model.ChatRoom
+	if err := r.db.Preload("Owner").Where(`"uri" = ?`, uri).First(&room).Error; err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
 func (r *chatRepository) UpdateRoom(room *model.ChatRoom) error {
 	return r.db.Save(room).Error
+}
+
+// TransferRoomOwnership hands roomID over from oldOwnerID to newOwnerID in one
+// transaction, keeping the "owner has no membership row" invariant.
+//
+// upstream ChatService.ts が room のメンバー集合を
+// `memberships.concat({userId: room.ownerId, isMuted: false})` で作り、
+// 「ownerはmembershipレコードを作らないため」とコメントしているとおり、owner は
+// membership 行を持たない。mk-go の読み取り側もこれに揃っている
+// (`packRoomDetailed` は owner に `isMuted: false` を固定で返し、
+// `isRoomMember` は owner を暗黙のメンバーとして扱う)。
+//
+// **ownerId を書き換えるだけだと両側が壊れる。**
+//   - 新 owner は membership 行を抱えたまま owner になる。mute していた場合、
+//     API もフロントも「ミュートしていない」と言うのに行だけが残り、UI から
+//     解除する手段が無い (フロントは owner に mute スイッチを出さない)。
+//     joined / joining 一覧にも自分の room が出る。
+//     **通知は落ちない** — fan-out は owner を mute 判定より前に never-muted と
+//     して seed する (core/chat/service.go の emitRoomNewChatMessage)。
+//   - 旧 owner は行を持たないまま非 owner になる。`isRoomMember` は
+//     `ownerId == userID || membership` なので**どちらも false** になり、
+//     譲渡した本人が room から締め出される。
+//
+// oldOwnerMembershipID は旧 owner に作る行の主キー。repository は ID 生成器を
+// 持たないので呼び出し元が採番する。
+//
+// **連合面は対象外。** 譲渡そのものを AP で伝える仕組みは無く、local 所有の
+// room を remote user へ渡すと roomURI や attributedTo が相手ホストに存在しない
+// 値に化ける (core/chat/service.go の roomURI 組み立てと renderer.go の
+// AttributedTo)。これは transfer-ownership が元から持つ性質で、ここでは直さない。
+//
+// UPDATE は `"ownerId" = oldOwnerID` を条件に持つ。同時に走った 2 つの譲渡の
+// うち後から来たほうは 0 行更新になり ErrNotFound を返すので、**消える側の
+// membership だけが適用された中途半端な状態**にはならない。
+func (r *chatRepository) TransferRoomOwnership(roomID, oldOwnerID, newOwnerID, oldOwnerMembershipID string) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.ChatRoom{}).
+			Where(`"id" = ? AND "ownerId" = ?`, roomID, oldOwnerID).
+			Update("ownerId", newOwnerID)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		if oldOwnerID == newOwnerID {
+			// owner が変わらないなら membership も動かさない。**ここで返さないと
+			// 下の入れ替えが自分の行を消して作り直す**ので、この関数自身が
+			// 「owner は行を持たない」契約を破る。呼び出し元のガードには任せない。
+			//
+			// owner 検査の**後**に置くこと。先頭で返すと、その room の owner で
+			// ない者による自己譲渡が黙って成功する。
+			return nil
+		}
+		if err := tx.Where(`"roomId" = ? AND "userId" = ?`, roomID, newOwnerID).
+			Delete(&model.ChatRoomMembership{}).Error; err != nil {
+			return err
+		}
+		// **保留中の招待も消す。** 残すと新 owner が自分でそれを accept でき、
+		// 今消したばかりの行が同じ room に作り直される
+		// (`InvitationsAccept` / `RoomsJoin` / `AddMemberViaAP` はいずれも
+		// 「その user が room の owner か」を見ない)。upstream は owner 宛の
+		// 招待を作れない (createRoomInvitation が self-invite と既存メンバーを
+		// 弾く) ので、この形の行は譲渡でしか生まれない。
+		if err := tx.Where(`"roomId" = ? AND "userId" = ?`, roomID, newOwnerID).
+			Delete(&model.ChatRoomInvitation{}).Error; err != nil {
+			return err
+		}
+		// 旧 owner を明示メンバーとして残す。譲渡は「owner の座を渡す」操作で
+		// あって「room を抜ける」操作ではない。
+		//
+		// **既にある行は触らない。** 不整合データ (この修正より前の譲渡で
+		// 残った行) では旧 owner が行を持っていることがあり、そこで
+		// `isMuted` を false に戻すと利用者が設定した mute を勝手に解除する。
+		var existing model.ChatRoomMembership
+		err := tx.Where(`"roomId" = ? AND "userId" = ?`, roomID, oldOwnerID).First(&existing).Error
+		if err == nil {
+			return nil
+		}
+		if !IsNotFound(err) {
+			return err
+		}
+		return tx.Create(&model.ChatRoomMembership{
+			ID:     oldOwnerMembershipID,
+			UserID: oldOwnerID,
+			RoomID: roomID,
+		}).Error
+	})
 }
 
 func (r *chatRepository) DeleteRoom(id string) error {
@@ -198,6 +318,9 @@ func (r *chatRepository) CreateMessage(msg *model.ChatMessage) error {
 }
 
 func (r *chatRepository) FindMessageByID(id string) (*model.ChatMessage, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var msg model.ChatMessage
 	if err := r.db.Preload("FromUser").Preload("File").Where(`"id" = ?`, id).First(&msg).Error; err != nil {
 		return nil, err
@@ -206,6 +329,9 @@ func (r *chatRepository) FindMessageByID(id string) (*model.ChatMessage, error) 
 }
 
 func (r *chatRepository) FindMessageByURI(uri string) (*model.ChatMessage, error) {
+	if !storable(uri) {
+		return nil, ErrNotFound
+	}
 	var msg model.ChatMessage
 	if err := r.db.Preload("FromUser").Preload("File").Where(`"uri" = ?`, uri).First(&msg).Error; err != nil {
 		return nil, err
@@ -272,6 +398,11 @@ func (r *chatRepository) ListMessagesByUser(userID, otherUserID, sinceID, untilI
 // + NO_SUCH_ROOM gate for roomID is enforced by the handler before this is
 // reached (upstream search.ts).
 func (r *chatRepository) SearchMessages(meID, query string, limit int, userID, roomID string) ([]*model.ChatMessage, error) {
+	// 列に入らない文字は保存された値に現れないので、一致しえない (#3025)。
+	// **引く前に弾く** — LIKE のパターンに載せるとクエリごと落ちて 500 になる。
+	if !storable(query) || !storable(meID) || !storable(userID) || !storable(roomID) {
+		return nil, nil
+	}
 	if limit <= 0 {
 		limit = 10
 	}
@@ -307,6 +438,9 @@ func (r *chatRepository) CreateMembership(m *model.ChatRoomMembership) error {
 }
 
 func (r *chatRepository) FindMembership(userID, roomID string) (*model.ChatRoomMembership, error) {
+	if !storable(userID) || !storable(roomID) {
+		return nil, ErrNotFound
+	}
 	var m model.ChatRoomMembership
 	if err := r.db.Where(`"userId" = ? AND "roomId" = ?`, userID, roomID).First(&m).Error; err != nil {
 		return nil, err
@@ -362,6 +496,9 @@ func (r *chatRepository) UpdateInvitation(inv *model.ChatRoomInvitation) error {
 }
 
 func (r *chatRepository) FindInvitation(userID, roomID string) (*model.ChatRoomInvitation, error) {
+	if !storable(userID) || !storable(roomID) {
+		return nil, ErrNotFound
+	}
 	var inv model.ChatRoomInvitation
 	if err := r.db.Where(`"userId" = ? AND "roomId" = ?`, userID, roomID).First(&inv).Error; err != nil {
 		return nil, err
@@ -370,6 +507,9 @@ func (r *chatRepository) FindInvitation(userID, roomID string) (*model.ChatRoomI
 }
 
 func (r *chatRepository) FindInvitationByID(id string) (*model.ChatRoomInvitation, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var inv model.ChatRoomInvitation
 	if err := r.db.Where(`"id" = ?`, id).First(&inv).Error; err != nil {
 		return nil, err
@@ -598,7 +738,14 @@ func (r *chatRepository) AddReaction(messageID, reaction string) error {
 		reaction, messageID, reaction).Error
 }
 
-func (r *chatRepository) RemoveReaction(messageID, reaction string) error {
-	return r.db.Exec(`UPDATE "chat_message" SET "reactions" = array_remove("reactions", ?) WHERE "id" = ?`,
-		reaction, messageID).Error
+func (r *chatRepository) RemoveReaction(messageID, reaction string) (bool, error) {
+	// **実際に持っているときだけ UPDATE する。** `array_remove` は無い要素を
+	// 渡しても成功するので、条件を付けないと `RowsAffected` が常に 1 になり
+	// 「消えたか」を判定できない (`AddReaction` の重複ガードと対称)。
+	res := r.db.Exec(`UPDATE "chat_message" SET "reactions" = array_remove("reactions", ?) WHERE "id" = ? AND "reactions" @> ARRAY[?]::varchar[]`,
+		reaction, messageID, reaction)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
 }

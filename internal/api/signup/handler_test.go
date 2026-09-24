@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,9 @@ type mockTicketStore struct {
 	markUsed    map[string]string                    // ticketID → userID
 	markPending map[string]string                    // ticketID → pendingID
 	markErr     error
+	// claimLost は「並行した別のリクエストが先に確保した」状態を再現する。
+	claimLost bool
+	released  []string
 }
 
 func newMockTicketStore() *mockTicketStore {
@@ -54,6 +58,36 @@ func (m *mockTicketStore) MarkUsed(ticketID, userID string) error {
 		return m.markErr
 	}
 	m.markUsed[ticketID] = userID
+	return nil
+}
+
+// ClaimForSignup mirrors the repository's conditional UPDATE in memory.
+func (m *mockTicketStore) ClaimForSignup(ticketID string, emailRequired bool) (bool, error) {
+	if m.claimLost {
+		return false, nil
+	}
+	for _, t := range m.tickets {
+		if t.ID != ticketID {
+			continue
+		}
+		now := time.Now()
+		if t.UsedByID != nil || (t.UsedAt != nil && (!emailRequired || t.UsedAt.After(now.Add(-30*time.Minute)))) {
+			return false, nil
+		}
+		t.UsedAt = &now
+		return true, nil
+	}
+	return false, nil
+}
+
+func (m *mockTicketStore) ReleaseClaim(ticketID string) error {
+	m.released = append(m.released, ticketID)
+	for _, t := range m.tickets {
+		if t.ID == ticketID && t.UsedByID == nil {
+			t.UsedAt = nil
+			t.PendingID = nil
+		}
+	}
 	return nil
 }
 
@@ -305,7 +339,7 @@ func TestSignup_EmailRequired_CreatesPendingAndSendsEmail(t *testing.T) {
 		t.Fatal("emailSender was not invoked")
 	}
 	assert.Equal(t, "alice@example.com", sentTo)
-	assert.Contains(t, sent.Subject, "Confirm")
+	assert.Equal(t, "Confirm your account", sent.Subject)
 	assert.Contains(t, sent.Text, "https://example.test/signup-complete/")
 	assert.Contains(t, sent.HTML, "https://example.test/signup-complete/", "HTML body にも link が含まれる")
 	assert.Contains(t, sent.HTML, "<!doctype html>", "HTML wrapper が適用される (#600 item 4)")
@@ -313,6 +347,71 @@ func TestSignup_EmailRequired_CreatesPendingAndSendsEmail(t *testing.T) {
 	for _, row := range pendingRepo.Rows {
 		assert.Contains(t, sent.Text, row.Code)
 	}
+}
+
+func TestSignup_EmailRequired_SendsJapaneseEmailFromAcceptLanguage(t *testing.T) {
+	userRepo := testutil.NewMockUserRepository()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x", EmailRequiredForSignup: true, Langs: []string{"ja-JP", "en-US"}}
+	pendingRepo := testutil.NewMockUserPendingRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	svc := coresignup.NewService(userRepo, metaRepo, idGen)
+	svc.SetUserPendingRepo(pendingRepo)
+	h := apisignup.NewHandler(svc, metaRepo, idGen)
+
+	var sent miscsmtp.Message
+	done := make(chan struct{})
+	h.SetEmailSender("https://example.test", func(_ string, msg miscsmtp.Message) {
+		sent = msg
+		close(done)
+	})
+
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"username":"alice","password":"pass1234","emailAddress":"alice@example.com"}`))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("Accept-Language", "ja-JP,en;q=0.8")
+	rec := httptest.NewRecorder()
+	require.NoError(t, h.Signup(e.NewContext(req, rec)))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("emailSender was not invoked")
+	}
+	assert.Equal(t, "アカウントの確認", sent.Subject)
+	assert.Contains(t, sent.Text, "登録を完了")
+}
+
+func TestSignup_EmailRequired_SendsJapaneseEmailFromAcceptLanguageWithoutMetaLangs(t *testing.T) {
+	userRepo := testutil.NewMockUserRepository()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x", EmailRequiredForSignup: true}
+	pendingRepo := testutil.NewMockUserPendingRepository()
+	idGen, _ := id.NewGenerator("aidx")
+	svc := coresignup.NewService(userRepo, metaRepo, idGen)
+	svc.SetUserPendingRepo(pendingRepo)
+	h := apisignup.NewHandler(svc, metaRepo, idGen)
+
+	var sent miscsmtp.Message
+	done := make(chan struct{})
+	h.SetEmailSender("https://example.test", func(_ string, msg miscsmtp.Message) {
+		sent = msg
+		close(done)
+	})
+
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"username":"alice","password":"pass1234","emailAddress":"alice@example.com"}`))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	req.Header.Set("Accept-Language", "ja-JP,en;q=0.8")
+	rec := httptest.NewRecorder()
+	require.NoError(t, h.Signup(e.NewContext(req, rec)))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("emailSender was not invoked")
+	}
+	assert.Equal(t, "アカウントの確認", sent.Subject)
 }
 
 // emailRequiredForSignup=true 経路でも 73 byte 以上 password は CreatePending が
@@ -529,6 +628,48 @@ func TestSignup_RegistrationDisabled_ExpiredCode(t *testing.T) {
 
 	rec := doPost(h.Signup, `{"username":"alice","password":"pass","invitationCode":"expired-code"}`)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// **検証を通っても、作成の直前に確保できなければ弾く。** 並行した別の
+// リクエストが同じコードを先に確保した状態 (検証は両方とも通っている)。
+func TestSignup_RegistrationDisabled_ClaimLostIsRejected(t *testing.T) {
+	for _, emailRequired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("emailRequired=%v", emailRequired), func(t *testing.T) {
+			h, _, metaRepo := newTestHandler(t)
+			metaRepo.Meta.DisableRegistration = true
+			metaRepo.Meta.EmailRequiredForSignup = emailRequired
+			store := newMockTicketStore()
+			store.tickets["race-code"] = &model.RegistrationTicket{ID: "t-race", Code: "race-code"}
+			store.claimLost = true
+			h.SetTicketStore(store)
+
+			rec := doPost(h.Signup, `{"username":"alice","password":"pass1234","emailAddress":"a@example.com","invitationCode":"race-code"}`)
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Equal(t, "INVITATION_CODE_INVALID", parseResp(t, rec)["error"].(map[string]any)["code"])
+			assert.Empty(t, store.markUsed)
+			assert.Empty(t, store.markPending)
+		})
+	}
+}
+
+// 作成に失敗したら確保を戻す (コードを無駄にしない)。成功したら戻さない。
+func TestSignup_RegistrationDisabled_ReleasesClaimOnFailure(t *testing.T) {
+	h, userRepo, metaRepo := newTestHandler(t)
+	metaRepo.Meta.DisableRegistration = true
+	store := newMockTicketStore()
+	store.tickets["c1"] = &model.RegistrationTicket{ID: "t-c1", Code: "c1"}
+	h.SetTicketStore(store)
+	_ = userRepo.Create(&model.User{ID: "existing", Username: "taken", UsernameLower: "taken"})
+
+	rec := doPost(h.Signup, `{"username":"taken","password":"pass1234","invitationCode":"c1"}`)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, []string{"t-c1"}, store.released)
+	assert.Nil(t, store.tickets["c1"].UsedAt, "失敗した登録の後はコードをまた使える")
+
+	rec = doPost(h.Signup, `{"username":"fresh","password":"pass1234","invitationCode":"c1"}`)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, []string{"t-c1"}, store.released, "成功したら戻さない")
+	assert.NotNil(t, store.tickets["c1"].UsedAt)
 }
 
 // --- CAPTCHA ---
@@ -931,4 +1072,43 @@ func mustIDGen(t *testing.T) id.Generator {
 	g, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
 	return g
+}
+
+// 最小文字数の違反は `USERNAME_TOO_SHORT` で返す (#3015)。
+//
+// **`USED_USERNAME` / `DENIED_USERNAME` / `INVALID_USERNAME` に混ぜない。**
+// 前二者は「他人のもの」、後者は「文字種か 20 文字の上限が不正」で、利用者の
+// 直し方が違う。最小文字数は運営者の設定なので、何文字必要かが分からないと
+// 直しようがない。additive な code なので既存クライアントは汎用表示に落ちる。
+func TestSignup_UsernameTooShort(t *testing.T) {
+	t.Run("非 email path", func(t *testing.T) {
+		h, _, metaRepo := newTestHandler(t)
+		metaRepo.Meta.MinimumUsernameLength = 5
+		rec := doPost(h.Signup, `{"username":"abcd","password":"pass1234"}`)
+		testutil.AssertFastifyError(t, rec, http.StatusBadRequest, "USERNAME_TOO_SHORT")
+	})
+
+	t.Run("email path", func(t *testing.T) {
+		h, _, metaRepo := newTestHandler(t)
+		metaRepo.Meta.EmailRequiredForSignup = true
+		metaRepo.Meta.MinimumUsernameLength = 5
+		rec := doPost(h.Signup, `{"username":"abcd","password":"pass1234","emailAddress":"x@example.com"}`)
+		testutil.AssertFastifyError(t, rec, http.StatusBadRequest, "USERNAME_TOO_SHORT")
+	})
+
+	// 境界の上側は通ること。**弾きすぎていない**ことを見ないと、
+	// 「常に USERNAME_TOO_SHORT」でもテストが緑になる。
+	t.Run("ちょうど n 文字は通る", func(t *testing.T) {
+		h, _, metaRepo := newTestHandler(t)
+		metaRepo.Meta.MinimumUsernameLength = 5
+		rec := doPost(h.Signup, `{"username":"abcde","password":"pass1234"}`)
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	})
+
+	// 既定 (1) では従来どおり 1 文字でも通る。**既存インスタンスを壊さない。**
+	t.Run("既定では 1 文字でも通る", func(t *testing.T) {
+		h, _, _ := newTestHandler(t)
+		rec := doPost(h.Signup, `{"username":"a","password":"pass1234"}`)
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	})
 }

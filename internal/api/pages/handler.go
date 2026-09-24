@@ -12,6 +12,7 @@ import (
 	corepage "github.com/shiroha-a/mk/internal/core/page"
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
 	"github.com/shiroha-a/mk/internal/entity"
+	"github.com/shiroha-a/mk/internal/misc/colfit"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
@@ -111,8 +112,18 @@ func (h *Handler) Create(c echo.Context) error {
 	if jsonAbsent(req.Content) || jsonAbsent(req.Variables) {
 		return apierr.JSONInvalidParam(c)
 	}
-	// upstream create.ts: eyeCatchingImageId 指定時は自分の drive file か検証し、
-	// 不在なら NO_SUCH_FILE (#1548)。
+	// **jsonb 列へそのまま入る (#3037)。** PostgreSQL の jsonb は NUL エスケープを
+	// 受け付けず SQLSTATE 22P05 でクエリごと落とすので、引く前に弾かないと
+	// **任意の認証ユーザーが 500 を起こせる**。
+	if !colfit.JSONStorable(req.Content) || !colfit.JSONStorable(req.Variables) {
+		return apierr.JSONInvalidParam(c)
+	}
+	// **enum 列へそのまま入る。** `page_visibility_enum` に無い値を渡すと
+	// INSERT が落ちて 500 になる (認証済みなら誰でも起こせた)。`visibility` は
+	// mk-go 独自のフィールド (drop-in #367) なので upstream 側に検証が無い。
+	if !validPageVisibility(req.Visibility) {
+		return apierr.JSONInvalidParam(c)
+	}
 	if !h.eyeCatchingImageOK(req.EyeCatchingImageID, user.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "b7b97489-0f66-4b12-a5ff-b21bd63f6e1c"))
 	}
@@ -206,6 +217,11 @@ func (h *Handler) Show(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	if err != nil {
+		// **DB 障害は 500** (#2792)。service は not-found と access denied だけを
+		// 専用の error にするので、それ以外はここで 500 に落とす。
+		if !errors.Is(err, corepage.ErrPageNotFound) && !errors.Is(err, corepage.ErrAccessDenied) {
+			return apierr.JSONInternalError(c)
+		}
 		// 非 public page を非許可 viewer が引いた場合 (ErrAccessDenied) も存在ごと
 		// 隠して NO_SUCH_PAGE (404) を返す。upstream TS pages/show は可視性ゲートを
 		// 持たず noSuchPage のみ返すため shape が一致し、private page の存在を 403 で
@@ -251,6 +267,21 @@ func (h *Handler) Update(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req UpdateRequest
 	if err := c.Bind(&req); err != nil || req.PageID == "" {
+		return apierr.JSONInvalidParam(c)
+	}
+	// **jsonb 列へそのまま入る (#3037)。** create 側と同じ理由。
+	if !colfit.JSONStorable(req.Content) || !colfit.JSONStorable(req.Variables) {
+		return apierr.JSONInvalidParam(c)
+	}
+	// enum 列の検証も create と揃える (指定されたときだけ)。
+	//
+	// **update では空文字を弾く。** create は値型なので「省略」と「空文字」を
+	// 区別できず `validPageVisibility` が空文字を通すが (service が `public` へ
+	// 正規化する)、update は `*model.PageVisibility` なので省略は nil で表せる。
+	// 空文字を通すと `fields["visibility"] = ""` がそのまま enum 列へ行き、
+	// **認証済みの一般利用者が 500 を起こせる**
+	// (`invalid input value for enum page_visibility_enum: ""`)。
+	if req.Visibility != nil && (*req.Visibility == "" || !validPageVisibility(*req.Visibility)) {
 		return apierr.JSONInvalidParam(c)
 	}
 	// upstream update.ts: eyeCatchingImageId 指定時は自分の drive file か検証し、
@@ -350,7 +381,10 @@ func (h *Handler) My(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -471,6 +505,12 @@ func (h *Handler) PagePush(c echo.Context) error {
 	// 使って合わせる。見つからなければ404に丸め、存在するIDだけに
 	// emitする。
 	p, err := h.svc.FindByID(req.PageID)
+	// **service の sentinel を見る。** page.Service は not-found を
+	// ErrPageNotFound に置き換えるので、repository.IsNotFound では判定できない。
+	if err != nil && !errors.Is(err, corepage.ErrPageNotFound) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_PAGE", "No such page.", "4a13ad31-6729-46b4-b9af-e86b265c2e74"))
 	}
@@ -605,3 +645,16 @@ func (h *Handler) pageToMapWithOwner(p *model.Page, owner *model.User, isLiked *
 // 未配線だと eyecatching image の所有者チェックが素通しになり、他人の drive
 // ファイルを自分の page に貼れる (IDOR)。起動時検査に使う (#2683)。
 func (h *Handler) HasDriveFileRepo() bool { return h.driveFileRepo != nil }
+
+// validPageVisibility reports whether v is one of the values the
+// `page_visibility_enum` column accepts.
+//
+// **空文字は許す。** `visibility` は省略可能で、その場合は列の既定
+// (`public`) が入る。Go の string では省略と空文字を区別できない。
+func validPageVisibility(v model.PageVisibility) bool {
+	switch v {
+	case "", model.PageVisibilityPublic, model.PageVisibilityFollowers, model.PageVisibilitySpecified:
+		return true
+	}
+	return false
+}

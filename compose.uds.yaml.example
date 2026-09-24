@@ -15,8 +15,27 @@
 # nginx の 80 番だけ。`ss -tlnp | grep -E ':(5432|6379|3000)'` が空なら
 # TCP を閉じきれている証拠になる。
 
+# ログの上限 (#2828)。
+#
+# **既定の json-file はローテーションしない。** 指定しないとコンテナが動いている
+# あいだログが増え続け、ディスクを埋める。
+#
+# **`max-size` は decimal。** json-file は units.FromHumanSize で読むので、`50m` は
+# 50,000,000 バイト (= 47.7 MiB)。`50mib` と書いても同じ扱いで、MiB は表現できない。
+# 3 世代で 1 サービスあたり最大 150 MB (= 143 MiB)。実測 (mk-go の本番) では
+# 1 日あたり約 13 MB なので、封筒の分を含めて 1 週間前後は遡れる。
+#
+# **既存のコンテナには効かない。** この設定は生成時に固定されるので、
+# `docker compose up -d` で作り直すまで反映されない。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   postgres:
+    logging: *default-logging
     # pg_bigm (LIKE 部分一致を加速する GIN index 拡張) 入りの PostgreSQL 18
     # (#2514)。CREATE EXTENSION するまでは素の postgres:18-alpine と同じ挙動
     # なので、使わない場合もこのままでよい。有効化手順は docs/deployment.md。
@@ -51,6 +70,7 @@ services:
     restart: unless-stopped
 
   valkey:
+    logging: *default-logging
     image: valkey/valkey:8-alpine
     command: ["valkey-server", "/etc/valkey/valkey.conf"]
     volumes:
@@ -84,6 +104,7 @@ services:
   # 互換の GET 経路に切替えたい場合は mk-go 側で
   # `videoThumbnailGeneratorMode: get` を設定し、対応 image に差し替える。
   #video-thumb:
+  #  logging: *default-logging
   #  image: ghcr.io/nekonoverse/video-thumb:unstable
   #  environment:
   #    UDS_PATH: /run/video-thumb/sock
@@ -94,9 +115,17 @@ services:
   #  restart: unless-stopped
 
   mkgo:
+    logging: *default-logging
     build:
       context: .
       dockerfile: deploy/uds/Dockerfile.mkgo
+      # ビルドした revision と同梱 frontend の版 (#2700)。Dockerfile 内では
+      # `.dockerignore` が `.git` を落とすので git を呼べず、build-arg で渡す。
+      # `make uds-build` が git から埋める。手で `docker compose build` を叩いた
+      # ときは空になり、/about-mkgo 側が表示を省く。
+      args:
+        MKGO_COMMIT: ${MKGO_COMMIT:-}
+        MKGO_FRONTEND_VERSION: ${MKGO_FRONTEND_VERSION:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -141,6 +170,7 @@ services:
     restart: unless-stopped
 
   nginx:
+    logging: *default-logging
     image: nginx:1.27-alpine
     depends_on:
       mkgo:

@@ -358,3 +358,117 @@ func TestNoteReactionRepository_ListReactionPairs(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, empty)
 }
+
+// **凍結した利用者のノートへのリアクションを返さないこと。**
+//
+// `users/reactions` はリアクション先のノートを完全な shape で返すので、その
+// 著者が凍結されていれば出さない。upstream `users/reactions.ts` は
+// `generateSuspendedUserQueryForNote` を掛けている。
+func TestNoteReactionRepository_ListByUserID_ExcludesSuspendedNoteAuthor(t *testing.T) {
+	repo := NewNoteReactionRepository(testDB)
+	author := insertTestUser(t, "u_nr_susp_a", "rxsuspa")
+	reactor := insertTestUser(t, "u_nr_susp_r", "rxsuspr")
+	defer cleanupUser(t, author.ID)
+	defer cleanupUser(t, reactor.ID)
+
+	noteRepo := NewNoteRepository(testDB)
+	note := &model.Note{
+		ID:         "n_nr_susp",
+		UserID:     author.ID,
+		Visibility: model.NoteVisibilityPublic,
+		Reactions:  datatypes.JSON([]byte("{}")),
+	}
+	require.NoError(t, noteRepo.Create(note))
+	defer cleanupNote(t, note.ID)
+
+	rec := &model.NoteReaction{ID: "rx_susp_1", UserID: reactor.ID, NoteID: note.ID, Reaction: "👍"}
+	require.NoError(t, repo.Create(rec))
+	defer cleanupReaction(t, rec.ID)
+
+	// 凍結前は返る (対照)。
+	out, err := repo.ListByUserID(reactor.ID, "", "", "", 10)
+	require.NoError(t, err)
+	require.Len(t, out, 1, "凍結前は返ること")
+
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, author.ID).Error)
+
+	out, err = repo.ListByUserID(reactor.ID, "", "", "", 10)
+	require.NoError(t, err)
+	require.Empty(t, out, "ノートの著者が凍結されていたら返さないこと")
+}
+
+// **返信先 / リノート元の著者が凍結されていても返さないこと。**
+//
+// upstream の `generateSuspendedUserQueryForNote` は `user` / `replyUser` /
+// `renoteUser` の 3 つを見る。著者しか見ないと、**凍結した利用者のノートが
+// 「誰かの返信」として本文ごと出る**。`note` 側の
+// `applySuspendedAuthorExclusion` と同じ 3 列を見ること。
+func TestNoteReactionRepository_ListByUserID_ExcludesSuspendedReplyAndRenoteAuthor(t *testing.T) {
+	// **ID はリテラルで書く。** CI の「重複フィクスチャ ID」検査は
+	// `insertTestUser(t, "..."` の第 1 引数を文字列として読むので、連結で
+	// 組むと前半だけを拾って誤検知する (実際に lint が落ちた)。
+	for _, tc := range []struct {
+		kind       string
+		suspended  string
+		author     string
+		reactor    string
+		baseNote   string
+		targetNote string
+		reaction   string
+	}{
+		{"reply", "u_nrrp_s", "u_nrrp_a", "u_nrrp_r", "n_nrrp_base", "n_nrrp_tgt", "rx_nrrp_1"},
+		{"renote", "u_nrrn_s", "u_nrrn_a", "u_nrrn_r", "n_nrrn_base", "n_nrrn_tgt", "rx_nrrn_1"},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			repo := NewNoteReactionRepository(testDB)
+			noteRepo := NewNoteRepository(testDB)
+			suspended := insertTestUser(t, tc.suspended, tc.suspended)
+			author := insertTestUser(t, tc.author, tc.author)
+			reactor := insertTestUser(t, tc.reactor, tc.reactor)
+			defer cleanupUser(t, suspended.ID)
+			defer cleanupUser(t, author.ID)
+			defer cleanupUser(t, reactor.ID)
+
+			// 凍結される側のノート。
+			base := &model.Note{
+				ID: tc.baseNote, UserID: suspended.ID,
+				Visibility: model.NoteVisibilityPublic, Reactions: datatypes.JSON([]byte("{}")),
+			}
+			require.NoError(t, noteRepo.Create(base))
+			defer cleanupNote(t, base.ID)
+
+			// それへの返信 / 引用。著者は凍結されていない。
+			target := &model.Note{
+				ID: tc.targetNote, UserID: author.ID,
+				Visibility: model.NoteVisibilityPublic, Reactions: datatypes.JSON([]byte("{}")),
+			}
+			if tc.kind == "reply" {
+				target.ReplyID = &base.ID
+				target.ReplyUserID = &suspended.ID
+			} else {
+				target.RenoteID = &base.ID
+				target.RenoteUserID = &suspended.ID
+			}
+			require.NoError(t, noteRepo.Create(target))
+			defer cleanupNote(t, target.ID)
+
+			rec := &model.NoteReaction{
+				ID: tc.reaction, UserID: reactor.ID, NoteID: target.ID, Reaction: "👍",
+			}
+			require.NoError(t, repo.Create(rec))
+			defer cleanupReaction(t, rec.ID)
+
+			// 凍結前は返る (対照)。
+			out, err := repo.ListByUserID(reactor.ID, "", "", "", 10)
+			require.NoError(t, err)
+			require.Len(t, out, 1, "凍結前は返ること")
+
+			require.NoError(t, testDB.Exec(
+				`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, suspended.ID).Error)
+
+			out, err = repo.ListByUserID(reactor.ID, "", "", "", 10)
+			require.NoError(t, err)
+			require.Empty(t, out, "%s 先の著者が凍結されていたら返さないこと", tc.kind)
+		})
+	}
+}

@@ -6,7 +6,7 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 
 | | 場所 |
 |---|---|
-| Go | `plugin/` と `plugin/plugintest/` |
+| Go | `plugin/` と `plugin/peercache/` と `plugin/plugintest/` |
 | TypeScript | `third_party/misskey/packages/frontend/src/plugin-api.ts` |
 | HTTP | `/api/plugin/<name>/` の名前空間 |
 | ページ | `/plugin/<name>/` と `/admin/plugin/<name>/` の名前空間 |
@@ -27,6 +27,16 @@ mk-go 本体を変更する人向け。**公開面を広げてよい条件**と�
 `plugin.Definition` はフィールド名を指定したkeyed struct literalだけを互換対象とする。外部プラグインのpositional / unkeyed literalはサポートしない。既存フィールドの意味や型を変えないoptional fieldはv1のまま追加できるため、プラグイン作者は必ず`Name: ...`のようにフィールド名を書くこと。
 
 `Definition.EffectivePolicies`と関連型の追加はこのadditive契約に従い、`Validate`もRoutes、Jobs、EffectivePoliciesのいずれかを要求する形へ緩和するだけなので、`APIVersion`は1のまま維持する。
+
+`Definition.Peer`（#2819）と`Context.Queue()`、`plugin.Queue` / `EnqueueOption`の追加も同じ扱い。`Definition.Peer`は既存プラグインが`Routes`の中でpeerを登録していても壊さない（`RoleBoth`ならそのまま動く）が、**ロールを分割した構成では応答が届かない**ので、移すこと。登録が無いロールでは起動時にwarnが出る。
+
+`Context`はmk-goが実装してプラグインは受け取るだけなので、メソッドが増えてもプラグインは壊れない（プラグイン側が`Context`を自前で実装している場合はこの限りではないが、それはサポート対象外）。
+
+### キューの実装との関係
+
+**`plugin.Queue`はmkqを再公開しない。** 本体のworkerはペイロードを`{type, body}`で包んで`type`でdispatchするので、素のmkqハンドルから積んだジョブは処理者が見つからない。包み方は本体のenqueueとworkerの間の契約であって、プラグインに晒す面ではない（`internal/queue/driver/mkqdriver`）。
+
+したがって**`plugin.APIVersion`はmkqのメジャー版に連動しない**。mkqを差し替えても`plugin.Queue`の形が変わらなければ、プラグインは再ビルドだけで動く。逆に`EnqueueOptions`のフィールドの意味を変えるときは、mkqが同じままでも破壊的変更になる。
 
 ### 破壊的変更（メジャー）
 
@@ -86,7 +96,7 @@ go run ./tools/pluginspec -write
 
 **golden の差分は必ずレビューで意図を確認すること。** これが「うっかり公開面が広がる」ことを防ぐ唯一の仕組み。
 
-対象は `plugin/` と `plugin/plugintest/` の両方。テスト用だからと外すと、そこだけ黙って育つ。
+対象は `plugin/` と `plugin/peercache/` と `plugin/plugintest/` の 3 つ。テスト用だからと外すと、そこだけ黙って育つ。
 
 ## サンプルプラグイン
 
@@ -100,7 +110,7 @@ go run ./tools/pluginspec -write
 |---|---|---|
 | `build` の `Vet bundled plugins` | 各プラグインを `go vet` (テストファイルも含めてコンパイル) | ○ |
 | `plugin-tests` | 各プラグインのテストを実行 (`replace` で本体の公開面に対してコンパイルされる) | × |
-| `frontend-check` | `make plugins-all` (`-include-disabled`) → 統合バイナリのビルド → `vue-tsc` | × |
+| `frontend-check` | `make plugins-all` (`-include-disabled`) → 統合バイナリのビルド → `vue-tsc` + submodule 依存のゲート | × |
 
 required なのは `build` だけ (`docs/ci.md` の required check は `build` / `test` / `lint` の 3 つ)。`plugin-tests` / `frontend-check` だけが落ちる壊れ方はマージをブロックしない。
 

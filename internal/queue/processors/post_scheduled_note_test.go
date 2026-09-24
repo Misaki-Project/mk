@@ -11,6 +11,7 @@ import (
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/queue"
 	"github.com/shiroha-a/mk/internal/queue/driver"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,7 +33,9 @@ func (s *stubDraftRepo) FindByID(id string) (*model.NoteDraft, error) {
 	}
 	d, ok := s.drafts[id]
 	if !ok {
-		return nil, errors.New("not found")
+		// **sentinel を返す。** 生の error だと呼び出し側が not-found と障害を
+		// 区別できず、#3116 の分岐を試せない。
+		return nil, repository.ErrNotFound
 	}
 	return d, nil
 }
@@ -60,7 +63,10 @@ func (s *stubUserRepo) FindByID(id string) (*model.User, error) {
 	}
 	u, ok := s.users[id]
 	if !ok {
-		return nil, errors.New("user not found")
+		// **sentinel を返す** (#3121)。production の `userRepository.FindByID` は
+		// miss で `gorm.ErrRecordNotFound` を返すので、生の error にすると
+		// 「retry しても変わらない not-found」と DB 障害を取り違えたまま緑になる。
+		return nil, repository.ErrNotFound
 	}
 	return u, nil
 }
@@ -79,10 +85,17 @@ func (s *stubPublisher) Create(in note.CreateInput) (*model.Note, error) {
 }
 
 func newProcessor(drafts map[string]*model.NoteDraft, users map[string]*model.User) (*PostScheduledNoteProcessor, *stubDraftRepo, *stubPublisher) {
+	p, dr, _, pub := newProcessorFull(drafts, users)
+	return p, dr, pub
+}
+
+// newProcessorFull is newProcessor plus the user repo, for tests that inject a
+// lookup failure there (#3121)。
+func newProcessorFull(drafts map[string]*model.NoteDraft, users map[string]*model.User) (*PostScheduledNoteProcessor, *stubDraftRepo, *stubUserRepo, *stubPublisher) {
 	dr := &stubDraftRepo{drafts: drafts}
 	ur := &stubUserRepo{users: users}
 	pub := &stubPublisher{}
-	return NewPostScheduledNoteProcessor(dr, ur, pub), dr, pub
+	return NewPostScheduledNoteProcessor(dr, ur, pub), dr, ur, pub
 }
 
 func taskFor(draftID string) driver.Task {
@@ -120,6 +133,78 @@ func TestPostScheduledNote_DraftMissing(t *testing.T) {
 	assert.Empty(t, pub.calls, "draft が無いなら publish しない")
 }
 
+// **DB 障害は ack しない** (#3116)。ack すると job が成功扱いになって retry
+// されず、**予約投稿が黙って消える**。直上の DraftMissing (not-found = ack が
+// 正しい) と対にして読むこと — 片方だけだと、両方を同じ側へ倒す実装で緑になる。
+func TestPostScheduledNote_DraftLookupFailurePropagates(t *testing.T) {
+	p, draftRepo, pub := newProcessor(map[string]*model.NoteDraft{}, map[string]*model.User{})
+	boom := errors.New("connection refused")
+	draftRepo.findErr = boom
+
+	err := p.Handle(context.Background(), taskFor("d1"))
+	require.ErrorIs(t, err, boom, "DB 障害を ack している")
+	assert.Empty(t, pub.calls)
+}
+
+// **lock は publish の直前でだけ取る** (#3121)。
+//
+// 手前で取ると、lookup が失敗して retry に回ったとき TTL (5 分) のあいだ
+// `ok=false` で silent skip になり、**障害が「already being published」という
+// 事実と逆の Info 1 行で成功扱いになる**。初回 backoff (約 60 秒) は TTL より
+// 短いので、TTL では救えない。
+func TestPostScheduledNote_LockTakenOnlyAtPublish(t *testing.T) {
+	at := time.Now().Add(-time.Minute)
+	draftsOf := func() map[string]*model.NoteDraft {
+		return map[string]*model.NoteDraft{
+			"d1": {ID: "d1", UserID: "u1", ScheduledAt: &at, IsActuallyScheduled: true},
+		}
+	}
+
+	t.Run("draft の lookup が引けないときは取らない", func(t *testing.T) {
+		p, draftRepo, pub := newProcessor(draftsOf(), map[string]*model.User{"u1": {ID: "u1"}})
+		lock := &stubLock{acquired: true}
+		p.SetLock(lock)
+		draftRepo.findErr = errors.New("connection refused")
+
+		require.Error(t, p.Handle(context.Background(), taskFor("d1")))
+		assert.Equal(t, 0, lock.calls, "lock を握ったまま retry に回している")
+		assert.Empty(t, pub.calls)
+	})
+
+	t.Run("利用者の lookup が引けないときも取らない", func(t *testing.T) {
+		p, _, userRepo, pub := newProcessorFull(draftsOf(), map[string]*model.User{"u1": {ID: "u1"}})
+		lock := &stubLock{acquired: true}
+		p.SetLock(lock)
+		userRepo.err = errors.New("connection refused")
+
+		require.Error(t, p.Handle(context.Background(), taskFor("d1")))
+		assert.Equal(t, 0, lock.calls, "lock を握ったまま retry に回している")
+		assert.Empty(t, pub.calls)
+	})
+
+	t.Run("publish するときだけ取る", func(t *testing.T) {
+		p, _, pub := newProcessor(draftsOf(), map[string]*model.User{"u1": {ID: "u1"}})
+		lock := &stubLock{acquired: true}
+		p.SetLock(lock)
+
+		require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
+		assert.Equal(t, 1, lock.calls, "publish の手前で取っていない")
+		require.Len(t, pub.calls, 1)
+	})
+
+	// **not-found は retry に倒さない** (#3121)。`note_draft.userId` は
+	// ON DELETE CASCADE なので普通は起きないが、起きたなら空振りを繰り返すだけ。
+	t.Run("利用者が消えていたら ack", func(t *testing.T) {
+		p, _, pub := newProcessor(draftsOf(), map[string]*model.User{})
+		lock := &stubLock{acquired: true}
+		p.SetLock(lock)
+
+		require.NoError(t, p.Handle(context.Background(), taskFor("d1")))
+		assert.Equal(t, 0, lock.calls)
+		assert.Empty(t, pub.calls)
+	})
+}
+
 // isActuallyScheduled=false な draft (= 後で unschedule された) は publish せず
 // silent skip (draft も残す)。
 func TestPostScheduledNote_Unscheduled(t *testing.T) {
@@ -151,12 +236,15 @@ func TestPostScheduledNote_PublishErrorNoRetry(t *testing.T) {
 	assert.Contains(t, draftRepo.drafts, "d1", "publish 失敗時は draft 残す")
 }
 
-// payload decode 失敗は error 返却 (= asynq に retry / dead letter 判断させる)。
+// payload decode 失敗は error 返却 (= driver に retry / dead letter 判断させる)。
 func TestPostScheduledNote_PayloadDecodeError(t *testing.T) {
 	p, _, _ := newProcessor(map[string]*model.NoteDraft{}, map[string]*model.User{})
 	bad := driver.RawTask{TypeName: queue.TaskTypePostScheduledNote, Body: []byte("{not json")}
 	err := p.Handle(context.Background(), bad)
 	require.Error(t, err)
+	// **retry させない** (#3121)。attempts を積んだので、付けないと壊れた
+	// payload が backoff 込みで 30 時間ほど再試行され続ける。
+	require.ErrorIs(t, err, driver.ErrSkipRetry)
 }
 
 // timeFromMs is a tiny helper to convert ms epoch to time.Time.
@@ -196,8 +284,11 @@ func TestPostScheduledNote_LockAcquired_PublishesOnce(t *testing.T) {
 }
 
 func TestPostScheduledNote_LockBusy_SkipsPublish(t *testing.T) {
+	// **ScheduledAt を持たせる。** 持たせないと lock より手前の gate で ack して
+	// しまい、lock の検証が空虚になる (#3121 で lock を publish 直前へ下げた)。
+	scheduledAt := timeFromMs(1234)
 	drafts := map[string]*model.NoteDraft{
-		"d1": {ID: "d1", UserID: "u1", IsActuallyScheduled: true},
+		"d1": {ID: "d1", UserID: "u1", IsActuallyScheduled: true, ScheduledAt: &scheduledAt},
 	}
 	p, _, pub := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
 	p.SetLock(&stubLock{acquired: false})
@@ -207,8 +298,9 @@ func TestPostScheduledNote_LockBusy_SkipsPublish(t *testing.T) {
 }
 
 func TestPostScheduledNote_LockError_Retries(t *testing.T) {
+	scheduledAt := timeFromMs(1234)
 	drafts := map[string]*model.NoteDraft{
-		"d1": {ID: "d1", UserID: "u1", IsActuallyScheduled: true},
+		"d1": {ID: "d1", UserID: "u1", IsActuallyScheduled: true, ScheduledAt: &scheduledAt},
 	}
 	p, _, _ := newProcessor(drafts, map[string]*model.User{"u1": {ID: "u1"}})
 	p.SetLock(&stubLock{err: errors.New("redis down")})

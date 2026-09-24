@@ -9,6 +9,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 )
 
@@ -163,10 +164,31 @@ func (h *Handler) AuthorizedApps(c echo.Context) error {
 // TS互換: tokenId (ID) または token (ハッシュ文字列) のどちらかで指定可。
 // 指定 access_token が自分の所有であれば削除する。
 func (h *Handler) RevokeToken(c echo.Context) error {
+	// upstream c07ce75281 は requireCredential を外し、認証を実装内に移したうえで
+	// **endpoint 固有の** CREDENTIAL_REQUIRED を投げる。汎用の middleware に任せると
+	// id が 1384574d-... になり upstream (6f1f0d3a-...) と wire が食い違う。
+	u := middleware.GetUser(c)
+	if u == nil {
+		// **凍結アカウントの扱いは upstream と意図的に違う (#2877)。** upstream の
+		// isSuspended 判定は ApiCallService の
+		// `requireCredential || requireModerator || requireAdmin` ブロックの中にあり、
+		// この endpoint はどれも宣言していないので **upstream は suspended を一切見ず、
+		// 凍結ユーザーも 204 で失効できる**。
+		//
+		// mk-go は Authenticate が凍結ユーザーを anonymous に落とす構造なので、ここで
+		// 分けないと 401 CREDENTIAL_REQUIRED になり upstream からさらに遠のく。403 の
+		// ほうが「凍結ゆえに拒否した」ことが伝わるので、そちらを採る。
+		if middleware.IsSuspendedRequest(c) {
+			return c.JSON(http.StatusForbidden, apierr.YourAccountSuspended())
+		}
+		return c.JSON(http.StatusUnauthorized, apierr.Error("CREDENTIAL_REQUIRED", "Credential required.", "6f1f0d3a-3d5b-4b1f-9c3e-2a6d1e5b8c47"))
+	}
+	// repo 未配線は認証の**後**に見る。前に置くと未認証リクエストにも 204 を返す
+	// (起動時の HasAccessTokenRepo 検査があるので production には届かないが、
+	// 認証を handler に移した以上、順序で守るべきもの)。
 	if h.accessTokenRepo == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
-	u := middleware.GetUser(c)
 	var req struct {
 		TokenID string `json:"tokenId"`
 		Token   string `json:"token"`
@@ -189,6 +211,12 @@ func (h *Handler) RevokeToken(c echo.Context) error {
 		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.Token)))
 		tok, err = h.accessTokenRepo.FindByHashOrToken(hash, req.Token)
 	}
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を「失効した」(204) に丸めない** (#2792)。呼び出し側は成功と
+		// 受け取るのに token は生きている。secure を外してサードパーティアプリが
+		// この経路に到達できるようになったので、露出範囲が広がっている。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -197,6 +225,14 @@ func (h *Handler) RevokeToken(c echo.Context) error {
 		// 実行するだけで、他人の token は単に no-op (成功 204) になる (#1546)。
 		// 403 を返すと token の存在 / 所有者が leak するため、no-op 204 に揃える。
 		return c.NoContent(http.StatusNoContent)
+	}
+	// upstream c07ce75281: アクセストークン経由 (サードパーティアプリ) では
+	// **いま使っているトークン自身しか**失効させられない。native session から
+	// 叩く分は従来どおり自分の全トークンを失効できる。
+	// 他人のトークンより後に置く — 存在しないトークン ID に 403 を返すと
+	// 「そのトークンは在る」ことが漏れるため。
+	if sc := middleware.GetAuthScope(c); sc != nil && sc.IsApp && sc.TokenID != tok.ID {
+		return c.JSON(http.StatusForbidden, apierr.Error("PERMISSION_DENIED", "Permission denied.", "fc20d118-5705-4462-b6c5-2b5b43092cf3"))
 	}
 	if err := h.accessTokenRepo.DeleteByID(tok.ID); err != nil {
 		return apierr.JSONInternalError(c)

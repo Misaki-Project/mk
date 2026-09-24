@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/shiroha-a/mk/internal/activitypub"
+	"github.com/shiroha-a/mk/internal/core/deliveryhealth"
 	"github.com/shiroha-a/mk/internal/core/federation"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/queue"
@@ -41,7 +43,7 @@ func mustEncode(t *testing.T, p queue.InboxPayload) []byte {
 	return b
 }
 
-// #534: InboxProcessor は payload decode 失敗を SkipRetry で確定 fail に
+// #534: InboxProcessor は payload decode 失敗を ErrSkipRetry で確定 fail に
 // する (壊れた payload を retry しても無限ループするため)。
 func TestInboxProcessor_DecodeFailureIsSkipRetry(t *testing.T) {
 	p := processors.NewInboxProcessor(&stubFedProcessor{})
@@ -51,8 +53,8 @@ func TestInboxProcessor_DecodeFailureIsSkipRetry(t *testing.T) {
 		Body:     []byte(`{not json`),
 	})
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, driver.SkipRetry),
-		"malformed payload should bubble up driver.SkipRetry to suppress retries")
+	assert.True(t, errors.Is(err, driver.ErrSkipRetry),
+		"malformed payload should bubble up driver.ErrSkipRetry to suppress retries")
 }
 
 // 正常 path: federation.Processor.Process が nil を返せば Handle も nil。
@@ -465,9 +467,15 @@ func (s *stubLDVerifier) VerifyAndCreator(_ []byte) (string, bool, error) {
 type multiActorVerifier struct {
 	pubKey string
 	byURI  map[string]*model.User
+	// errByURI injects a per-URI lookup failure (#3121)。「解決できない」と
+	// 「引けなかった」を分けて試すために使う。
+	errByURI map[string]error
 }
 
 func (m *multiActorVerifier) ResolveActor(actorURI string) (*model.User, error) {
+	if err, ok := m.errByURI[actorURI]; ok {
+		return nil, err
+	}
 	if u, ok := m.byURI[actorURI]; ok {
 		return u, nil
 	}
@@ -755,7 +763,7 @@ func TestInboxProcessor_LDVerify_FailDropsActivity(t *testing.T) {
 }
 
 // 任意 error は driver の retry policy (inboxJobMaxAttempts) に任せるため
-// そのまま返す (SkipRetry を付けない)。
+// そのまま返す (ErrSkipRetry を付けない)。
 func TestInboxProcessor_GenericErrorPropagatesForRetry(t *testing.T) {
 	boom := errors.New("transient db error")
 	stub := &stubFedProcessor{returnFn: func(_ []byte) error { return boom }}
@@ -767,8 +775,8 @@ func TestInboxProcessor_GenericErrorPropagatesForRetry(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, boom), "underlying error must be wrapped, not swallowed")
-	assert.False(t, errors.Is(err, driver.SkipRetry),
-		"transient errors should NOT carry SkipRetry — driver retry handles them")
+	assert.False(t, errors.Is(err, driver.ErrSkipRetry),
+		"transient errors should NOT carry ErrSkipRetry — driver retry handles them")
 }
 
 // #2106 N26: HTTP 署名済 + signer==actor の通常経路では、LD-Signature verify 失敗
@@ -997,4 +1005,233 @@ func TestInboxProcessor_TypeErrorDoesNotBypassActorGate(t *testing.T) {
 			assert.Empty(t, stub.calls, "署名者と異なる actor を Process へ渡さない")
 		})
 	}
+}
+
+// unavailableKeyVerifier は鍵の lookup だけを落とす verifier。actor は解決でき
+// るので、**署名が合わないのではなく確かめられなかった**状態を再現する (#3121)。
+type unavailableKeyVerifier struct {
+	actor    *model.User
+	pubKey   string
+	keyErr   error
+	actorErr error
+}
+
+func (u *unavailableKeyVerifier) ResolveActor(_ string) (*model.User, error) {
+	if u.actorErr != nil {
+		return nil, u.actorErr
+	}
+	return u.actor, nil
+}
+
+func (u *unavailableKeyVerifier) PublicKeyForActor(_ string) (string, error) {
+	if u.keyErr != nil {
+		return "", u.keyErr
+	}
+	return u.pubKey, nil
+}
+
+func (u *unavailableKeyVerifier) PublicKeyForKeyID(actorID, _ string) (string, error) {
+	return u.PublicKeyForActor(actorID)
+}
+
+// #3121: 署名を「確かめられなかった」ときは ack せず job に retry させる。
+// ack すると DB 障害のあいだに届いた activity がそのまま失われる (inbox は
+// enqueue した時点で 202 を返すので相手の再送は当てにできない)。
+func TestInboxProcessor_VerificationUnavailableIsRetried(t *testing.T) {
+	priv, pub, err := activitypub.GenerateRSAKeypair()
+	require.NoError(t, err)
+	key, err := activitypub.NewPrivateKey("https://remote.example/users/alice#main-key", priv)
+	require.NoError(t, err)
+
+	host := "remote.example"
+	aliceURI := "https://remote.example/users/alice"
+	actor := &model.User{ID: "alice", Host: &host, URI: &aliceURI}
+	body := []byte(`{"id":"https://remote.example/follows/1","type":"Follow","actor":"https://remote.example/users/alice"}`)
+	payload := signedInboxPayload(t, key, body)
+
+	t.Run("確かめられなかったときは error を返す", func(t *testing.T) {
+		boom := fmt.Errorf("%w: public key for actor %q: connection refused",
+			federation.ErrLookupUnavailable, "alice")
+		stub := &stubFedProcessor{}
+		p := processors.NewInboxProcessor(stub)
+		p.SetSignatureVerifier(&unavailableKeyVerifier{actor: actor, keyErr: boom})
+		tel := &recordingTelemetry{}
+		p.SetDeliveryTelemetry(tel)
+
+		err := p.Handle(context.Background(), driver.RawTask{
+			TypeName: queue.TaskTypeInbox,
+			Body:     mustEncode(t, payload),
+		})
+		require.ErrorIs(t, err, federation.ErrLookupUnavailable, "ack に潰している")
+		assert.Empty(t, stub.calls, "検証を通していないのに Process へ流している")
+		// **分類も見る。** signatureFailed のままだと Errored Instances 上で
+		// 「相手の署名が壊れている」に見え、こちらの DB 障害が隠れる。
+		require.Len(t, tel.outcomes, 1)
+		assert.Equal(t, deliveryhealth.ClassProcessingError, tel.outcomes[0].Class)
+	})
+
+	// 鍵ではなく actor の lookup が引けなかった場合も同じ。**こちらのほうが
+	// 先に走る**ので、塞がないと DB 障害のあいだ届いた activity はここで落ちる。
+	t.Run("actor の lookup が引けないときも error を返す", func(t *testing.T) {
+		boom := fmt.Errorf("%w: actor %q: connection refused",
+			federation.ErrLookupUnavailable, aliceURI)
+		stub := &stubFedProcessor{}
+		p := processors.NewInboxProcessor(stub)
+		p.SetSignatureVerifier(&unavailableKeyVerifier{actorErr: boom, pubKey: pub})
+		tel := &recordingTelemetry{}
+		p.SetDeliveryTelemetry(tel)
+
+		err := p.Handle(context.Background(), driver.RawTask{
+			TypeName: queue.TaskTypeInbox,
+			Body:     mustEncode(t, payload),
+		})
+		require.ErrorIs(t, err, federation.ErrLookupUnavailable, "ack に潰している")
+		assert.Empty(t, stub.calls)
+		require.Len(t, tel.outcomes, 1)
+		assert.Equal(t, deliveryhealth.ClassProcessingError, tel.outcomes[0].Class)
+	})
+
+	// **対になる側も見る。** 両方 retry に倒す実装でも上だけなら緑になる。
+	// 署名が合わない body は retry しても結果が変わらないので ack のまま。
+	t.Run("署名検証の失敗は従来どおり ack", func(t *testing.T) {
+		stub := &stubFedProcessor{}
+		p := processors.NewInboxProcessor(stub)
+		p.SetSignatureVerifier(&unavailableKeyVerifier{actor: actor, keyErr: errors.New("no key")})
+		tel := &recordingTelemetry{}
+		p.SetDeliveryTelemetry(tel)
+
+		require.NoError(t, p.Handle(context.Background(), driver.RawTask{
+			TypeName: queue.TaskTypeInbox,
+			Body:     mustEncode(t, payload),
+		}))
+		assert.Empty(t, stub.calls)
+		require.Len(t, tel.outcomes, 1)
+		assert.Equal(t, deliveryhealth.ClassSignatureFailed, tel.outcomes[0].Class)
+	})
+
+	// 正常系が通ることも見る (上 2 つは鍵を返さない経路なので、verify そのものを
+	// 常に落とす変異でも両方緑になる)。
+	t.Run("検証が通れば Process へ流す", func(t *testing.T) {
+		stub := &stubFedProcessor{}
+		p := processors.NewInboxProcessor(stub)
+		p.SetSignatureVerifier(&unavailableKeyVerifier{actor: actor, pubKey: pub})
+
+		require.NoError(t, p.Handle(context.Background(), driver.RawTask{
+			TypeName: queue.TaskTypeInbox,
+			Body:     mustEncode(t, payload),
+		}))
+		require.Len(t, stub.calls, 1)
+	})
+}
+
+// #3121: 転送 activity の認可も DB を読む (LD-Signature の creator を
+// `ResolveActor` で解決し、その鍵を DB から引く)。理由を見ずに drop すると、
+// DB 障害のあいだリレー経由の配送がまるごと消える。
+func TestInboxProcessor_AuthorizeActorLookupUnavailableIsRetried(t *testing.T) {
+	priv, pub, err := activitypub.GenerateRSAKeypair()
+	require.NoError(t, err)
+	key, err := activitypub.NewPrivateKey("https://relay.example/actor#main-key", priv)
+	require.NoError(t, err)
+
+	relayHost := "relay.example"
+	body := []byte(`{"id":"https://origin.example/creates/1","type":"Create","actor":"https://origin.example/users/alice","signature":{"type":"RsaSignature2017","creator":"https://origin.example/users/alice#main-key"}}`)
+	payload := signedInboxPayload(t, key, body)
+
+	boom := fmt.Errorf("%w: actor %q: connection refused",
+		federation.ErrLookupUnavailable, "https://origin.example/users/alice")
+	verifier := &multiActorVerifier{
+		pubKey: pub,
+		byURI: map[string]*model.User{
+			"https://relay.example/actor": {ID: "relay", Host: &relayHost, URI: uptr("https://relay.example/actor")},
+		},
+		// creator (origin/alice) の解決だけ落とす。
+		errByURI: map[string]error{"https://origin.example/users/alice": boom},
+	}
+	stub := &stubFedProcessor{}
+	p := processors.NewInboxProcessor(stub)
+	p.SetSignatureVerifier(verifier)
+	p.SetLDSignatureVerifier(&stubLDVerifier{present: true, creator: "https://origin.example/users/alice#main-key"})
+	tel := &recordingTelemetry{}
+	p.SetDeliveryTelemetry(tel)
+
+	err = p.Handle(context.Background(), driver.RawTask{
+		TypeName: queue.TaskTypeInbox,
+		Body:     mustEncode(t, payload),
+	})
+	require.ErrorIs(t, err, federation.ErrLookupUnavailable, "ack に潰している")
+	assert.Empty(t, stub.calls)
+	require.Len(t, tel.outcomes, 1)
+	assert.Equal(t, deliveryhealth.ClassProcessingError, tel.outcomes[0].Class)
+}
+
+// #3121: Headers 無しの legacy / direct-enqueue 経路も同じ。LD-Signature の
+// creator の鍵は DB から引くので、理由を見ずに drop すると消える。
+func TestInboxProcessor_LegacyLDVerifyLookupUnavailableIsRetried(t *testing.T) {
+	boom := fmt.Errorf("%w: ld-sig public key: connection refused", federation.ErrLookupUnavailable)
+	body := []byte(`{"id":"https://remote.example/creates/1","type":"Create","actor":"https://remote.example/users/alice"}`)
+
+	t.Run("確かめられなかったときは error を返す", func(t *testing.T) {
+		stub := &stubFedProcessor{}
+		p := processors.NewInboxProcessor(stub)
+		p.SetLDSignatureVerifier(&stubLDVerifier{err: boom})
+
+		err := p.Handle(context.Background(), driver.RawTask{
+			TypeName: queue.TaskTypeInbox,
+			Body:     mustEncode(t, queue.InboxPayload{Body: body}),
+		})
+		require.ErrorIs(t, err, federation.ErrLookupUnavailable, "ack に潰している")
+		assert.Empty(t, stub.calls)
+	})
+
+	// **対になる側。** 検証そのものの失敗は従来どおり drop する。
+	t.Run("検証失敗は従来どおり drop", func(t *testing.T) {
+		stub := &stubFedProcessor{}
+		p := processors.NewInboxProcessor(stub)
+		p.SetLDSignatureVerifier(&stubLDVerifier{err: errors.New("bad signature")})
+
+		require.NoError(t, p.Handle(context.Background(), driver.RawTask{
+			TypeName: queue.TaskTypeInbox,
+			Body:     mustEncode(t, queue.InboxPayload{Body: body}),
+		}))
+		assert.Empty(t, stub.calls)
+	})
+}
+
+// **転送された actor 側の連合可否も見ること。**
+//
+// ブロック判定は HTTP 署名者にしか掛かっていなかったので、第三者 (リレー等) が
+// 転送すると `blockedHosts` に入れたホストの actor でも LD-Signature が有効なら
+// 処理されていた。`Announce` / `Like` / `Follow` / `Block` / `Flag` / `Move` /
+// chat がそのまま通り、defederation が素通りする。
+func TestInboxProcessor_ForwardedActorFromBlockedHostDropped(t *testing.T) {
+	priv, pub, err := activitypub.GenerateRSAKeypair()
+	require.NoError(t, err)
+	// 署名者 = relay (ブロックしていない)。
+	key, err := activitypub.NewPrivateKey("https://relay.example/actor#main-key", priv)
+	require.NoError(t, err)
+
+	relayHost := "relay.example"
+	blockedHost := "blocked.example"
+	verifier := &multiActorVerifier{
+		pubKey: pub,
+		byURI: map[string]*model.User{
+			"https://relay.example/actor":         {ID: "relay", Host: &relayHost, URI: uptr("https://relay.example/actor")},
+			"https://blocked.example/users/alice": {ID: "alice", Host: &blockedHost, URI: uptr("https://blocked.example/users/alice")},
+		},
+	}
+	stub := &stubFedProcessor{}
+	p := processors.NewInboxProcessor(stub)
+	p.SetSignatureVerifier(verifier)
+	p.SetLDSignatureVerifier(&stubLDVerifier{present: true, creator: "https://blocked.example/users/alice#main-key"})
+	// **ブロックしているのは転送元 (actor) のホストだけ。** 署名者は通る。
+	p.SetHostBlockChecker(&stubBlocker{blocked: func(h string) bool { return h == blockedHost }})
+
+	body := []byte(`{"id":"https://blocked.example/creates/1","type":"Create","actor":"https://blocked.example/users/alice","signature":{"type":"RsaSignature2017","creator":"https://blocked.example/users/alice#main-key"}}`)
+	payload := signedInboxPayload(t, key, body)
+	require.NoError(t, p.Handle(context.Background(), driver.RawTask{
+		TypeName: queue.TaskTypeInbox,
+		Body:     mustEncode(t, payload),
+	}), "drop は sender へ retry を要求しない")
+	require.Empty(t, stub.calls,
+		"ブロックしたホストの actor は、転送経由でも処理しないこと")
 }

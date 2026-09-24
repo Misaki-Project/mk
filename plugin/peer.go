@@ -1,8 +1,3 @@
-/*
- * SPDX-FileCopyrightText: syuilo and misskey-project
- * SPDX-License-Identifier: AGPL-3.0-only
- */
-
 package plugin
 
 import (
@@ -19,8 +14,12 @@ import (
  * 閉じるので、壊れても他実装には届かない。代わりに、相手も同じプラグインを
  * 持っていることが前提になる。
  *
- * 宛先・署名・ブロック・SSRF・大きさ・レート制限は mk-go 側で担保する。
- * プラグインが面倒を見るのは payload の中身だけ。
+ * 宛先・署名・ブロック・SSRF・大きさ・受け口のレート制限は mk-go 側で担保する
+ * ([Router] と違い、peer の受け口には専用の throttle がある)。**送信側には
+ * 無い**ので、送る量はプラグインが決めること。プラグインが面倒を見るのは
+ * payload の中身と、送る間隔。
+ *
+ * wire の仕様は docs/plugin-peer-protocol.md。
  */
 
 // Peer is a private channel to the same plugin on other mk-go instances.
@@ -28,15 +27,23 @@ import (
 // 使うには [Definition.Peered] を立てる。立てると nodeinfo にプラグイン名が
 // 出て、相手から「このインスタンスは同じプラグインを持っている」と分かる。
 // 立てていないプラグインでこれを呼ぶとエラーになる。
+//
+// **[Handle] と [OnReply] は [Definition.Peer] の中で登録する。** Routes の中で
+// 登録すると、ロールを分割した構成 (MK_ONLY_SERVER / MK_ONLY_QUEUE) で片方に
+// しか登録されない — 送信の POST は queue ロールで走るので、OnReply が
+// server ロールにしか無いと応答が届かない (#2819)。
 type Peer interface {
-	// Send queues a payload for the same plugin on host and returns the id
+	// Send posts a payload to the same plugin on host and returns the id
 	// that identifies this exchange.
 	//
-	// **即座に返る。** 実際の送信は mk-go のキューが行うので、相手が遅くても
-	// こちらのリクエストは詰まらない。応答は [Peer.OnReply] に届く。
+	// **POST はキューが行う**ので、相手が遅くてもこちらのリクエストは詰まらない。
+	// 応答は [Peer.OnReply] に届く。ただし**即座に返るとは限らない** — 相手の
+	// nodeinfo がキャッシュに無いと、ここで取得を待つ (最大 10 秒)。
+	//
+	// **再起動をまたぐ (#2819)。** 送信中のものはデプロイで消えない。
 	//
 	// 相手が同じプラグインを持たない / ブロックしている / 宛先が不正な場合は
-	// ここでエラーになる (キューに積まれない)。
+	// ここでエラーになり、送信そのものが起きない。
 	Send(ctx context.Context, host string, payload any) (id string, err error)
 
 	// Handle registers the receiver for payloads from other instances.
@@ -52,8 +59,12 @@ type Peer interface {
 	// OnReply registers the receiver for replies to [Peer.Send].
 	//
 	// **届かないことがある。** 相手が落ちている / 応答しない / リトライの
-	// 上限に達した場合は呼ばれない。mk-go は「いつか必ず届く」を約束しない
-	// ので、取り直しはプラグイン側が期限を持って行うこと。
+	// 上限に達した / 相手がプラグインを外した場合は呼ばれない。mk-go は
+	// 「いつか必ず届く」を約束しないので、取り直しはプラグイン側が期限を
+	// 持って行うこと。
+	//
+	// **複数回呼ばれることがある。** 送信はキューに載るので、worker が途中で
+	// 落ちれば同じ交換が積み直される。加算や追記はそのままでは二重になる。
 	OnReply(fn PeerReplyHandler)
 
 	// Has reports whether host runs this plugin.

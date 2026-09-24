@@ -24,7 +24,7 @@ upstream と一致するか」(計算結果・正規化・順序・条件分岐�
 docker-compose.diff.yml  (隔離 stack、production UDS には触れない)
 ├─ mkgo  (build: tests/federation/common/Dockerfile.mkgo, config: tests/diff/mkgo.yml)
 │   ├─ postgres-mk / redis-mk
-├─ ts    (image: misskey/misskey:2026.7.0, config: tests/diff/ts.yml)
+├─ ts    (image: misskey/misskey:2026.9.1, config: tests/diff/ts.yml)
 │   ├─ postgres-ts / redis-ts
 └─ diff-runner (profiles:[test], pytest + requests)
      MKGO_URL=http://mkgo:3000  TS_URL=http://ts:3000
@@ -32,7 +32,7 @@ docker-compose.diff.yml  (隔離 stack、production UDS には触れない)
 
 - **API-only (HTTP, no TLS/federation)**: runner は両 backend を `:3000` で直接
   叩く。WebAuthn/secure-context は不要なので nginx TLS 層は省く。
-- **version**: mk-go・TS ともに **2026.7.0** で一致している。かつては公式 image が
+- **version**: mk-go・TS ともに **2026.9.1** で一致している。かつては公式 image が
   1 minor 遅れており version-gap のノイズを ignore-list で吸収していたが、その必要は
   無くなった。追従直後で公式 image が未公開の期間だけ、再び gap が生じうる。
 - **隔離 (重要)**: compose 先頭で `name: mkdiff` を指定し専用 project に固定する。
@@ -155,7 +155,7 @@ FTT on/off で計 4 実行)。
 | `notes/timeline` | `note.go ListHomeTimeline` | fanout 経由 (`sinceId` 付きは #2720 で必ず DB へ倒れる)。実利用が最も多い。**`meta.enableFanoutTimelineDbFallback` が off だと空が返る** (#2762、§5.6 参照) ので、そのときは `got=[]` で落ちる |
 | `users/notes` | `note.go ListByUserIDFiltered` | fanout を通らない直行経路。本家 e2e も見ているが、あちらは mk-go 単体の assert で値の突き合わせはしない |
 | `drive/folders` | `drive_folder.go ListByUser` | **#2764 が実際に直した経路**。note 系は元から ASC だったので、そこだけ見ても #2713 の回帰は捕まらない (mock 側は #2764 で `SortMockPage` に揃っているので、こちらは単体テストでも見える) |
-| `drive/files` | `drive_file.go ListByUser` | **mock からは順序回帰が見えない** — `MockDriveFileRepository.ListByUser` は sort キー分岐を持つため sinceID 単独の ASC を実装しておらず、doc コメント自身が「#2766 が終わっても残る」と書いている (`ListForAdmin` / `ListSystemFiles` も同様、#2766 で追跡中)。frontend の MkDrive が `sinceId: '0'` で読む。**`sort` は渡さない** — production も upstream も sort 指定時は `paginationOrder` を通らず固定 order を使い、MkDrive も `-createdAt` のとき sort を送らない |
+| `drive/files` | `drive_file.go ListByUser` | 追加時点では **mock (`MockDriveFileRepository.ListByUser`) が sinceID 単独の ASC を実装しておらず**、単体テストからは順序回帰が見えなかった。#2766 で揃えたので今は mock でも見えるが、mock は production の SQL を実行しないので実 API 側のゲートは残す。frontend の MkDrive が `sinceId: '0'` で読む。**`sort` は渡さない** — production も upstream も sort 指定時は `paginationOrder` を通らず固定 order を使い、MkDrive も `-createdAt` のとき sort を送らない |
 | `admin/announcements/list` | `announcement.go ListForAdmin` | note / drive 以外の repository |
 
 **候補行数 > limit で読む。** 候補 <= limit だと `ORDER BY id ASC` と
@@ -170,7 +170,7 @@ assert する**。diff だけだと「両方 DESC」でも通ってしまい、T
 
 `test_meta_value_parity` の `META_IGNORE` は instance state (mediaProxy host /
 proxyAccountName) のノイズを吸収するためのもの。version-gap 由来の除外は TS image を
-2026.7.0 に揃えた時点で不要になったため、**残っているものが instance state 起因だけかを
+2026.9.0 に揃えた時点で不要になったため、**残っているものが instance state 起因だけかを
 追従のたびに見直すこと**。
 
 ## 既知の制約・今後

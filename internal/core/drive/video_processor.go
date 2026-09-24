@@ -1,24 +1,84 @@
 package drive
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // CommandRunner abstracts os/exec.Command for testing.
 type CommandRunner interface {
 	// Run executes the command and returns its combined output.
-	Run(name string, args ...string) ([]byte, error)
+	//
+	// **ctx を受けるのが要点 (#3037)。** 以前は `exec.Command` を直に呼んで
+	// いたので、**timeout も cancel も無い**まま ffmpeg を起動していた。
+	// 細工した動画 (壊れた duration、極端なフレームレート、巨大な解像度) で
+	// ffmpeg は何分でも回り、利用者が接続を切っても止まらない。
+	Run(ctx context.Context, name string, args ...string) ([]byte, error)
 }
+
+// ffmpegTimeout bounds one ffmpeg invocation.
+//
+// **upstream にこの上限は無い** (`FileInfoService` / `VideoProcessingService`
+// は `fluent-ffmpeg` を timeout 指定なしで呼ぶ) が、そちらに合わせない。値は
+// 「正当な動画のサムネイル生成が終わる時間」より十分長く、「1 本で枠を
+// 潰し続ける」には短い点を採った。
+const ffmpegTimeout = 60 * time.Second
+
+// ffmpegMaxOutputBytes caps how much of the command's combined output we keep.
+//
+// **ffmpeg は stderr に大量に書く。** 入力が壊れているほど多くなるので、
+// `CombinedOutput` のように全部ためると**入力の内容で確保量が決まる**。
+// 出力そのものは使っていない (エラー判定は終了コード) ので、診断に足りる
+// だけ残して捨てる。
+const ffmpegMaxOutputBytes = 64 << 10
 
 // ExecCommandRunner is the default CommandRunner that uses os/exec.
 type ExecCommandRunner struct{}
 
-func (r *ExecCommandRunner) Run(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).CombinedOutput()
+func (r *ExecCommandRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out boundedBuffer
+	out.limit = ffmpegMaxOutputBytes
+	// **同じ buffer を 2 つに渡すのは os/exec の実装に依存している。**
+	// `childStderr` が `interfaceEqual(c.Stderr, c.Stdout)` を見て同じ fd を
+	// 使い回すので、コピーする goroutine は 1 本しか起きない。**別々の
+	// writer に分けるとデータ競合になる** — ffmpeg は stdout に何も書かない
+	// (出力はファイル) ので `-race` でも出ない形の競合になる。
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	// **ctx が切れたあと居座らせない。** `CommandContext` は SIGKILL を
+	// 送るが、子プロセスがパイプを掴んだままだと `Wait` は返らない。
+	cmd.WaitDelay = 5 * time.Second
+	err := cmd.Run()
+	return out.buf.Bytes(), err
+}
+
+// boundedBuffer keeps at most limit bytes and silently drops the rest.
+type boundedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if room := b.limit - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			b.buf.Write(p[:room])
+		} else {
+			b.buf.Write(p)
+		}
+	}
+	// **書けたことにする。** 途中で `io.ErrShortWrite` を返すと ffmpeg 側が
+	// SIGPIPE で落ち、正常な動画でもサムネイルが作れなくなる。
+	return len(p), nil
 }
 
 // FFmpegVideoProcessor extracts thumbnails from video files using FFmpeg.
@@ -43,7 +103,7 @@ var osWriteFile = os.WriteFile
 
 // GenerateThumbnail extracts a frame at 5% of the video duration and
 // converts it to a WebP thumbnail. FFmpeg がない場合や失敗時は nil を返す。
-func (p *FFmpegVideoProcessor) GenerateThumbnail(body []byte, mimeType string) (*ProcessedImage, error) {
+func (p *FFmpegVideoProcessor) GenerateThumbnail(ctx context.Context, body []byte, mimeType string) (*ProcessedImage, error) {
 	if !isMimeVideo(mimeType) {
 		return nil, nil
 	}
@@ -61,11 +121,51 @@ func (p *FFmpegVideoProcessor) GenerateThumbnail(body []byte, mimeType string) (
 		return nil, nil
 	}
 
-	// FFmpeg: 5% 地点のスクリーンショットを PNG で出力
-	_, err = p.runner.Run("ffmpeg",
+	runCtx, cancel := context.WithTimeout(ctx, ffmpegTimeout)
+	defer cancel()
+
+	// **`-ss` は秒で渡す (#3037 レビュー 2 周目)。**
+	//
+	// upstream は fluent-ffmpeg の `screenshots({timestamps:['5%']})` を使って
+	// おり、**あちらが自分で duration を probe して秒に直してから** ffmpeg へ
+	// 渡す。ffmpeg の `-ss` は `5%` を受け付けず
+	// `Invalid duration for option ss: 5%` でコマンドごと失敗するので、
+	// `GenerateThumbnail` は常に `nil, nil` を返していた (= **全解像度で
+	// サムネイルが生成されていなかった**。実測 ffmpeg 7.1.5)。
+	//
+	// probe に失敗したら先頭から取る。真っ黒な導入部を引く可能性はあるが、
+	// サムネイルが無いよりはよい。
+	seek := "0"
+	if d, ok := p.durationSeconds(runCtx, inputPath); ok {
+		seek = strconv.FormatFloat(d*thumbnailSeekRatio, 'f', 3, 64)
+	}
+
+	// FFmpeg: 5% 地点のスクリーンショットを PNG で出力。
+	//
+	// **`-ss` は `-i` より前に置く** (input seeking)。後ろに置くと先頭から
+	// デコードするので、長尺動画では 5% 地点に着く前に timeout する。
+	_, err = p.runner.Run(runCtx, "ffmpeg",
+		"-ss", seek,
 		"-i", inputPath,
-		"-ss", "5%",
 		"-vframes", "1",
+		// **ffmpeg 側で縮めてから受け取る (#3037 レビュー)。**
+		//
+		// 引数に scale が無いと出力 PNG は入力動画の解像度そのままで、
+		// 8K なら 70MB になる (実測 7680x4320 + noise で 74,167,935 バイト)。
+		// `readFileAtMost` の上限 (32MiB) に当たると `GenerateThumbnail` は
+		// `nil, nil` を返すので、そこでもサムネイルが欠ける。
+		//
+		// **`min()` で包むのが要点 (#3037 レビュー 2 周目)。**
+		// `force_original_aspect_ratio=decrease` は「箱に内接させる」ので、
+		// 箱より小さい入力は**拡大される** — 実測で 320x240 が 1280x960 に
+		// なり、中間 PNG は 14 倍に太った。`min(1280,iw)` で包むと縮小方向に
+		// だけ効く (実測: 320x240 と 640x480 は原寸のまま、1920x1080 は
+		// 1280x720、3840x100 は 1280x33)。
+		//
+		// どうせこの後 `imgProc.GenerateThumbnail` が 498x422 へ縮めるので、
+		// 縮小側の結果は変わらない (3840x100 は scale の有無どちらでも
+		// 最終 498x12 になることを実測)。
+		"-vf", `scale=w=min(1280\,iw):h=min(1280\,ih):force_original_aspect_ratio=decrease`,
 		"-f", "image2",
 		outputPath,
 	)
@@ -74,7 +174,7 @@ func (p *FFmpegVideoProcessor) GenerateThumbnail(body []byte, mimeType string) (
 		return nil, nil
 	}
 
-	pngData, err := os.ReadFile(outputPath)
+	pngData, err := readFileAtMost(outputPath, ffmpegMaxFrameBytes)
 	if err != nil || len(pngData) == 0 {
 		return nil, nil
 	}
@@ -85,6 +185,61 @@ func (p *FFmpegVideoProcessor) GenerateThumbnail(body []byte, mimeType string) (
 	}
 
 	return nil, nil
+}
+
+// thumbnailSeekRatio is the position in the video the thumbnail is taken from.
+//
+// upstream `VideoProcessingService` の `timestamps: ['5%']` と同じ。
+const thumbnailSeekRatio = 0.05
+
+// durationSeconds probes the container duration with ffprobe.
+//
+// **ffprobe が無い / 読めないときは ok=false。** 呼び出し側は先頭から取る
+// (サムネイルを諦めない)。
+func (p *FFmpegVideoProcessor) durationSeconds(ctx context.Context, path string) (float64, bool) {
+	out, err := p.runner.Run(ctx, "ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		path,
+	)
+	if err != nil {
+		return 0, false
+	}
+	d, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil || d <= 0 || math.IsInf(d, 0) || math.IsNaN(d) {
+		return 0, false
+	}
+	return d, true
+}
+
+// ffmpegMaxFrameBytes caps how much of an ffmpeg-produced frame we load.
+//
+// **PNG の大きさは入力の解像度で決まる。** 8K の動画なら 1 枚で数十 MB に
+// なり、`os.ReadFile` はそれを丸ごとヒープへ載せる。サムネイルも
+// sensitive 判定も**縮小してから**使うので、ここで打ち切っても判定は
+// 変わらない (打ち切られた PNG はデコードに失敗し、呼び出し側の
+// fail-open へ落ちる)。
+const ffmpegMaxFrameBytes = 32 << 20
+
+// readFileAtMost reads at most maxBytes from path.
+//
+// **上限を超えたら読まない。** 途中まで返すと、壊れた PNG を「正しく
+// 読めた」として扱うことになる。
+func readFileAtMost(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("ffmpeg frame exceeds %d bytes", maxBytes)
+	}
+	return data, nil
 }
 
 // detectionFrameLimit は ffmpeg に出力させるフレーム数の上限。upstream の
@@ -98,7 +253,7 @@ const detectionFrameLimit = 2
 // FFmpeg パイプライン移植)。I-frame のみを選び、暗部 50% 以上のフレームを
 // 除外し、scale=299:299 で正規化した連番 PNG を出力してから、upstream と
 // 同じ index 間引きループでフレームを選ぶ。失敗時は nil (fail-open)。
-func (p *FFmpegVideoProcessor) ExtractDetectionFrames(body []byte) ([][]byte, error) {
+func (p *FFmpegVideoProcessor) ExtractDetectionFrames(ctx context.Context, body []byte) ([][]byte, error) {
 	tmpDir, err := osMkdirTemp("", "misskey-sensitive-*")
 	if err != nil {
 		return nil, err
@@ -118,7 +273,9 @@ func (p *FFmpegVideoProcessor) ExtractDetectionFrames(body []byte) ([][]byte, er
 	// 下の間引きループが選ぶのは先頭 detectionFrameLimit 枚だけなので、
 	// -frames:v で ffmpeg 側を早期終了させ、選択結果を変えずにディスクと
 	// CPU を有界にする (長尺動画で /tmp を溢れさせる DoS の防止)。
-	_, err = p.runner.Run("ffmpeg",
+	runCtx, cancel := context.WithTimeout(ctx, ffmpegTimeout)
+	defer cancel()
+	_, err = p.runner.Run(runCtx, "ffmpeg",
 		"-skip_frame", "nokey",
 		"-lowres", "3",
 		"-i", inputPath,
@@ -159,7 +316,7 @@ func (p *FFmpegVideoProcessor) ExtractDetectionFrames(body []byte) ([][]byte, er
 		}
 		targetIndex = nextIndex
 		nextIndex += index
-		data, err := os.ReadFile(path)
+		data, err := readFileAtMost(path, ffmpegMaxFrameBytes)
 		if err != nil {
 			continue
 		}

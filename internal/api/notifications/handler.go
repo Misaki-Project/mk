@@ -14,12 +14,25 @@ import (
 	"github.com/shiroha-a/mk/internal/api/pagination"
 	corenote "github.com/shiroha-a/mk/internal/core/note"
 	"github.com/shiroha-a/mk/internal/core/notification"
+	"github.com/shiroha-a/mk/internal/core/role"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 )
+
+// ModeratorChecker reports whether a user has moderation privileges.
+// 実装は core/role.Service。
+type ModeratorChecker interface {
+	IsModerator(userID string) bool
+	IsAdministrator(userID string) bool
+	// HasRolePolicy は運営向け通知のうち、モデレーター権限ではなく**ロール
+	// ポリシーで gate されているもの**の再確認に使う (#2987)。絵文字の申請は
+	// `canManageCustomEmojis` で審査でき、`HasRolePolicy` が短絡するのは root と
+	// 管理者だけ (モデレーターは短絡しない) ので、IsModerator では判定できない。
+	HasRolePolicy(userID, policyKey string) bool
+}
 
 // Handler handles notifications-related API endpoints.
 type Handler struct {
@@ -38,6 +51,19 @@ type Handler struct {
 	testNotifier         TestNotifier
 	roleLookup           entity.RoleLookup
 	chatInvitationLookup entity.ChatInvitationLookup
+	// abuseReportStates は abuseReport 通知の現在の状態を read 時に batch で
+	// 引く (#2868)。**未配線なら abuseReport を返さない** (roleAssigned と同じ
+	// fail-closed)。状態を出せないまま「未対応」に見せると、対処済みの通報に
+	// 別のモデレーターが二重で当たる。
+	abuseReportStates       AbuseReportStateLookup
+	emojiApplicationLookup  entity.EmojiApplicationLookup
+	signupApplicationLookup entity.SignupApplicationLookup
+	// moderatorChecker は read 時に abuseReport 通知の閲覧権限を再確認する
+	// (#2868)。対象ユーザー ID が Extra に入り通報の存在自体が機微なので、権限を
+	// 失った元モデレーターが admin/abuse-user-reports の 403 を迂回して
+	// 通知欄から読み続けられないようにする。**未配線なら abuseReport を
+	// 返さない (fail-closed)** — 判定できないまま出すより出さないほうが安全側。
+	moderatorChecker ModeratorChecker
 	// noteFieldResolver は通知に埋め込む note の後段 field (files / channel /
 	// myReaction / poll の isVoted) を埋める (#2735)。packer は Files を空スライスで
 	// 初期化するだけなので、未配線だと添付メディアが一切返らない。
@@ -59,6 +85,38 @@ func (h *Handler) SetAccessTokenRepo(r repository.AccessTokenRepository) {
 // embedded role (#1559)。
 func (h *Handler) SetRoleLookup(fn entity.RoleLookup) { h.roleLookup = fn }
 
+// SetModeratorChecker wires the moderation check used to re-verify who may
+// read abuseReport notifications (#2868).
+//
+// **未配線なら abuseReport を返さない (fail-closed)。** 対象ユーザー ID が Extra に入り通報の存在自体が機微なので、判定できないまま出すより出さないほうが安全側。
+func (h *Handler) SetModeratorChecker(c ModeratorChecker) { h.moderatorChecker = c }
+
+// AbuseReportStateLookup resolves the resolution state of several reports at
+// once (#2868)。実装は repository.AbuseReportRepository.FindStatesByIDs。
+type AbuseReportStateLookup func(ids []string) (map[string]model.AbuseReportState, error)
+
+// SetAbuseReportLookup wires the read-time state lookup for abuseReport
+// notifications (#2868)。未配線なら abuseReport 通知を返さない (fail-closed)。
+func (h *Handler) SetAbuseReportLookup(fn AbuseReportStateLookup) { h.abuseReportStates = fn }
+
+// SetEmojiApplicationLookup wires the read-time state lookup for
+// emojiApplicationProcessed notifications (#2934)。未配線なら返さない
+// (fail-closed、abuseReport と同じ)。
+//
+// **batch にしていない。** abuseReport はモデレーター全員へ配るので 1 ページに
+// 数百件並びうるが、申請の結果通知は申請者本人にしか飛ばず、同じページに何件も
+// 並ぶ形にならない。N+1 を避けるための複雑さに見合わない。
+func (h *Handler) SetEmojiApplicationLookup(fn entity.EmojiApplicationLookup) {
+	h.emojiApplicationLookup = fn
+}
+
+// SetSignupApplicationLookup wires the read-time state lookup for
+// signupApplicationReceived notifications (#2987)。未配線なら通知ごと返さない
+// (fail-closed。状態を引けないまま出すと、処理済みの申請に二重で当たる)。
+func (h *Handler) SetSignupApplicationLookup(fn entity.SignupApplicationLookup) {
+	h.signupApplicationLookup = fn
+}
+
 // SetChatInvitationLookup wires the lookup used to pack
 // chatRoomInvitationReceived notifications' embedded invitation (#1559)。
 func (h *Handler) SetChatInvitationLookup(fn entity.ChatInvitationLookup) {
@@ -79,13 +137,80 @@ func (h *Handler) SetNoteFieldResolver(r *entity.NoteFieldResolver) {
 // viewer は note の後段 field 解決にも使われる。upstream NotificationEntityService は
 // note を `noteEntityService.pack(noteId, { id: meId }, { detail: true })` で
 // pack するので、myReaction / poll の isVoted も notifiee 視点で埋まる。
-func (h *Handler) notificationOptions(viewerID string) []entity.NotificationOption {
+func (h *Handler) notificationOptions(viewerID string, rows []entity.NotificationItem) ([]entity.NotificationOption, error) {
+	lookup, err := h.batchAbuseReportLookup(rows)
+	if err != nil {
+		return nil, err
+	}
 	return []entity.NotificationOption{
 		entity.WithRoleLookup(h.roleLookup),
 		entity.WithChatInvitationLookup(h.chatInvitationLookup),
+		entity.WithAbuseReportLookup(lookup),
+		entity.WithEmojiApplicationLookup(h.emojiApplicationLookup),
+		entity.WithSignupApplicationLookup(h.signupApplicationLookup),
 		entity.WithViewer(viewerID),
 		entity.WithNoteFieldResolver(h.noteFieldResolver),
+	}, nil
+}
+
+// batchAbuseReportLookup resolves every abuseReport state in one query (#2868).
+//
+// **1 件ずつ引かない。** 通知一覧はページあたり最大 100 件で、1 件ずつ引くと
+// リクエストごとに数百 SELECT が直列に走る。noteFieldResolver が「ページで
+// lookup 1 回」に畳んでいるのと同じ形にする。
+//
+// **DB 障害を「削除済み」に丸めない (#2792)。** 丸めると一時的な接続断で通報の
+// 通知だけが消え、しかも既読位置は進むので未読の合図が失われる。エラーは
+// 呼び出し元へ返して 500 にする。
+//
+// abuseReport が 1 件も無いページでは 1 回も引かない。
+func (h *Handler) batchAbuseReportLookup(rows []entity.NotificationItem) (entity.AbuseReportLookup, error) {
+	ids := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+	for _, item := range rows {
+		n := item.N
+		if n == nil || n.Type != notification.TypeAbuseReport {
+			continue
+		}
+		id, _ := n.Extra["reportId"].(string)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
 	}
+	if len(ids) == 0 {
+		// 未配線と区別が付かない nil ではなく、常に false を返す lookup を渡す。
+		// この経路には abuseReport が無いので実際には呼ばれない。
+		return func(string) (entity.AbuseReportStatus, bool) {
+			return entity.AbuseReportStatus{}, false
+		}, nil
+	}
+	if h.abuseReportStates == nil {
+		// 未配線: fail-closed (通知を drop する)。
+		return nil, nil
+	}
+	states, err := h.abuseReportStates(ids)
+	if err != nil {
+		return nil, err
+	}
+	return func(reportID string) (entity.AbuseReportStatus, bool) {
+		st, ok := states[reportID]
+		if !ok {
+			return entity.AbuseReportStatus{}, false
+		}
+		out := entity.AbuseReportStatus{Resolved: st.Resolved}
+		if st.ResolvedAs != nil {
+			out.ResolvedAs = *st.ResolvedAs
+		}
+		if st.AssigneeID != nil {
+			out.AssigneeID = *st.AssigneeID
+		}
+		return out, true
+	}, nil
 }
 
 // NewHandler creates a new notifications Handler.
@@ -186,6 +311,15 @@ func (h *Handler) Show(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 
+	// upstream i/notifications.ts が getNotifications の前に持つ 2 つの早期
+	// return (#2835)。既読化もここで止まる。
+	if emptyByTypeFilter(req) {
+		return c.JSON(http.StatusOK, []any{})
+	}
+	// 早期 return の**後**に obsolete を除去する (#2837)。順序が結果を分ける。
+	req.IncludeTypes = stripObsoleteTypes(req.IncludeTypes)
+	req.ExcludeTypes = stripObsoleteTypes(req.ExcludeTypes)
+
 	filtered, notifierByID, noteByID, err := h.collectNotifications(c, user, req)
 	if err != nil {
 		return apierr.JSONInternalError(c)
@@ -199,7 +333,12 @@ func (h *Handler) Show(c echo.Context) error {
 			Note: noteByID[n.NoteID],
 		})
 	}
-	out := entity.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), h.notificationOptions(user.ID)...)
+	opts, err := h.notificationOptions(user.ID, items)
+	if err != nil {
+		slog.Error("notifications: resolve abuse report states failed", "err", err)
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
+	out := entity.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), opts...)
 	// depth-2 embed hide (#1570): collectNotifications の #1444 CanSeeNote gate は
 	// 見えない note を丸ごと落とすが embed (renote/reply) には再帰しない。通知 note の
 	// embed と著者設定ゲートを viewer 可視性で適用する。これを欠くと #1570 で塞いだ
@@ -209,18 +348,124 @@ func (h *Handler) Show(c echo.Context) error {
 	return c.JSON(http.StatusOK, out)
 }
 
+// notificationTypeList is the set counted by the excludeTypes "covers
+// everything" check (emptyByTypeFilter)。**upstream 由来の型のみ。**
+//
+// **core の registry から導出する (#2898)。** 以前はここに upstream の一覧を
+// リテラルで持っていたが、core 側の `Type` 定数との間で片側更新が起きていた
+// (`importCompleted` が core にだけあった)。同じ一覧を 2 箇所に置くと、
+// 固有型を足すたびにその穴を踏む。
+//
+// **obsolete も mk-go 固有も含まない。** 固有型を入れると、upstream の 20 種
+// しか送らないクライアント (misskey-js の notificationTypes を使うもの) の
+// 「すべて無効」が被覆判定を外れ、emptyByTypeFilter の早期 return を抜けて
+// 既読化まで進む。1 件も返していないのに既読位置が飛ぶ (#2833 / #2835 が塞いだ
+// 害の再オープン)。固有型は enum には入るので filter 値としては指定できる。
+var notificationTypeList = notification.UpstreamTypeNames()
+
+// obsoleteNotificationTypeList mirrors upstream `obsoleteNotificationTypes`。
+// paramDef の enum には含まれるが、excludeTypes の全指定判定には数えない。
+var obsoleteNotificationTypeList = notification.ObsoleteTypeNames()
+
 // notificationTypeEnum mirrors upstream `[...notificationTypes,
 // ...obsoleteNotificationTypes]` (types.ts)。includeTypes/excludeTypes の
 // 要素検証に使う (#2062)。mk-go が produce しない type も upstream paramDef の
 // enum に含まれるため許容する (filter で何も match しないだけ)。
-var notificationTypeEnum = map[string]bool{
-	"note": true, "follow": true, "mention": true, "reply": true, "renote": true,
-	"quote": true, "reaction": true, "pollEnded": true, "scheduledNotePosted": true,
-	"scheduledNotePostFailed": true, "receiveFollowRequest": true, "followRequestAccepted": true,
-	"roleAssigned": true, "chatRoomInvitationReceived": true, "achievementEarned": true,
-	"exportCompleted": true, "login": true, "createToken": true, "app": true, "test": true,
-	// obsoleteNotificationTypes (paramDef enum に含まれる)
-	"pollVote": true, "groupInvited": true,
+//
+// **2 つの list から組み立てる。** 手で二重に持つと、片方に type を足したときに
+// もう片方が古いまま残る。enum にだけ足すと emptyByTypeFilter の全指定判定が
+// 足りない type を無視して**早く空を返しすぎる**方向に壊れる。
+var notificationTypeEnum = buildNotificationTypeEnum()
+
+func buildNotificationTypeEnum() map[string]bool {
+	// mk-go 固有の型も filter 値としては受け付ける。全指定判定
+	// (notificationTypeList) には入れない — 理由は notificationTypeList の
+	// コメントを参照。
+	mkgo := notification.MkGoTypeNames()
+	m := make(map[string]bool, len(notificationTypeList)+len(obsoleteNotificationTypeList)+len(mkgo))
+	for _, t := range notificationTypeList {
+		m[t] = true
+	}
+	for _, t := range obsoleteNotificationTypeList {
+		m[t] = true
+	}
+	for _, t := range mkgo {
+		m[t] = true
+	}
+	return m
+}
+
+// obsoleteNotificationTypeSet is the lookup form of obsoleteNotificationTypeList.
+var obsoleteNotificationTypeSet = func() map[string]bool {
+	m := make(map[string]bool, len(obsoleteNotificationTypeList))
+	for _, t := range obsoleteNotificationTypeList {
+		m[t] = true
+	}
+	return m
+}()
+
+// stripObsoleteTypes removes obsolete types from a type filter, mirroring
+// upstream's `.filter(type => !obsoleteNotificationTypes.includes(type))` (#2837).
+//
+// **emptyByTypeFilter の後に掛ける。** upstream もその順序で、入れ替えると結果が
+// 逆になる — `includeTypes:[]` は「何も含めない」で空配列を返すが、
+// `includeTypes:["pollVote"]` は除去後に空になり、svc.List の
+// `len(includeSet) > 0` が false になって**filter 無し = 全件**になる。
+//
+// **全部落ちたら nil を返す。** 長さ 0 の slice を返すと「明示的な
+// `includeTypes:[]`」と区別が付かなくなり、collectNotificationsWithDropped の
+// fail-closed guard がそれを「何も含めない」と読んで全件落とす。upstream の
+// `filter()` は `[]` を返すが、あちらは nil / 空の区別を持たない言語なので
+// 形ではなく**意味**に合わせる — 除去後に空になったものの意味は「filter 無し」。
+func stripObsoleteTypes(types []string) []string {
+	if len(types) == 0 {
+		return types
+	}
+	out := make([]string, 0, len(types))
+	for _, t := range types {
+		if !obsoleteNotificationTypeSet[t] {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// emptyByTypeFilter reports whether the type filters alone make the query
+// pointless, mirroring the two early returns upstream i/notifications.ts and
+// i/notifications-grouped.ts have before `getNotifications` (#2835).
+//
+//   - includeTypes が明示的に空 = 何も含めない
+//   - excludeTypes が notificationTypes を全て覆う
+//
+// **既読化より前に判定するのが要点。** MarkAllAsRead が進める先は fetch が返した
+// 行ではなくストリームの最新エントリなので、ここで抜けずに既読化すると、
+// 1 件も返していないのにユーザーが受け取っていない通知まで既読位置が飛ぶ
+// (#2833 と同じ害の別経路)。
+//
+// excludeTypes が nil / 空のときは false。upstream の
+// `notificationTypes.every(type => ps.excludeTypes?.includes(type))` も、
+// undefined なら `?.` で undefined になり every が false、空配列なら
+// `[].includes` が false で every が false になる。
+func emptyByTypeFilter(req ListRequest) bool {
+	if req.IncludeTypes != nil && len(req.IncludeTypes) == 0 {
+		return true
+	}
+	if len(req.ExcludeTypes) == 0 {
+		return false
+	}
+	excluded := make(map[string]struct{}, len(req.ExcludeTypes))
+	for _, t := range req.ExcludeTypes {
+		excluded[t] = struct{}{}
+	}
+	for _, t := range notificationTypeList {
+		if _, ok := excluded[t]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // validNotificationTypes reports whether every element of types is a known
@@ -254,7 +499,13 @@ func (h *Handler) bindListRequest(c echo.Context) (ListRequest, bool) {
 	// `n.ID >= untilID`) で sinceDate / untilDate も正しく効く。Redis Stream
 	// native ID と aidx ID は別物だが、本 endpoint の cursor は notification.ID
 	// (= aidx) で判定する設計なので adapter pattern で完結する。
-	req.SinceID, req.UntilID = id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	// **列に入らないカーソルもここで ok=false にする (#3025)。** そのまま渡すと
+	// `id < ?` の bind parameter で落ちて 500 になる。
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return req, false
+	}
+	req.SinceID, req.UntilID = cursorSince, cursorUntil
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return req, false
@@ -309,14 +560,18 @@ func survivors(all []*notification.Notification, dropped map[string]struct{}) []
 // noteId / renote の target) で決まるので、落とした通知の中身そのものが要る。
 // resolveAllNotes は drop 済み行の note まで引くかどうか。grouped だけが true。
 func (h *Handler) collectNotificationsWithDropped(c echo.Context, user *model.User, req ListRequest, resolveAllNotes bool) ([]*notification.Notification, map[string]struct{}, map[string]*model.User, map[string]*model.Note, error) {
-	// upstream notifications.ts: 明示的な includeTypes:[] は空配列を返す
-	// (= 何も含めない)。omit (nil) は全 type を通す。Go の []string は
-	// absent→nil / []→non-nil(len 0) で区別できるので、ここで早期 return する
-	// (#1546)。excludeTypes 全指定の空返却は下の per-row exclude filter で既に
-	// 成立するため特別扱い不要。
+	// 明示的な includeTypes:[] は空配列を返す (= 何も含めない)。omit (nil) は全
+	// type を通す。Go の []string は absent→nil / []→non-nil(len 0) で区別できる
+	// (#1546)。
+	//
+	// **現状ここには到達しない** — Show / Grouped はどちらも emptyByTypeFilter で
+	// 先に抜ける (#2835)。直接呼ぶ経路が増えたときのための fail-closed な二重防御。
+	// stripObsoleteTypes が全除去で nil を返すのは、その結果 (意味は「filter 無し」)
+	// をここへ「何も含めない」として渡さないため (#2837)。
 	if req.IncludeTypes != nil && len(req.IncludeTypes) == 0 {
 		return nil, map[string]struct{}{}, map[string]*model.User{}, map[string]*model.Note{}, nil
 	}
+
 	// svc.List が upstream NotificationService.getNotifications 相当に cursor
 	// (sinceId/untilId)・向き (sinceId-only は昇順)・type filter・limit を適用して
 	// 返す (#1953)。ここではその後段の drop (解決済み follow request / invalid
@@ -461,18 +716,18 @@ func (h *Handler) collectNotificationsWithDropped(c echo.Context, user *model.Us
 	// noteByID に無い NoteID を持つ行を落とす。repo / queryService 配線済のときだけ適用する
 	// (未配線の partial test では note 解決自体が走らず、全 note-required 通知を
 	// 誤って落とさないため)。
+	// **列は絞らない。** この関数は drop を適用せず、全行と drop 集合の両方を
+	// 返す契約 (grouped が raw 列を要るため)。ここでやるのは dropped の登録だけで、
+	// 実際に落とすのは呼び出し側の `survivors`。
 	if h.noteRepo != nil && h.queryService != nil {
-		kept := make([]*notification.Notification, 0, len(filtered))
 		for _, n := range filtered {
-			if n.NoteID != "" {
-				if _, ok := noteByID[n.NoteID]; !ok {
-					dropped[n.ID] = struct{}{}
-					continue
-				}
+			if n.NoteID == "" {
+				continue
 			}
-			kept = append(kept, n)
+			if _, ok := noteByID[n.NoteID]; !ok {
+				dropped[n.ID] = struct{}{}
+			}
 		}
-		filtered = kept
 	}
 	return rows, dropped, notifierByID, noteByID, nil
 }
@@ -519,6 +774,12 @@ func (h *Handler) SetMutingRepo(r repository.MutingRepository) {
 // 害が小さいと判断している。notifier fetch の成否を知っているのは呼び出し元だけ
 // なので、その判定だけそちらに置く。
 func (h *Handler) filterValidNotifiers(viewerID string, rows []*notification.Notification, notifierByID map[string]*model.User) []*notification.Notification {
+	// abuseReport はモデレーション用なので、read 時に権限を再確認する (#2868)。
+	// 対象ユーザー ID が Extra に入り通報の存在自体が機微なので、権限を失った元
+	// モデレーターが admin/abuse-user-reports の 403 を迂回して読み続けられない
+	// ようにする。
+	rows = h.filterModerationNotifications(viewerID, rows)
+
 	muted := map[string]bool{}
 	if h.mutingRepo != nil {
 		if ids, err := h.mutingRepo.ListMuteeIDs(viewerID); err == nil {
@@ -543,6 +804,14 @@ func (h *Handler) filterValidNotifiers(viewerID string, rows []*notification.Not
 	}
 	out := make([]*notification.Notification, 0, len(rows))
 	for _, n := range rows {
+		// **abuseReport は notifier のミュート等で落とさない (#2868)。**
+		// notifier は通報者なので、モデレーターがミュートしている相手からの
+		// 通報が通知欄に一切現れなくなる。凍結された利用者からの通報も同じ
+		// (凍結の理由がその通報の対象であることもある)。
+		if isStaffNotification(n.Type) {
+			out = append(out, n)
+			continue
+		}
 		if n.NotifierID != "" {
 			if muted[n.NotifierID] {
 				continue
@@ -585,7 +854,10 @@ func (h *Handler) maybeMarkAsRead(c echo.Context, user *model.User, req ListRequ
 	if req.MarkAsRead != nil && !*req.MarkAsRead {
 		return
 	}
-	if err := h.svc.MarkAllAsRead(c.Request().Context(), user.ID); err != nil {
+	// 暗黙既読は upstream i/notifications 同様 force を立てない。毎 fetch で
+	// readAllNotifications を再送すると、保留中の unreadNotification を潰して
+	// 逆にバッジが点かなくなる (#420 follow-up)。
+	if err := h.svc.MarkAllAsRead(c.Request().Context(), user.ID, false); err != nil {
 		// 既読化失敗は通知一覧の取得結果には影響しないので 200 のまま
 		// 返し、ログだけ残す。
 		slog.Warn("notifications: implicit mark-all-as-read failed",
@@ -594,9 +866,14 @@ func (h *Handler) maybeMarkAsRead(c echo.Context, user *model.User, req ListRequ
 }
 
 // MarkAllAsRead handles POST /api/notifications/mark-all-as-read.
+//
+// **明示的な既読操作なので force で呼ぶ** (upstream mark-all-as-read.ts と同じ、
+// #2831)。バッジのカウンタはクライアント側にしか無く、readAllNotifications を
+// 取りこぼすと読み取り位置だけが進んで guard に阻まれる。次の通知が来るまで
+// バッジが残るので、その場で復帰させる手段としてこのボタンを force にする。
 func (h *Handler) MarkAllAsRead(c echo.Context) error {
 	user := middleware.GetUser(c)
-	if err := h.svc.MarkAllAsRead(c.Request().Context(), user.ID); err != nil {
+	if err := h.svc.MarkAllAsRead(c.Request().Context(), user.ID, true); err != nil {
 		return apierr.JSONInternalError(c)
 	}
 	return c.NoContent(http.StatusNoContent)
@@ -710,4 +987,77 @@ func (h *Handler) TestNotification(c echo.Context) error {
 		h.testNotifier.OnTest(user.ID)
 	}
 	return c.NoContent(http.StatusNoContent)
+}
+
+// filterModerationNotifications drops moderation-only notifications when the
+// viewer no longer holds moderation privileges (#2868).
+//
+// **fail-closed。** checker 未配線なら abuseReport を落とす。対象ユーザー ID が
+// Extra に入り、通報の存在自体が機微なので、判定できないまま出すより出さない
+// ほうが安全側。administrator も通す (upstream の iAmModerator と同じ扱い)。
+//
+// **該当する通知が無ければ何もしない。** 権限判定は role 解決を伴うので、
+// 通知一覧の大半を占める通常の通知のために毎回引かない。
+func (h *Handler) filterModerationNotifications(viewerID string, rows []*notification.Notification) []*notification.Notification {
+	hasModerationRow := false
+	for _, n := range rows {
+		if isStaffNotification(n.Type) {
+			hasModerationRow = true
+			break
+		}
+	}
+	if !hasModerationRow {
+		return rows
+	}
+	// **型ごとに判定が違う (#2987)。** 通報とアカウントの登録申請は
+	// `RequireModerator` で審査するが、絵文字の申請は
+	// `RequireRolePolicy(canManageCustomEmojis)` で、`HasRolePolicy` が短絡
+	// するのは root と管理者だけ。モデレーターかどうかでは判定できない。
+	//
+	// 1 度ずつしか引かないよう、型ごとの結果を memo する。
+	allowed := make(map[notification.Type]bool, 2)
+	permitted := func(t notification.Type) bool {
+		if v, ok := allowed[t]; ok {
+			return v
+		}
+		v := h.staffNotificationVisible(viewerID, t)
+		allowed[t] = v
+		return v
+	}
+	out := make([]*notification.Notification, 0, len(rows))
+	for _, n := range rows {
+		if isStaffNotification(n.Type) && !permitted(n.Type) {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// staffNotificationVisible reports whether viewerID may still see a staff
+// notification of type t (#2868 / #2987).
+//
+// **未配線 / 未ログインでは見せない (fail-closed)。** 判定できないまま出すより
+// 出さないほうが安全側 — 申請や通報の存在自体が機微で、Extra には対象の id が
+// 入る。
+func (h *Handler) staffNotificationVisible(viewerID string, t notification.Type) bool {
+	if h.moderatorChecker == nil || viewerID == "" {
+		return false
+	}
+	if t == notification.TypeEmojiApplicationReceived {
+		// `HasRolePolicy` は root / 管理者を短絡し、そうでなければ policy を見る。
+		return h.moderatorChecker.HasRolePolicy(viewerID, role.PolicyCanManageCustomEmojis)
+	}
+	// abuseReport / signupApplicationReceived。administrator も通す
+	// (upstream の iAmModerator と同じ扱い)。
+	return h.moderatorChecker.IsModerator(viewerID) || h.moderatorChecker.IsAdministrator(viewerID)
+}
+
+// isStaffNotification reports whether the type is delivered to the moderation
+// team rather than to the user it is about (#2987).
+//
+// **registry を truth にする。** ここで型を並べ直すと、新しい運営向け通知を
+// 足したときに「ミュートで消える」「権限を失っても見える」が静かに起きる。
+func isStaffNotification(t notification.Type) bool {
+	return notification.IsStaffType(t)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/userrelation"
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
+	"github.com/shiroha-a/mk/internal/core/notification"
 	"github.com/shiroha-a/mk/internal/core/user"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -47,6 +48,7 @@ type Handler struct {
 	proxyFollow        ProxyFollowEnqueuer
 	moderatorLister    ModeratorLister
 	abuseNotifier      AbuseReportNotifier
+	abuseInAppNotifier AbuseReportInAppNotifier
 	mutingRepo         repository.MutingRepository
 	// channelMutingRepo は users/notes (withChannelNotes) の post-fetch filter で
 	// チャンネルミュートを効かせるために使う。未配線なら no-op。
@@ -72,6 +74,10 @@ type Handler struct {
 	pageRepo     repository.PageRepository
 	piningRepo   repository.UserNotePiningRepository
 	fieldRes     *entity.NoteFieldResolver
+	// metaRepo / localHost は pinned-users 用 (#2791 で router.go の inline
+	// closure から移設)。
+	metaRepo  repository.MetaRepository
+	localHost string
 	// userRepo は users/notes / users/search-by-username-and-host 経由で
 	// 表示する note list の hardMutedWords filter (#787) に使う。
 	userRepo repository.UserRepository
@@ -89,6 +95,8 @@ type Handler struct {
 	// ugcVisibility は meta.ugcVisibilityForVisitor。'local' (既定) のとき匿名
 	// visitor に remote user プロフィールを出さない (upstream users/show、#2106 S3)。
 	ugcVisibility string
+	// ugcVisibilityFn は live lookup (起動時の焼き込みを避ける)。
+	ugcVisibilityFn func() string
 	// driveFileRepo は users/pages で page の attachedFiles / eyeCatchingImage を
 	// drive file から解決するのに使う (#1662)。未配線なら両 field は default。
 	driveFileRepo repository.DriveFileRepository
@@ -176,6 +184,22 @@ func (h *Handler) SetUGCVisibility(v string) {
 	h.ugcVisibility = v
 }
 
+// SetUGCVisibilityLookup wires a live lookup of the policy.
+//
+// **毎回読む。** 起動時に文字列を焼き込むと、運営者が管理画面で締めても
+// プロセスを再起動するまで反映されない。
+func (h *Handler) SetUGCVisibilityLookup(fn func() string) {
+	h.ugcVisibilityFn = fn
+}
+
+// ugcVisibilityNow resolves the current policy.
+func (h *Handler) ugcVisibilityNow() string {
+	if h.ugcVisibilityFn != nil {
+		return h.ugcVisibilityFn()
+	}
+	return h.ugcVisibility
+}
+
 // ModeratorLister lists moderator/administrator users for abuse-report fanout
 // (#1549)。実装は core/role.Service.GetModerators。
 type ModeratorLister interface {
@@ -188,12 +212,27 @@ type AbuseReportNotifier interface {
 	PublishAdminEvent(userID, eventType string, body any)
 }
 
+// AbuseReportInAppNotifier creates the in-app notification moderators see in
+// their notification list (#2868)。実装は core/notification.Service。
+//
+// **admin stream (AbuseReportNotifier) では足りない。** あちらはその瞬間に
+// 管理画面を開いている人にしか届かず、後から見返せない。
+type AbuseReportInAppNotifier interface {
+	Create(ctx context.Context, in notification.CreateInput) (*notification.Notification, error)
+}
+
 // SetAbuseReportFanout wires the moderator lister + admin event notifier so
 // report-abuse fans out newAbuseUserReport to every moderator/admin (#1549).
 // 片方でも nil なら fanout を skip する (= test / 旧挙動)。
 func (h *Handler) SetAbuseReportFanout(lister ModeratorLister, notifier AbuseReportNotifier) {
 	h.moderatorLister = lister
 	h.abuseNotifier = notifier
+}
+
+// SetAbuseReportInAppNotifier wires the in-app notification for new reports
+// (#2868). nil なら通知を作らない (= test / 旧挙動)。
+func (h *Handler) SetAbuseReportInAppNotifier(n AbuseReportInAppNotifier) {
+	h.abuseInAppNotifier = n
 }
 
 // SetUserRepo wires a UserRepository so users/notes filters out notes that
@@ -561,7 +600,7 @@ func (h *Handler) Show(c echo.Context) error {
 		// #2106 S3: ugcVisibilityForVisitor='local' のとき、匿名 visitor が host 指定で
 		// remote user を解決させること自体を resolve 前に弾く (upstream show.ts:157-159、
 		// 未知 remote host への外向き resolve 誘発 = SSRF amplification も防ぐ)。
-		if req.Host != nil && *req.Host != "" && viewer == nil && h.ugcVisibility == "local" {
+		if req.Host != nil && *req.Host != "" && viewer == nil && h.ugcVisibilityNow() == "local" {
 			return apierr.JSONNoSuchUser(c)
 		}
 		// #2106 L10: upstream show.ts は lookup 前に username を trim する。前後空白を含む
@@ -572,6 +611,12 @@ func (h *Handler) Show(c echo.Context) error {
 	if err != nil {
 		if errors.Is(err, user.ErrFailedToResolveRemoteUser) {
 			return apierr.JSONFailedToResolveRemoteUser(c)
+		}
+		// **DB 障害を 404 に丸めない (#2792 / #2996)。** service は「行が無い」を
+		// `ErrUserNotFound` に寄せるので、それ以外は接続断のような障害。
+		// クライアントからは区別できず監視でも 5xx が立たないので、ここで分ける。
+		if !errors.Is(err, user.ErrUserNotFound) {
+			return apierr.JSONInternalError(c)
 		}
 		return apierr.JSONNoSuchUser(c)
 	}
@@ -585,7 +630,7 @@ func (h *Handler) Show(c echo.Context) error {
 
 	// #2106 S3: ugcVisibilityForVisitor='local' のとき匿名 visitor に remote user を
 	// 出さない (upstream show.ts:177-179)。userId 指定経路もここでカバーする。
-	if viewer == nil && bundle.User.Host != nil && h.ugcVisibility == "local" {
+	if viewer == nil && bundle.User.Host != nil && h.ugcVisibilityNow() == "local" {
 		return apierr.JSONNoSuchUser(c)
 	}
 
@@ -622,8 +667,9 @@ func (h *Handler) Show(c echo.Context) error {
 	if h.remoteStatsFetcher != nil && bundle.User.Host != nil && *bundle.User.Host != "" {
 		if stats := h.remoteStatsFetcher.Fetch(c.Request().Context(), *bundle.User.Host, bundle.User.Username); stats != nil {
 			detailed.NotesCount = stats.NotesCount
-			detailed.FollowersCount = stats.FollowersCount
-			detailed.FollowingCount = stats.FollowingCount
+			// **ゲートが入れ直す値も更新する。** 表示値だけ書くと、後で
+			// `GateCountVisibility` が元の値で上書きする。
+			entity.OverrideRemoteCounts(&detailed, stats.FollowersCount, stats.FollowingCount)
 		}
 	}
 
@@ -840,7 +886,10 @@ func (h *Handler) Notes(c echo.Context) error {
 	}
 
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	viewer := middleware.GetUser(c)
 	viewerID := ""
 	if viewer != nil {
@@ -881,6 +930,14 @@ func (h *Handler) Notes(c echo.Context) error {
 	}
 
 	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes)
+	// **ブロック済みインスタンスのノートを落とす** (upstream
+	// generateBlockedHostQueryForNote)。`ListByUserIDFiltered` が push down
+	// するのは visibility だけなので、ブロック後も既存のノートが出続けていた。
+	blockedHosts, err := notesfilter.LoadBlockedHosts(h.metaRepo)
+	if err != nil {
+		return apierr.JSONInternalError(c)
+	}
+	notes = notesfilter.ApplyBlockedHosts(notes, blockedHosts)
 	out := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(out, viewer)
 	notehide.HideEmbeds(viewer, out)
@@ -911,25 +968,50 @@ func (h *Handler) Following(c echo.Context) error {
 	return h.listRelations(c, false)
 }
 
+// jsonNoSuchUserForRelations returns the NO_SUCH_USER error with the id
+// upstream assigns to users/followers / users/following (別 id が振られている)。
+func jsonNoSuchUserForRelations(c echo.Context, followers bool) error {
+	nsuID := "63e4aba4-4156-4e53-be25-c9559e42d71b" // users/following
+	if followers {
+		nsuID = "27fa5435-88ab-43de-9360-387de88727cd" // users/followers
+	}
+	return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_USER", "No such user.", nsuID))
+}
+
 func (h *Handler) listRelations(c echo.Context, followers bool) error {
 	var req FollowersRequest
 	if err := c.Bind(&req); err != nil {
 		return apierr.JSONInvalidParam(c)
 	}
+	// **viewer は username 解決より前に読む。** 下の匿名 gate が要る。
+	viewer := middleware.GetUser(c)
 	// userId 指定が無ければ username(+host) から解決する (upstream followers.ts:60-71、
 	// #1547)。usernameLower + host で findOne。
 	if req.UserID == "" {
 		if req.Username == "" {
 			return apierr.JSONInvalidParam(c)
 		}
+		// **users/show と同じ匿名 gate をここにも掛ける** (handler.go の Show に
+		// ある #2106 S3 の判定)。`users/followers` / `users/following` は
+		// auth middleware が無く**未認証で叩ける**のに、`ShowByUsername` は
+		// ローカル DB が miss すると WebFinger + actor fetch へ落ちる。gate が
+		// 無いと、認証不要の POST 1 回ごとに未知のリモート host への outbound
+		// HTTP とリモート user 行の作成を外部から強制できる (= `ShowByUsernameDB`
+		// の doc コメントが `/@:acct` について書いているのと同じ増幅面)。
+		if req.Host != nil && *req.Host != "" && viewer == nil && h.ugcVisibilityNow() == "local" {
+			return jsonNoSuchUserForRelations(c, followers)
+		}
 		// #2106 L10: Followers/Following も Show と同じく lookup 前に trim する。
 		bundle, err := h.userService.ShowByUsername(strings.ToLower(strings.TrimSpace(req.Username)), req.Host)
 		if err != nil || bundle == nil {
-			nsuID := "63e4aba4-4156-4e53-be25-c9559e42d71b" // users/following
-			if followers {
-				nsuID = "27fa5435-88ab-43de-9360-387de88727cd" // users/followers
+			// Show と同じく DB 障害は 500 に倒す (#2792 / #2996)。
+			// `ErrFailedToResolveRemoteUser` は「引けたが解決できない」なので
+			// not-found 側に寄せる (この endpoint に専用の error code は無い)。
+			if err != nil && !errors.Is(err, user.ErrUserNotFound) &&
+				!errors.Is(err, user.ErrFailedToResolveRemoteUser) {
+				return apierr.JSONInternalError(c)
 			}
-			return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_USER", "No such user.", nsuID))
+			return jsonNoSuchUserForRelations(c, followers)
 		}
 		req.UserID = bundle.User.ID
 	}
@@ -941,17 +1023,14 @@ func (h *Handler) listRelations(c echo.Context, followers bool) error {
 	req.Limit = &limit
 
 	if _, err := h.userService.ShowByID(req.UserID); err != nil {
-		// upstream は users/followers と users/following で NO_SUCH_USER に別 id を割り当てる
-		nsuID := "63e4aba4-4156-4e53-be25-c9559e42d71b" // users/following
-		if followers {
-			nsuID = "27fa5435-88ab-43de-9360-387de88727cd" // users/followers
-		}
-		return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_USER", "No such user.", nsuID))
+		return jsonNoSuchUserForRelations(c, followers)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	req.SinceID, req.UntilID = id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
-
-	viewer := middleware.GetUser(c)
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
+	req.SinceID, req.UntilID = cursorSince, cursorUntil
 
 	// followersVisibility / followingVisibility gate (#1461)。upstream
 	// `users/followers.ts` / `users/following.ts` と同等に、target profile の
@@ -996,7 +1075,15 @@ func (h *Handler) gateRelationVisibility(c echo.Context, targetID string, viewer
 	}
 
 	vis := model.FollowingVisibilityPublic
-	if profile := h.userService.GetProfile(targetID); profile != nil {
+	// **DB 障害を「公開」に倒さない。** err を捨てて nil で fall-through すると、
+	// `followersVisibility: private` の利用者のフォロワー一覧が接続断のあいだ
+	// 誰にでも読める (#2799)。同 function の `followingRepo.Exists` は既に
+	// fail-closed なので、ここだけ向きが違っていた。
+	profile, perr := h.userService.GetProfileErr(targetID)
+	if perr != nil && !repository.IsNotFound(perr) {
+		return true, apierr.JSONInternalError(c)
+	}
+	if profile != nil {
 		if followers {
 			vis = profile.FollowersVisibility
 		} else {
@@ -1188,8 +1275,7 @@ func (h *Handler) packRelationItems(
 			}
 			if stats := remoteStatsMap[b.User.ID]; stats != nil {
 				d.NotesCount = stats.NotesCount
-				d.FollowersCount = stats.FollowersCount
-				d.FollowingCount = stats.FollowingCount
+				entity.OverrideRemoteCounts(&d, stats.FollowersCount, stats.FollowingCount)
 			}
 			// count visibility gate は remote stats override の後に適用する (#1558)。
 			entity.GateCountVisibility(&d, isMe, iAmModerator, isFollowing)
@@ -1428,7 +1514,7 @@ func (h *Handler) fillPinned(ctx context.Context, viewer *model.User, u *model.U
 	if profile != nil && profile.PinnedPageID != nil && *profile.PinnedPageID != "" {
 		detailed.PinnedPageID = profile.PinnedPageID
 		if h.pageRepo != nil {
-			if p, err := h.pageRepo.FindByID(*profile.PinnedPageID); err == nil {
+			if p, err := h.pageRepo.FindByID(*profile.PinnedPageID); err == nil && pinnedPageVisibleTo(p, viewer) {
 				// golden Page は user 必須。pinnedPage は profile user 自身の page
 				// なので owner=u を渡して user (UserLite) を埋める (#1266 follow-up)。
 				detailed.PinnedPage = entity.PackPageWithContext(p, entity.PackPageContext{IDGen: h.idGen, Owner: u})
@@ -1464,4 +1550,32 @@ func (h *Handler) HasBlockingRepo() bool { return h.blockingRepo != nil }
 // 未配線だと匿名 visitor への remote profile 露出を
 // `ugcVisibilityForVisitor` で gate できない。**空文字は gate 無効**と同義
 // (`"none"` でも `"local"` でもないので素通し)。起動時検査に使う (#2708)。
-func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibility != "" }
+//
+// **live lookup も見る。** 焼き込みを止めて `SetUGCVisibilityLookup` に
+// 移したとき、この述語だけが固定フィールドを見たままだと**配線済みなのに
+// 起動時検査が落ちて本番が起動しない**。notes 側 (`ugcVisibilityNow`) と
+// 同じ形にしてある。
+func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibilityNow() != "" }
+
+// pinnedPageVisibleTo reports whether viewer may read the pinned page body.
+//
+// **`pages/show` は拒否するのに `users/show` は本文を渡していた。**
+// 同じ関数の 14 行上ではピン留めノートに可視性ゲートを掛けているのに、Page 側の
+// 枝には viewer への参照が 1 つも無く、`content` (ブロックツリー全体) / `script` /
+// `title` / `summary` / `variables` がそのまま出ていた。Page は
+// `pages/create` が `visibility` を無検証で受け、`i/update` の `pinnedPageId` も
+// 所有者しか見ないので、前提を作るのは容易。
+//
+// upstream も `pages/show` にゲートが無いので `両方` に当たるが、mk-go は
+// `pages/show` 側だけ厳しくしてあり、**同じサーバーが片方で「無い」と言い
+// ながらもう片方で本文を渡す**状態だった。安全側 (mk-go の厳しい方) に揃える。
+func pinnedPageVisibleTo(p *model.Page, viewer *model.User) bool {
+	if p == nil {
+		return false
+	}
+	if p.Visibility == "" || p.Visibility == model.PageVisibilityPublic {
+		return true
+	}
+	// 非公開の Page は本人にだけ返す (`pages/show` の core service と同じ判定)。
+	return viewer != nil && viewer.ID == p.UserID
+}

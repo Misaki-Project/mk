@@ -16,6 +16,36 @@ import (
 	"github.com/shiroha-a/mk/internal/queue"
 )
 
+// operatorProtectedTaskTypes are job types the queue-wide admin operations
+// must not touch.
+//
+// **deliver キューには利用者の不可逆な予定が同居している。**
+//
+//   - `postScheduledNote`: 促進すると**全利用者の未公開の予約投稿が即時公開**
+//     される。消すと二度と発火せず、失敗通知も出ない (下書き行だけが残る)
+//   - `deleteAccount`: 消すと「削除フラグだけ立ってノート・ドライブ・フォローが
+//     残るアカウント」が生まれる。しかも `WithUnique(24h)` の dedup キーが
+//     Redis に残るので、24 時間は再実行しても黙って無視される
+//
+// upstream はこれらを `postScheduledNote` / `db` の別キューに置いているので、
+// deliver の詰まりを流す操作が波及しない。mk-go は deliver に相乗りさせる
+// 構成を意図的に選んでいる (docs/divergence.md) ので、代わりにここで守る。
+// **キュー構成を変えないのは、管理画面のタブが fork 側の定数から生成されて
+// いて、名前を増やすと片側更新になるため。**
+var operatorProtectedTaskTypes = map[string]struct{}{
+	queue.TaskTypePostScheduledNote: {},
+	queue.TaskTypeDeleteAccount:     {},
+}
+
+// isOperatorProtectedTask reports whether a queue-wide operation must skip t.
+func isOperatorProtectedTask(t *QueueTaskSummary) bool {
+	if t == nil {
+		return false
+	}
+	_, protected := operatorProtectedTaskTypes[t.Type]
+	return protected
+}
+
 // QueueClear handles POST /api/admin/queue/clear.
 func (h *Handler) QueueClear(c echo.Context) error {
 	// upstream Misskey TS は paramDef で queue + state を required にしている (#929)。
@@ -31,6 +61,11 @@ func (h *Handler) QueueClear(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	h.clearQueueState(req.Queue, req.State)
+	// **監査に残す。** 連合の配送が丸ごと落ちる操作。
+	h.logModeration(c, moderationlog.LogClearQueue, map[string]any{
+		"queue": req.Queue,
+		"state": req.State,
+	})
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -39,53 +74,79 @@ func (h *Handler) QueueClear(c echo.Context) error {
 // mkq には state 単位の bulk-delete API が無いため、pending は DrainPending、
 // それ以外は state 別の list → DeleteTask で消す (best-effort)。
 //
-// 注意点 (mkq 制約 / upstream との差): (1) "wait" は DrainPending を呼ぶが mkq の
-// DrainPending は wait に加え paused / prioritized バケットも drain する。mk-go は
-// queue を pause せず deliver/inbox で per-job priority も使わないため両バケットは
-// 実運用で常に空であり observable な差は無い。(2) active / paused / prioritized を
-// 単独 state で指定した場合は対応する bulk-clear 経路が無いため no-op。(3) cron
-// (repeat) 由来の delayed job は RemoveJob が拒否するため clear('delayed') で消えない。
-// (4) clearable job が約 100k を超える queue では 1 リクエストで消し切らない (再実行で継続)。
+// 注意点 (mkq 制約 / upstream との差):
+//
+// (1) **"wait" は wait バケットしか掃かない。** かつては `DrainPending` を呼んで
+// おり、あれは wait に加え paused / prioritized も drain したが、job type を見ない
+// ので**予約投稿やアカウント削除まで巻き込んだ** (#3130)。列挙経路
+// (`ListPendingTasks`) へ移して保護対象を除けるようにした。あちらは
+// `JobBucketWait` だけを見るが、mkq v1.1.0 (BullMQ 6) からは pause してもジョブは
+// wait に残るので、pause 中のキューでも掃ける。**v5 時代に paused list へ退避
+// されたジョブだけは残る** (Resume が wait へ戻した後なら掃ける)。mk-go は
+// deliver/inbox で per-job priority を使わないので prioritized は常に空。
+//
+// (2) active / paused / prioritized を単独 state で指定した場合は対応する
+// bulk-clear 経路が無いため no-op。
+//
+// (3) cron (repeat) 由来の delayed job は RemoveJob が拒否するため
+// clear('delayed') で消えない。
+//
+// (4) **1 リクエストで消し切らないことがある** (再実行で継続)。上限 1000 反復 ×
+// 100 件で約 100k。(1) の変更で wait もこの制限に入った (`DrainPending` は
+// 1 回で全部消していた)。
 func (h *Handler) clearQueueState(queue, state string) {
 	// deleteAll はリストが空になるまで先頭ページを引いて消す。削除で件数が
 	// 減るため page=1 を繰り返す。delete が 1 件も進まなければ無限ループを
 	// 避けて打ち切る。上限 1000 反復 (= 約 100k tasks) の安全弁付き。
-	deleteAll := func(lister func(string, int, int) ([]*QueueTaskSummary, error)) {
+	// **保護を掛けるのは「これから動く」バケットだけ。** completed / failed は
+	// 既に終わった記録なので、消せなくすると**終了済みの予約投稿 /
+	// アカウント削除が永久に残る** (掃除の目的そのものが果たせない)。
+	deleteAll := func(lister func(string, int, int) ([]*QueueTaskSummary, error), protect bool) {
 		for i := 0; i < 1000; i++ {
 			rows, err := lister(queue, 1, 100)
 			if err != nil || len(rows) == 0 {
 				return
 			}
 			progressed := false
+			skipped := 0
 			for _, t := range rows {
+				if protect && isOperatorProtectedTask(t) {
+					skipped++
+					continue
+				}
 				if h.queueInspector.DeleteTask(queue, t.ID) == nil {
 					progressed = true
 				}
 			}
-			if !progressed {
+			// **保護対象しか残っていなければ打ち切る。** 進捗ゼロで回り続けない。
+			if !progressed || skipped == len(rows) {
 				return
 			}
 		}
 	}
+	// **pending も一括削除ではなく個別に消す。** `DeleteAllPendingTasks` は
+	// job type を見ないので、wait へ昇格した予約投稿やアカウント削除まで
+	// 巻き込む。保護対象を除いて消すために列挙経路を通す。
 	switch state {
 	case "*":
-		_, _ = h.queueInspector.DeleteAllPendingTasks(queue)
-		deleteAll(h.queueInspector.ListScheduledTasks)
-		deleteAll(h.queueInspector.ListRetryTasks)
-		deleteAll(h.queueInspector.ListFailedTasks)
-		deleteAll(h.queueInspector.ListCompletedTasks)
+		deleteAll(h.queueInspector.ListPendingTasks, true)
+		deleteAll(h.queueInspector.ListScheduledTasks, true)
+		deleteAll(h.queueInspector.ListRetryTasks, true)
+		deleteAll(h.queueInspector.ListFailedTasks, false)
+		deleteAll(h.queueInspector.ListCompletedTasks, false)
 	case "wait", "waiting", "pending":
-		_, _ = h.queueInspector.DeleteAllPendingTasks(queue)
+		deleteAll(h.queueInspector.ListPendingTasks, true)
 	case "delayed":
-		deleteAll(h.queueInspector.ListScheduledTasks)
-		deleteAll(h.queueInspector.ListRetryTasks)
+		deleteAll(h.queueInspector.ListScheduledTasks, true)
+		deleteAll(h.queueInspector.ListRetryTasks, true)
 	case "failed":
-		deleteAll(h.queueInspector.ListFailedTasks)
+		deleteAll(h.queueInspector.ListFailedTasks, false)
 	case "completed":
-		deleteAll(h.queueInspector.ListCompletedTasks)
+		deleteAll(h.queueInspector.ListCompletedTasks, false)
 	default:
 		// active / paused / prioritized は単独 state での bulk-clear 経路が
-		// 無いため no-op (paused/prioritized は wait 経由の DrainPending で消える)。
+		// 無いため no-op。pause 中のジョブは wait にあるので "wait" で掃ける
+		// (上の注意点 (1))。
 	}
 }
 
@@ -115,7 +176,8 @@ func (h *Handler) QueueInboxDelayed(c echo.Context) error {
 }
 
 // delayedTasksFetchPageSize は scheduled / retry を page 走査する際の 1 page
-// 当たり件数。100 は asynq inspector の page size 制限 (1〜) 内で妥当な大きさ。
+// 当たり件数。100 は driver 側の page size 上限 (mkq は 100 超を 30 に丸める)
+// に収まる大きさ。
 const delayedTasksFetchPageSize = 100
 
 // delayedTasksMaxPages は scheduled / retry それぞれの page 走査の上限。
@@ -266,8 +328,8 @@ func inboxHostFromPayload(t *QueueTaskSummary) string {
 //
 // frontend admin/job-queue.vue は state を Bull の state 名配列で送る
 // (`['completed', 'failed', 'active', 'delayed', 'wait']` など)。
-// mk-go は asynq バックなので Bull state 名を asynq の list 呼び出しに
-// マッピングする。合計 limit を超えないよう走査中に切り詰める。
+// mk-go は Bull state 名を driver の list 呼び出しにマッピングする。
+// 合計 limit を超えないよう走査中に切り詰める。
 func (h *Handler) QueueJobs(c echo.Context) error {
 	// state は string でも string[] でも受け取れるようにする (frontend は
 	// 配列、既存テストや admin CLI からは単一文字列でくる可能性がある)。
@@ -285,18 +347,25 @@ func (h *Handler) QueueJobs(c echo.Context) error {
 	if h.queueInspector == nil {
 		return c.JSON(http.StatusOK, []any{})
 	}
-	if req.Limit <= 0 || req.Limit > 100 {
-		req.Limit = 30
-	}
-	if req.Page < 1 {
-		req.Page = 1
-	}
 	states := parseStateField(req.State)
 	terms := searchTerms(req.Search)
 	if len(terms) > 0 {
 		// upstream queueGetJobs の search 経路は paramDef に limit/page を持たず、
 		// 1000 件取得→filter→最大 100 件返す。専用ページング経路に委譲する。
 		return c.JSON(http.StatusOK, h.searchQueueJobs(req.Queue, states, terms))
+	}
+	// **limit / page は mk-go の拡張で、upstream の paramDef には無い。** 同梱
+	// フロントは渡さないので、未指定のときは upstream と同じ形で返す (#3167)。
+	// 以前は既定の 30 件が全 state 合計に効き、state を順に詰めるので「すべて」
+	// タブが完了済みだけで埋まって失敗が 1 件も見えなかった。
+	if req.Limit == 0 && req.Page == 0 {
+		return c.JSON(http.StatusOK, h.upstreamQueueJobs(req.Queue, states))
+	}
+	if req.Limit <= 0 || req.Limit > 100 {
+		req.Limit = 30
+	}
+	if req.Page < 1 {
+		req.Page = 1
 	}
 
 	seen := make(map[string]struct{}, req.Limit)
@@ -323,6 +392,47 @@ outer:
 	return c.JSON(http.StatusOK, out)
 }
 
+// upstreamPerStateLimit is how many jobs upstream returns per state:
+// `queue.getJobs(types, 0, 100)` is end-inclusive, so up to 101.
+const upstreamPerStateLimit = 101
+
+// upstreamQueueJobs reproduces upstream queueGetJobs の search 無し経路。
+// BullMQ の getJobs は state ごとに新しい順で [0, 100] を取り、state の指定順に
+// 連結して ID で重複を除く。**合計では切らない** — 切ると先頭の state だけで
+// 埋まり、後ろの state (「すべて」タブの failed など) が見えなくなる。
+func (h *Handler) upstreamQueueJobs(queue string, states []string) []map[string]any {
+	seen := make(map[string]struct{})
+	out := make([]map[string]any, 0)
+	for _, state := range states {
+		for _, t := range h.listTasksUpTo(queue, state, upstreamPerStateLimit) {
+			if _, dup := seen[t.ID]; dup {
+				continue
+			}
+			seen[t.ID] = struct{}{}
+			out = append(out, packTaskSummary(t))
+		}
+	}
+	return out
+}
+
+// listTasksUpTo collects up to n tasks of one state, newest first, paging
+// past the driver's page size cap (100).
+func (h *Handler) listTasksUpTo(queue, state string, n int) []*QueueTaskSummary {
+	const pageSize = 100 // driver の page size 上限
+	out := make([]*QueueTaskSummary, 0, min(n, pageSize))
+	for page := 1; len(out) < n; page++ {
+		rows, err := h.listTasksForState(queue, state, page, pageSize)
+		if err != nil || len(rows) == 0 {
+			break
+		}
+		out = append(out, rows[:min(len(rows), n-len(out))]...)
+		if len(rows) < pageSize {
+			break
+		}
+	}
+	return out
+}
+
 // searchQueueJobs reproduces upstream queueGetJobs の search 経路。各 state を
 // 100 件 (driver の page size 上限) ずつ最大 searchMaxPages ページ取得して候補
 // プールを ~1000 件まで広げ、JSON 表現に全 term を含む job だけを最大
@@ -330,33 +440,24 @@ outer:
 // 単一呼び出しでなくページングで候補を集める。
 func (h *Handler) searchQueueJobs(queue string, states, terms []string) []map[string]any {
 	const searchReturnLimit = 100 // upstream RETURN_LIMIT
-	const searchPageSize = 100    // driver の page size 上限
-	const searchMaxPages = 10     // upstream getJobs(0, 1000) 相当の候補プール
+	// upstream は getJobs(types, 0, 1000) = state ごとに新しい順で最大 1001 件
+	const searchPoolPerState = 1001
 	seen := make(map[string]struct{}, searchReturnLimit)
 	out := make([]map[string]any, 0, searchReturnLimit)
 	for _, state := range states {
-		for page := 1; page <= searchMaxPages; page++ {
-			rows, err := h.listTasksForState(queue, state, page, searchPageSize)
-			if err != nil || len(rows) == 0 {
-				break
+		for _, t := range h.listTasksUpTo(queue, state, searchPoolPerState) {
+			if len(out) >= searchReturnLimit {
+				return out
 			}
-			for _, t := range rows {
-				if len(out) >= searchReturnLimit {
-					return out
-				}
-				if _, dup := seen[t.ID]; dup {
-					continue
-				}
-				packed := packTaskSummary(t)
-				if !jobMatchesSearch(packed, terms) {
-					continue
-				}
-				seen[t.ID] = struct{}{}
-				out = append(out, packed)
+			if _, dup := seen[t.ID]; dup {
+				continue
 			}
-			if len(rows) < searchPageSize {
-				break
+			packed := packTaskSummary(t)
+			if !jobMatchesSearch(packed, terms) {
+				continue
 			}
+			seen[t.ID] = struct{}{}
+			out = append(out, packed)
 		}
 	}
 	return out
@@ -386,7 +487,7 @@ func jobMatchesSearch(packed map[string]any, terms []string) bool {
 
 // parseStateField normalizes the `state` request field which can be a single
 // string or an array of strings (Misskey frontend sends array). Empty input
-// defaults to "wait" (Bull wording) = asynq "pending".
+// defaults to "wait" (Bull wording) = driver の pending バケット。
 func parseStateField(raw json.RawMessage) []string {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
@@ -415,14 +516,14 @@ func (h *Handler) listTasksForState(queue, state string, page, limit int) ([]*Qu
 		return h.queueInspector.ListScheduledTasks(queue, page, limit)
 	case "retry":
 		return h.queueInspector.ListRetryTasks(queue, page, limit)
-	// Bull と asynq の用語対応
+	// Bull と driver の用語対応
 	case "wait", "pending":
 		return h.queueInspector.ListPendingTasks(queue, page, limit)
 	case "delayed":
-		// delayed は Bull 用語で asynq の scheduled + retry に対応する。
-		sched, _ := h.queueInspector.ListScheduledTasks(queue, page, limit)
-		retry, _ := h.queueInspector.ListRetryTasks(queue, page, limit)
-		return append(sched, retry...), nil
+		// delayed は Bull 用語で driver の scheduled + retry に対応する。
+		// **2 つを後から混ぜない (#3167)。** 別々に page を取って連結すると
+		// 1 ページが最大 2 倍になり、並びも delayed 全体の新しい順にならない。
+		return h.queueInspector.ListDelayedTasks(queue, page, limit)
 	case "completed":
 		// mkq は WithKeepCompleted retention で完了ジョブを保持する。frontend
 		// の All / Latest / Completed タブはこれを引く (#1396)。
@@ -430,8 +531,10 @@ func (h *Handler) listTasksForState(queue, state string, page, limit int) ([]*Qu
 	case "failed":
 		return h.queueInspector.ListFailedTasks(queue, page, limit)
 	case "paused":
-		// "paused" は queue 状態であってジョブ一覧ではない。mk-go は queue を
-		// pause しないため空で返す。
+		// "paused" は queue 状態であってジョブ一覧ではない。**upstream 2026.9.0 は
+		// bullmq v6 化に伴い paramDef.state から 'paused' 自体を外し、Paused タブも
+		// 削除した**ので、空返しのまま upstream に揃う (mk-go は #2069 で pause/resume
+		// を実装済みだが、それとは別の話)。
 		return nil, nil
 	default:
 		return h.queueInspector.ListPendingTasks(queue, page, limit)
@@ -440,7 +543,7 @@ func (h *Handler) listTasksForState(queue, state string, page, limit int) ([]*Qu
 
 // QueuePromoteJobs handles POST /api/admin/queue/promote-jobs.
 func (h *Handler) QueuePromoteJobs(c echo.Context) error {
-	// asynq に bulk promote API が無いため、対象 queue の scheduled/retry を
+	// driver に bulk promote API が無いため、対象 queue の scheduled/retry を
 	// 1 ページずつ拾って RunTask で逐次 promote する。大量投入時は後続の
 	// ページを クライアント側で再呼び出しする運用。
 	// upstream Misskey TS は paramDef で queue を required にしている (#929)。
@@ -462,11 +565,20 @@ func (h *Handler) QueuePromoteJobs(c echo.Context) error {
 			rows, _ = h.queueInspector.ListRetryTasks(req.Queue, 1, 100)
 		}
 		for _, t := range rows {
+			// **利用者の予定は促進しない。** 促進は「詰まった配送を流す」操作で、
+			// 予約投稿を前倒しで公開する操作ではない。
+			if isOperatorProtectedTask(t) {
+				continue
+			}
 			if err := h.queueInspector.RunTask(req.Queue, t.ID); err == nil {
 				promoted++
 			}
 		}
 	}
+	h.logModeration(c, moderationlog.LogPromoteQueue, map[string]any{
+		"queue":    req.Queue,
+		"promoted": promoted,
+	})
 	return c.JSON(http.StatusOK, map[string]any{"promoted": promoted})
 }
 
@@ -517,7 +629,10 @@ func (h *Handler) queuePauseResume(c echo.Context, pause bool) error {
 	if err := c.Bind(&req); err != nil || req.Queue == "" {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("queue is required."))
 	}
-	if _, ok := queuePauseResumeTypes[req.Queue]; !ok {
+	// プラグイン専用のキュー (#2818) は名前が動的なので、静的な一覧では
+	// 判定できない。**接頭辞で通したうえで queueIsManaged に実在を確かめ
+	// させる** — 未運用の名前はその先で no-op 204 になる。
+	if _, ok := queuePauseResumeTypes[req.Queue]; !ok && !strings.HasPrefix(req.Queue, queue.PluginQueuePrefix) {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam("invalid queue."))
 	}
 	if h.queueInspector == nil {
@@ -580,9 +695,8 @@ func shapeQueueForFrontend(info *QueueInfoResult, completed, failed *QueueMetric
 
 	// metrics は driver から渡された QueueMetricsResult を採用し、
 	// nil/欠損時は info.Completed / info.Failed の累積値で count を埋め、
-	// data は空配列にフォールバックする。前者は mkq driver で
-	// WithJobMetrics が無効、後者は asynq driver の time-series 非対応
-	// シナリオを想定。
+	// data は空配列にフォールバックする。mkq driver で WithJobMetrics を
+	// 無効にした構成や、time-series を持たない driver を想定。
 	completedData, completedCount := metricsToFrontend(completed, int64(info.Completed))
 	failedData, failedCount := metricsToFrontend(failed, int64(info.Failed))
 
@@ -672,7 +786,7 @@ func metricsToFrontend(m *QueueMetricsResult, fallbackCount int64) ([]int64, int
 // その queue だけ、来なければ全 queue を返すという両対応にする。
 //
 // frontend は Misskey Bull の queue 名を hardcode (`Misskey.queueTypes`) で
-// 列挙しており、mk-go の asynq queue 名 (deliver/push/maintenance/webhook/
+// 列挙しており、mk-go の queue 名 (deliver/push/maintenance/webhook/
 // export) と完全には一致しない。存在しない queue を叩かれたときは 500 で
 // はなくゼロ埋めの shape を返して、フロント側の queueInfo が stale に
 // ならないようにする。
@@ -701,7 +815,7 @@ func (h *Handler) QueueQueueStats(c echo.Context) error {
 // per-minute history. Errors are absorbed and returned as nil so the
 // admin endpoints stay 200 OK — partial chart data is preferable to
 // a hard failure when the metrics writer is opt-in (mkq driver) or
-// absent altogether (asynq driver).
+// absent altogether.
 func (h *Handler) fetchQueueMetrics(qname string) (completed, failed *QueueMetricsResult) {
 	if h.queueInspector == nil {
 		return nil, nil
@@ -743,9 +857,9 @@ func (h *Handler) QueueRemoveJob(c echo.Context) error {
 	if h.queueInspector == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
-	// asynq DeleteTask は不明 task id でも nil error を返す (= idempotent)
-	// が、upstream Misskey TS は 4xx を返す。drop-in 互換のため事前に
-	// GetTaskInfo で存在確認して、無ければ 404 を返す (#929)。
+	// driver の DeleteTask は不明 task id でも nil error を返しうる
+	// (= idempotent) が、upstream Misskey TS は 4xx を返す。drop-in 互換の
+	// ため事前に GetTaskInfo で存在確認して、無ければ 404 を返す (#929)。
 	if _, err := h.queueInspector.GetTaskInfo(queue, id); err != nil {
 		return c.JSON(http.StatusNotFound, apierr.NotFound())
 	}
@@ -787,7 +901,7 @@ func (h *Handler) QueueRetryJob(c echo.Context) error {
 	if h.queueInspector == nil {
 		return c.NoContent(http.StatusNoContent)
 	}
-	// asynq RunTask も不明 id で nil を返す idempotent 挙動。drop-in 互換の
+	// RunTask も不明 id で nil を返しうる idempotent 挙動。drop-in 互換の
 	// ため事前に GetTaskInfo で存在確認 (#929)。
 	if _, err := h.queueInspector.GetTaskInfo(queue, id); err != nil {
 		return c.JSON(http.StatusNotFound, apierr.NotFound())
@@ -818,8 +932,8 @@ func (h *Handler) QueueShowJob(c echo.Context) error {
 //
 // upstream は `queue.getJobLogs(jobId).logs` をそのまま返す。mk-go 自身は
 // 現状 log を書かないが、**drop-in で TS が書いた job** や、将来 processor が
-// Job.Log を使った場合にそのまま読める (#2689)。持たない driver (asynq) は
-// 空を返す。存在しない job と log 0 件の job は BullMQ 同様に区別しない。
+// Job.Log を使った場合にそのまま読める (#2689)。持たない driver は空を
+// 返す。存在しない job と log 0 件の job は BullMQ 同様に区別しない。
 func (h *Handler) QueueShowJobLogs(c echo.Context) error {
 	queue, id, ok := bindQueueJobReq(c)
 	if !ok {
@@ -895,13 +1009,13 @@ func packTaskSummary(t *QueueTaskSummary) map[string]any {
 		// **記録が無い job では空配列**になる (mkq v1.0.8 より前に失敗したもの、
 		// TS が書いたもの)。frontend はその場合に従来どおり折りたたむ。
 		"attemptsAt": attemptsAtOrEmpty(t.AttemptsAt),
-		// asynq-native field (既存 admin tool 互換のために残す)。
+		// mk-go 独自 field (既存 admin tool 互換のために残す)。
 		"queue":   t.Queue,
 		"type":    t.Type,
 		"state":   t.State,
-		"payload": string(t.Payload),
+		"payload": redactPayloadSecrets(t.Payload),
 		"retried": t.Retried,
-		// maxRetry は asynq 由来の独自 field。mkq driver は TaskSummary.MaxRetry を
+		// maxRetry は mk-go 独自 field。mkq driver は TaskSummary.MaxRetry を
 		// 埋めないので、opts.attempts から拾えるならそちらを使う (0 のまま出すと
 		// 「リトライしない設定」に見える、#2689 review)。
 		"maxRetry":     maxRetryFor(t),
@@ -959,8 +1073,9 @@ func packJobData(t *QueueTaskSummary) map[string]any {
 	if body == nil {
 		body = map[string]any{}
 	}
+	body = redactJobSecrets(body)
 	// Type が空になることは無い。mkq driver は framing が無ければ BullMQ の
-	// job.name に落とし、その既定は queue 名。asynq も TaskInfo.Type を必ず持つ。
+	// job.name に落とし、その既定は queue 名。
 	return map[string]any{"type": t.Type, "body": body}
 }
 
@@ -978,8 +1093,8 @@ func attemptsAtOrEmpty(v []int64) []int64 {
 // maxRetryFor reports the job's configured attempt limit, preferring the
 // BullMQ opts value over the driver-reported one.
 //
-// asynq は TaskSummary.MaxRetry を埋めるが mkq driver は埋めない (attempts は
-// opts 側にある)。どちらの driver でも意味のある値になるようにする。
+// mkq driver は TaskSummary.MaxRetry を埋めない (attempts は opts 側にある)。
+// どちらが埋まっていても意味のある値になるようにする。
 func maxRetryFor(t *QueueTaskSummary) int {
 	if t.MaxRetry > 0 {
 		return t.MaxRetry
@@ -1071,7 +1186,7 @@ func (h *Handler) QueueStats(c echo.Context) error {
 			"active":    info.Active,
 			"completed": info.Completed,
 			"failed":    info.Failed,
-			// Bull の delayed は asynq の Scheduled (未来実行予定) と Retry
+			// Bull の delayed は Scheduled (未来実行予定) と Retry
 			// (失敗後再試行待ち) の両方を含む (#654)。
 			"delayed": info.Scheduled + info.Retry,
 		}
@@ -1090,4 +1205,78 @@ func (h *Handler) queueRuntimeFor(qname string) *QueueRuntime {
 		return nil
 	}
 	return &rt
+}
+
+// jobSecretKeys are payload fields that must never reach the API response.
+//
+// **deliver job の署名鍵。** 現在の producer は payload に載せないが、この
+// 変更より前に積まれた job は持っている。取得できれば任意のローカルユーザーと
+// して署名付き連合リクエストを偽造できるので、**到達点でも伏せる**
+// (moderator + `read:admin:queue` で届く)。
+var jobSecretKeys = map[string]struct{}{
+	// deliver job の署名鍵 (`queue.DeliverPayload`)。
+	"keyPem":         {},
+	"ed25519PrivPem": {},
+	// webhook job の上書き secret (`queue.WebhookPayload`)。`i/webhooks/test` の
+	// 送信内容で、**他人のものも同じ endpoint から読める** (queue 名に
+	// allowlist が無い)。upstream も job data に secret を入れているので
+	// parity ではあるが、読める必要は無い。
+	"overrideSecret": {},
+	// プラグイン peer の送信本文 (`peerJob.Envelope`、#3037)。**中身を決めるのは
+	// プラグイン**で、本体はそれが何かを知らない。実際の同梱プラグインは
+	// 利用者のノートや外部サービスの応答を載せうるし、peer は本来「その
+	// プラグイン同士」の通信で、モデレーション画面に出す前提のものではない。
+	// Redis に再送のあいだ残り、`admin/queue/jobs` から (moderator +
+	// `read:admin:queue` で) 読めていた。**upstream に peer は無い**ので
+	// mk-go 独自の判断。
+	//
+	// 伏せても運用は困らない — 同じ job に `host` / `sendId` / 試行回数 /
+	// 失敗理由が出るので、送信の追跡はできる。
+	"envelope": {},
+}
+
+const redactedPlaceholder = "[redacted]"
+
+// redactJobSecrets replaces secret-bearing fields in a decoded job body.
+func redactJobSecrets(body any) any {
+	m, ok := body.(map[string]any)
+	if !ok {
+		return body
+	}
+	for k := range m {
+		if _, secret := jobSecretKeys[k]; secret {
+			m[k] = redactedPlaceholder
+		}
+	}
+	return m
+}
+
+// redactPayloadSecrets returns the raw payload with secret fields removed.
+//
+// JSON として読めないものはそのまま返す (非 JSON payload の job がありうる)。
+// 伏せ損ねるより読めるほうを優先する形だが、この経路は `data` 側の redact と
+// 二重になっており、かつ producer は既に鍵を載せていないので実害は無い。
+func redactPayloadSecrets(raw []byte) string {
+	if len(raw) == 0 {
+		return string(raw)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return string(raw)
+	}
+	var found bool
+	for k := range m {
+		if _, secret := jobSecretKeys[k]; secret {
+			m[k] = redactedPlaceholder
+			found = true
+		}
+	}
+	if !found {
+		return string(raw)
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return string(raw)
+	}
+	return string(out)
 }

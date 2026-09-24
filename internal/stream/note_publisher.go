@@ -268,6 +268,12 @@ type NotificationPublisher struct {
 	emojiLookup          entity.EmojiLookup
 	roleLookup           entity.RoleLookup
 	chatInvitationLookup entity.ChatInvitationLookup
+	// abuseReportLookup は abuseReport 通知の現在の状態を read 時に引く
+	// (#2868)。未配線なら abuseReport 通知を返さない (fail-closed)。
+	abuseReportLookup entity.AbuseReportLookup
+	// emojiApplicationLookup は #2934 の申請結果通知。未配線なら返さない。
+	emojiApplicationLookup  entity.EmojiApplicationLookup
+	signupApplicationLookup entity.SignupApplicationLookup
 	// fieldResolver は埋め込み note の Files / Channel / MyReaction を埋める
 	// (#2735)。未配線だと通知 payload の files が空配列のままになり、通知ページの
 	// reply / mention / quote (MkNote で全体描画される) から添付メディアが消える。
@@ -308,6 +314,25 @@ func (p *NotificationPublisher) SetEmojiLookup(lookup entity.EmojiLookup) {
 // の `followingChecker == nil` semantics。
 func (p *NotificationPublisher) SetFollowingChecker(c NotificationFollowingChecker) {
 	p.followingRepo = c
+}
+
+// SetAbuseReportLookup attaches the read-time state lookup for abuseReport
+// notifications (#2868)。未配線なら abuseReport 通知を返さない (fail-closed)。
+func (p *NotificationPublisher) SetAbuseReportLookup(fn entity.AbuseReportLookup) {
+	p.abuseReportLookup = fn
+}
+
+// SetEmojiApplicationLookup attaches the read-time state lookup for
+// emojiApplicationProcessed notifications (#2934)。未配線なら返さない
+// (fail-closed、abuseReport と同じ)。
+func (p *NotificationPublisher) SetEmojiApplicationLookup(fn entity.EmojiApplicationLookup) {
+	p.emojiApplicationLookup = fn
+}
+
+// SetSignupApplicationLookup attaches the read-time state lookup for
+// signupApplicationReceived notifications (#2987)。未配線なら通知ごと返さない。
+func (p *NotificationPublisher) SetSignupApplicationLookup(fn entity.SignupApplicationLookup) {
+	p.signupApplicationLookup = fn
 }
 
 // SetRoleLookup attaches the lookup used to pack roleAssigned notifications'
@@ -387,6 +412,9 @@ func (p *NotificationPublisher) Pack(notifieeID string, n *corenotification.Noti
 	}
 	packed := entity.PackNotification(n, user, note, p.idGen, p.instanceLookup, p.emojiLookup,
 		entity.WithRoleLookup(p.roleLookup),
+		entity.WithAbuseReportLookup(p.abuseReportLookup),
+		entity.WithEmojiApplicationLookup(p.emojiApplicationLookup),
+		entity.WithSignupApplicationLookup(p.signupApplicationLookup),
 		entity.WithChatInvitationLookup(p.chatInvitationLookup),
 		entity.WithViewer(notifieeID),
 		entity.WithNoteFieldResolver(p.fieldResolver))

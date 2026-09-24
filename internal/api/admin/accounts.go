@@ -3,13 +3,12 @@ package admin
 import (
 	"log/slog"
 	"net/http"
-	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/core/moderationlog"
-	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/queue"
+	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // AccountsDelete handles POST /api/admin/accounts/delete.
@@ -21,12 +20,22 @@ func (h *Handler) AccountsDelete(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	// root / system アカウントの削除は連合を壊すため拒否する (#parity review F1)。
-	if h.isProtectedAccount(req.UserID) {
+	// **判定できないときは 500 に倒す** — 分からないまま不可逆な削除を通さない。
+	switch protected, undetermined := h.isProtectedAccount(req.UserID); {
+	case undetermined:
+		return apierr.JSONInternalError(c)
+	case protected:
 		return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Cannot delete a root or system account.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 	}
 	// #2230: local user は物理削除 (Soft=false)、remote user は tombstone (Soft=true)。
 	user, _ := h.userRepo.FindByID(req.UserID)
 	if err := h.userRepo.UpdateUser(req.UserID, map[string]any{"isSuspended": true, "isDeleted": true}); err == nil {
+		// **モデレーターの判断として刻む** (#2973)。刻まないと、発信元由来の
+		// 凍結が `remote` のまま残っている行では、発信元が `toot:suspended` を
+		// 下ろした時点で tombstone の凍結が解除される。inbound の gate は
+		// `isSuspended` しか見ないので、削除済みアカウントからの activity が
+		// 再び通ることになる。
+		h.recordLocalSuspensionOrigin(req.UserID)
 		// 論理削除直後の auth bypass 防止 (#965)。target の全 token cache
 		// entry を即時 invalidate して 30s stale window を消す。DB 更新が
 		// 失敗したケースでは cache を触る理由がないので、err 成功時のみ。
@@ -48,10 +57,18 @@ func (h *Handler) AccountsFindByEmail(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "email is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 	profile, err := h.userRepo.FindProfileByEmail(req.Email)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("USER_NOT_FOUND", "User not found.", "cb865949-8af5-4062-a88c-ef55e8786d1d"))
 	}
 	user, err := h.userRepo.FindByID(profile.UserID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("USER_NOT_FOUND", "User not found.", "cb865949-8af5-4062-a88c-ef55e8786d1d"))
 	}
@@ -61,7 +78,7 @@ func (h *Handler) AccountsFindByEmail(c echo.Context) error {
 	// includeSecrets 限定 field が漏れる (#1847、#1822 と同 class)。UserDetailed に
 	// 揃えて過剰露出を防ぐ (ShowUsers と同方針)。生 model.User の内部 field
 	// (inbox/sharedInbox/usernameLower) も UserDetailed では出ない。
-	return c.JSON(http.StatusOK, entity.PackUserDetailed(user, profile, h.idGen))
+	return c.JSON(http.StatusOK, h.packModeratorVisibleUser(user, profile))
 }
 
 // DeleteAccount handles POST /api/admin/delete-account. AccountsDelete と
@@ -75,12 +92,22 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	// root / system アカウントの削除は連合を壊すため拒否する (#parity review F1)。
-	if h.isProtectedAccount(req.UserID) {
+	// **判定できないときは 500 に倒す** — 分からないまま不可逆な削除を通さない。
+	switch protected, undetermined := h.isProtectedAccount(req.UserID); {
+	case undetermined:
+		return apierr.JSONInternalError(c)
+	case protected:
 		return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Cannot delete a root or system account.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 	}
 	// AP Delete(actor) 配信のため、更新前に user を控える (#1759)。
 	user, _ := h.userRepo.FindByID(req.UserID)
 	if err := h.userRepo.UpdateUser(req.UserID, map[string]any{"isSuspended": true, "isDeleted": true}); err == nil {
+		// **モデレーターの判断として刻む** (#2973)。刻まないと、発信元由来の
+		// 凍結が `remote` のまま残っている行では、発信元が `toot:suspended` を
+		// 下ろした時点で tombstone の凍結が解除される。inbound の gate は
+		// `isSuspended` しか見ないので、削除済みアカウントからの activity が
+		// 再び通ることになる。
+		h.recordLocalSuspensionOrigin(req.UserID)
 		// AccountsDelete と同じ。target の全 token cache entry を即時
 		// invalidate (#965)。
 		h.invalidateUserTokenCache(req.UserID)
@@ -107,29 +134,47 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 // の `meta.rootUserId === user.id` (root) と `user.host === null &&
 // username.includes('.')` (system account) ガードに対応する (#parity review F1)。
 // Returns false when the user cannot be resolved.
-func (h *Handler) isProtectedAccount(userID string) bool {
+func (h *Handler) isProtectedAccount(userID string) (protected bool, undetermined bool) {
 	if h.userRepo == nil || userID == "" {
-		return false
+		return false, false
 	}
-	// root user id は meta が権威ソース (role service の isRootUser と揃える)。
+	// **判定できないときは「分からない」を返す (#2792 / #3037)。**
+	//
+	// かつては meta / user の lookup 失敗を黙って握り潰して false を返して
+	// いた。本番の root は `isRoot = false` (列を足した migration より後に
+	// 作られていない) なので **meta が唯一の判定材料**で、そこを読めない窓では
+	// root の保護が発火しない。通ると `user` 行が削除され、`meta.rootUserId` が
+	// 消えた ID を指したまま残って API 経由で復旧できなくなる。
+	//
+	// 同じ不変条件を守る `i/delete-account` / `targetIsRoot` /
+	// `suspend-user` / `show-user` は #3037 で「判定できない → 500」に直って
+	// おり、**admin の削除経路だけが取り残されていた**。
 	if h.metaRepo != nil {
-		if meta, err := h.metaRepo.Fetch(); err == nil && meta != nil && meta.RootUserID != nil && *meta.RootUserID == userID {
-			return true
+		meta, err := h.metaRepo.Fetch()
+		if err != nil {
+			slog.Error("admin: cannot determine whether the target is root", "userId", userID, "err", err)
+			return false, true
+		}
+		if meta != nil && meta.RootUserID != nil && *meta.RootUserID == userID {
+			return true, false
 		}
 	}
 	u, err := h.userRepo.FindByID(userID)
-	if err != nil || u == nil {
-		return false
+	if err != nil {
+		if repository.IsNotFound(err) {
+			// 居ないものは保護対象でもない。
+			return false, false
+		}
+		slog.Error("admin: cannot look up the delete target", "userId", userID, "err", err)
+		return false, true
+	}
+	if u == nil {
+		return false, false
 	}
 	if u.IsRoot {
-		return true
+		return true, false
 	}
-	// ローカル system account: host=null かつ username に '.' を含む
-	// (systemaccount は `<kind>.actor` 形式で作られる)。
-	if u.Host == nil && strings.Contains(u.Username, ".") {
-		return true
-	}
-	return false
+	return isSystemAccountUser(u), false
 }
 
 // scheduleAccountCascade queues the background cascade deletion. Errors

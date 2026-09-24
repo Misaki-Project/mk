@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # submodule は不要。配布物は compose と設定のひな形だけ。
 
       # 生成元をそのままコピーする。ここで内容を書き換えないのが要点。

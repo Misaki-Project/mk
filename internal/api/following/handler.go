@@ -152,10 +152,18 @@ func (h *Handler) AcceptRequest(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "66ce1645-d66c-46bb-8b79-96739af885bd"))
 	}
 	if err := h.followingService.AcceptRequest(me.ID, req.UserID); err != nil {
-		if errors.Is(err, corefollowing.ErrRequestNotFound) {
+		switch {
+		case errors.Is(err, corefollowing.ErrRequestNotFound):
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_FOLLOW_REQUEST", "No such follow request.", "bcde4f8b-0913-4614-8881-614e522fb041"))
+		case errors.Is(err, corefollowing.ErrBlocking):
+			// mk-go 独自の多層防御 (upstream の accept.ts には無い、#1562 の
+			// BLOCKING と同じ code だが occurrence が別なので id は別)。
+			return c.JSON(http.StatusBadRequest, apierr.Error("BLOCKING", "You are blocking that user.", "b155c6b3-83e9-400a-89c1-4a521da65240"))
+		case errors.Is(err, corefollowing.ErrBlocked):
+			return c.JSON(http.StatusBadRequest, apierr.Error("BLOCKED", "You are blocked by that user.", "25d1906c-9e73-49c0-85d1-f48d2520cd60"))
+		default:
+			return apierr.JSONInternalError(c)
 		}
-		return apierr.JSONInternalError(c)
 	}
 	return c.NoContent(http.StatusNoContent)
 }
@@ -248,7 +256,10 @@ func (h *Handler) List(c echo.Context) error {
 	// sinceDate / untilDate (Unix ms) を aidx prefix に正規化して sinceID /
 	// untilID と同 SQL cursor で扱う (#1166)。sinceID が指定されている場合
 	// upstream 同様 sinceDate は無視される。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 
 	rows, err := h.followingService.ListFollowingForList(me.ID, sinceID, untilID, req.Notification, limit)
 	if err != nil {
@@ -302,7 +313,10 @@ func (h *Handler) ListRequests(c echo.Context) error {
 	}
 	_ = c.Bind(&req)
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {

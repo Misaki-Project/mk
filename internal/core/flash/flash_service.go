@@ -104,12 +104,48 @@ func (s *Service) Create(in CreateInput) (*model.Flash, error) {
 	return f, nil
 }
 
-// Show returns a Flash by id. requesterID is currently unused (Flash は
-// public のみで、特に閲覧権限の概念はない) but kept for parity with the
-// page service to ease future expansion.
-func (s *Service) Show(_, flashID string) (*model.Flash, error) {
+// Show returns a Flash by id, refusing non-public ones to anyone but the owner.
+//
+// **doc の前提が誤っていた。** かつてここは「Flash は public のみで、特に閲覧
+// 権限の概念はない」と書いて `requesterID` を捨てていたが、`internal/model`
+// には `Visibility` 列があり、`flash/create` / `update` は `private` を明示的に
+// 受け付ける。非公開 flash を featured から外す repository クエリも 3 本ある。
+// つまり `flash/show` だけが `script` 全文を誰にでも返していた。
+//
+// upstream も同じ挙動 (`flash/show.ts` は `findOneBy({id})` だけ) だが、
+// mk-go はここを厳しくする。作った本人が「非公開」と指定したものを、その
+// 指定を持つサーバーが誰にでも返すのは筋が通らない。
+func (s *Service) Show(requesterID, flashID string) (*model.Flash, error) {
 	f, err := s.repo.FindByID(flashID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
+		return nil, ErrFlashNotFound
+	}
+	// 非公開のものは所有者にだけ返す。存在そのものを伏せるため not-found を返す
+	// (`pages` の core service は ErrAccessDenied を返すが、あちらは
+	// `pages/show` が not-found へ畳んでいる。ここでは直接 not-found にする)。
+	if f != nil && f.Visibility != "" && f.Visibility != "public" && f.UserID != requesterID {
+		return nil, ErrFlashNotFound
+	}
+	return f, nil
+}
+
+// ShowAny returns the flash regardless of its visibility.
+//
+// **認可は呼び出し側が行うこと。** `Show` の可視性ゲートは「閲覧」のための
+// もので、削除やモデレーションの前段でそれを通すと**所有者にもモデレーターにも
+// not-found が返る** (実際そうなっていた — private な Flash が誰にも消せない
+// 状態になった)。
+func (s *Service) ShowAny(flashID string) (*model.Flash, error) {
+	f, err := s.repo.FindByID(flashID)
+	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrFlashNotFound
 	}
 	return f, nil
@@ -128,6 +164,10 @@ type UpdateInput struct {
 func (s *Service) Update(ownerID, flashID string, in UpdateInput) (*model.Flash, error) {
 	f, err := s.repo.FindByID(flashID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrFlashNotFound
 	}
 	if f.UserID != ownerID {
@@ -167,6 +207,10 @@ func (s *Service) Update(ownerID, flashID string, in UpdateInput) (*model.Flash,
 func (s *Service) Delete(ownerID, flashID string) error {
 	f, err := s.repo.FindByID(flashID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrFlashNotFound
 	}
 	if f.UserID != ownerID {
@@ -182,6 +226,10 @@ func (s *Service) Delete(ownerID, flashID string) error {
 func (s *Service) DeleteByID(flashID string) error {
 	f, err := s.repo.FindByID(flashID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrFlashNotFound
 	}
 	return s.repo.Delete(f)
@@ -211,6 +259,10 @@ func (s *Service) Like(userID, flashID string) error {
 	}
 	f, err := s.repo.FindByID(flashID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrFlashNotFound
 	}
 	// 自分の flash は like できない (upstream flash/like の yourFlash, #1548)。
@@ -243,10 +295,18 @@ func (s *Service) Unlike(userID, flashID string) error {
 		return errors.New("userId is required")
 	}
 	if _, err := s.repo.FindByID(flashID); err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrFlashNotFound
 	}
 	fl, err := s.likeRepo.FindByPair(userID, flashID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrNotLiked
 	}
 	if err := s.likeRepo.Delete(fl); err != nil {

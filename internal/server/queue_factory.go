@@ -3,30 +3,25 @@ package server
 import (
 	"context"
 	"fmt"
-	"log/slog"
-	"sort"
 	"time"
 
 	"github.com/shiroha-a/mk/internal/config"
 	"github.com/shiroha-a/mk/internal/queue"
 	"github.com/shiroha-a/mk/internal/queue/driver"
-	"github.com/shiroha-a/mk/internal/queue/driver/asynqdriver"
 	"github.com/shiroha-a/mk/internal/queue/driver/mkqdriver"
 )
 
 // buildQueueDriver constructs the queue driver selected by config.
 //
-// driverName=="mkq" connects to Redis via mkq.NewClient (PING + SCRIPT
-// LOAD); failures bubble up so the server fails to start rather than
-// silently falling back to asynq. asynq is the historical default and
-// does not Dial on construction, so its branch is infallible at this
-// layer.
+// mkq connects to Redis via mkq.NewClient (PING + SCRIPT LOAD); failures
+// bubble up so the server fails to start rather than running with a queue
+// that cannot be reached.
 //
 // `<queue>JobConcurrency` / `<queue>JobPerSec` / `<queue>JobMaxAttempts`
 // 系の config は queue_factory が driver Config に流して runtime に反映
 // する。deliver / inbox / relationship の 3 queue に対して有効
 // (#495 / #534 / #2403)。
-func buildQueueDriver(ctx context.Context, cfg *config.Config) (driver.Driver, error) {
+func buildQueueDriver(ctx context.Context, cfg *config.Config, pluginQueues []string) (driver.Driver, error) {
 	totalConcurrency := 16
 	if cfg.DeliverJobConcurrency != nil && *cfg.DeliverJobConcurrency > 0 {
 		totalConcurrency = *cfg.DeliverJobConcurrency
@@ -38,29 +33,13 @@ func buildQueueDriver(ctx context.Context, cfg *config.Config) (driver.Driver, e
 	// 空 string は config.resolveJobQueueDriver で "mkq" に正規化されている
 	// 想定だが、queue_factory が直接 *config.Config を受けるテスト経由など
 	// 正規化されない経路もあるので、ここでも "" → "mkq" に倒す。
-	// asynq driver は legacy / future-deprecation candidate (#571 audit)。
+	// mkq は唯一の driver だが、config 側の検証が落ちたときに別の driver 名で
+	// 黙って mkq を起動しないよう、既知の名前だけを受ける形は残す (#2985)。
 	switch cfg.JobQueueDriver {
 	case "mkq", "":
 		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		return mkqdriver.New(dialCtx, mkqConfig(cfg, totalConcurrency, queueConcurrency, queueRateLimits))
-	case "asynq":
-		// asynq は per-queue concurrency を持たず、Concurrency (総 worker pool)
-		// に fallback する。jobQueueAutoScale (autoscale_wiring.go) は「有効化
-		// しても全く機能しない」ので startup error にしているが、こちらは
-		// 総 worker 数として動きはするため起動は止めない。ただし設定した値が
-		// queue 単位には効かないので、黙って捨てずに warning で知らせる。
-		if ignored := asynqIgnoredConcurrencyKnobs(queueConcurrency); len(ignored) > 0 {
-			slog.Warn("queue: asynq driver does not support per-queue concurrency; these knobs fall back to the shared worker pool",
-				"queues", ignored, "sharedConcurrency", totalConcurrency)
-		}
-		return asynqdriver.New(
-			asynqdriver.BuildRedisOpt(cfg.RedisForJobQueue),
-			asynqdriver.ServerConfig{
-				Concurrency: totalConcurrency,
-				RateLimits:  queueRateLimits,
-			},
-		), nil
+		return mkqdriver.New(dialCtx, mkqConfig(cfg, totalConcurrency, queueConcurrency, queueRateLimits, pluginQueues))
 	default:
 		return nil, fmt.Errorf("server: unknown jobQueueDriver %q", cfg.JobQueueDriver)
 	}
@@ -73,9 +52,16 @@ func buildQueueDriver(ctx context.Context, cfg *config.Config) (driver.Driver, e
 // 無くなる。`queueStuckWorkerSeconds` (#2657) と
 // `queueHandlerDeadlineSeconds` (#2658) は機構を止める唯一の手段なので、
 // 配線が落ちたら気付けるようにしておく。
-func mkqConfig(cfg *config.Config, totalConcurrency int, queueConcurrency, queueRateLimits map[string]int) mkqdriver.Config {
+func mkqConfig(cfg *config.Config, totalConcurrency int, queueConcurrency, queueRateLimits map[string]int, pluginQueues []string) mkqdriver.Config {
+	// **既定の一覧を書き換えず足すだけにする。** ここで本体のキューを
+	// 列挙し直すと、キューを増やしたときに片側更新になる。
+	var names []string
+	if len(pluginQueues) > 0 {
+		names = append(append(names, mkqdriver.QueueNames...), pluginQueues...)
+	}
 	return mkqdriver.Config{
 		Redis:            mkqdriver.BuildRedisOptions(cfg.RedisForJobQueue),
+		QueueNames:       names,
 		Concurrency:      totalConcurrency,
 		QueueConcurrency: queueConcurrency,
 		QueueRateLimits:  queueRateLimits,
@@ -130,33 +116,8 @@ func perQueueConcurrencyFromConfig(cfg *config.Config) map[string]int {
 	return out
 }
 
-// asynqIgnoredConcurrencyKnobs returns the queue names whose per-queue
-// concurrency setting the asynq driver cannot honour, sorted for stable
-// log output.
-func asynqIgnoredConcurrencyKnobs(queueConcurrency map[string]int) []string {
-	if len(queueConcurrency) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(queueConcurrency))
-	for name := range queueConcurrency {
-		// deliver だけは asynqdriver に Concurrency (総 worker pool) として
-		// 渡っており、値が完全に捨てられるわけではないので warning から外す
-		// (docs/configuration.md の記述と揃える)。
-		if name == queue.QueueName {
-			continue
-		}
-		out = append(out, name)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	sort.Strings(out)
-	return out
-}
-
 // perQueueRatesFromConfig builds the queue-name → tasks/sec map applied to
-// the driver Server's rate-limiter middleware (asynq) / mkq.WithRateLimit
-// (mkq).
+// the driver's rate limiter (mkq.WithRateLimit).
 func perQueueRatesFromConfig(cfg *config.Config) map[string]int {
 	out := map[string]int{}
 	if cfg.DeliverJobPerSec != nil && *cfg.DeliverJobPerSec > 0 {
@@ -220,9 +181,14 @@ const (
 // Policy 設定は deliver / inbox / export / push / webhook の application
 // queue 全てに対して適用する。Misskey TS upstream の QueueService.ts が
 // 全 enqueue helper で `removeOnComplete: {age: 7d, count: 30}` を指定して
-// いる規約に合わせるため (#1193)。maintenance queue は Scheduler.Register
-// 経由で mkq native の per-fire option を上流仕様で drop するため本 PR では
-// 対象外 (mkq upstream 拡張後に follow-up)。
+// いる規約に合わせるため (#1193)。**cron 発火の job はこの Policy を通らない**
+// (maintenance と、プラグインの cron)。そちらは `queue.Scheduler.register` が
+// upstream の system queue と同じ 7 日の期限を付ける (mkq v1.2.0 / mkq#109)。
+// **maintenance には Policy が無い** ので、cron 以外で maintenance に積む job
+// (`EnqueueCleanRemoteNotes` / `EnqueueReactionFlush`) には retention が付かない。
+// ただし期限による刈り込みは、job が入る側の集合 (completed / failed) 全体が
+// 対象なので、cron の job が**完了**するたびに completed 側のそれらも 7 日で
+// 刈られる。failed 側が刈られるのは cron の job が**失敗**したときだけ。
 func applyClientPolicies(c *queue.Client, cfg *config.Config) {
 	c.SetPolicy(queue.QueueName, buildPolicy(cfg.DeliverJobMaxAttempts, defaultDeliverJobMaxAttempts, cfg.DeliverJobKeepFailed, cfg.DeliverJobKeepCompleted))
 	c.SetPolicy(queue.InboxQueueName, buildPolicy(cfg.InboxJobMaxAttempts, defaultInboxJobMaxAttempts, cfg.InboxJobKeepFailed, cfg.InboxJobKeepCompleted))
@@ -239,6 +205,11 @@ func applyClientPolicies(c *queue.Client, cfg *config.Config) {
 	// relationship も同様。移行時の一括 follow で completed が一気に積み上がる
 	// ので retention が要る (#2403)。
 	c.SetPolicy(queue.RelationshipQueueName, defaultPolicy())
+	// **プラグインのキューは接頭辞で 1 回だけ登録する。** `plugin:<名前>` は
+	// 運営者が入れたプラグインの数だけ増えるので、名前ごとに登録させると
+	// 登録し忘れたものだけ retention が効かない。`PolicyFor` が接頭辞で
+	// 引き当てる。
+	c.SetPolicy(queue.PluginQueuePrefix, defaultPolicy())
 }
 
 // defaultPolicy returns the queue.Policy applied when no operator config

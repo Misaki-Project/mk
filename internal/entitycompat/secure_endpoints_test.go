@@ -57,17 +57,67 @@ func TestSecureDrift(t *testing.T) {
 		}
 		t.Fatal(b.String())
 	}
+
+	// **逆向きも見る。** golden にない endpoint に RequireSecure が付いていると、
+	// upstream ではサードパーティアプリから叩けるものが mk-go だけ 403 になる。
+	// 片方向のままだと、upstream が secure を外したとき (2026.9.0 の
+	// `i/revoke-token` がまさにそれ) に golden から消えるだけで、mk-go 側に
+	// RequireSecure が残っていても緑のまま通る = 機能が丸ごと死んでいても
+	// 検出できない。
+	//
+	// mk-go が意図的に upstream より厳しくする場合は、理由を添えて
+	// secureStricterThanUpstream に登録すること (現在は空 = 全件 upstream 一致)。
+	var extra []string
+	for ep, reg := range regs {
+		if secure[ep] || excludedEndpoint(ep) || secureStricterThanUpstream[ep] != "" {
+			continue
+		}
+		if strings.Contains(reg, "RequireSecure") {
+			extra = append(extra, ep)
+		}
+	}
+	if len(extra) > 0 {
+		sort.Strings(extra)
+		var b strings.Builder
+		b.WriteString("secure drift: mk-go applies RequireSecure to an endpoint Misskey does NOT mark `secure: true`.\n")
+		b.WriteString("third-party apps can drive it upstream but get 403 here. Remove it, or register the reason in secureStricterThanUpstream.\n")
+		for _, ep := range extra {
+			b.WriteString("  " + ep + "\n")
+		}
+		t.Fatal(b.String())
+	}
 }
+
+// secureStricterThanUpstream lists endpoints where mk-go deliberately requires a
+// native session token even though Misskey does not mark them `secure: true`.
+// The value is the reason; an empty map means every RequireSecure matches
+// upstream. Keep it empty unless there is a documented reason (docs/divergence.md).
+var secureStricterThanUpstream = map[string]string{}
 
 // parseRouteRegistrations returns endpoint path -> the full router registration
 // text (balanced parens), so middleware on a multi-line inline handler's closing
 // line is included.
+//
+// **コメントを先に落とす (#3037 レビュー 3 周目)。** 深さ数えは文字列にも
+// コメントにも入るので、引数の途中に**括弧を含むコメントを 1 行足すだけ**で
+// 対応が崩れ、後続の route を丸ごと飲み込む。飲み込まれた route の
+// middleware が手前の判定に混ざるので、
+//
+//   - app-token gate: `RejectAppToken()` を外した route が、後続 route の
+//     文字列に紛れて「付いている」と判定される
+//   - privileged policy gate: 後続の `RequireModerator` が混ざって
+//     「ロールで守られている」と読まれ、検査対象から外れる
+//
+// の 2 形が実測で素通りした。**2 周目はこのパーサを「自前の行畳みと違って
+// 文字列・コメントを数えない」と書いて採用したが、事実と逆だった。**
+// `stripGoComments` は rune / 文字列リテラルを保つので、route の path に
+// 含まれる `(` が消えることはない。
 func parseRouteRegistrations(t *testing.T, path string) map[string]string {
 	src, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read router: %v", err)
 	}
-	s := string(src)
+	s := stripGoComments(string(src))
 	out := map[string]string{}
 	for _, loc := range routeRegRe.FindAllStringSubmatchIndex(s, -1) {
 		ep := strings.TrimPrefix(s[loc[2]:loc[3]], "/")

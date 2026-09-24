@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -560,6 +561,7 @@ func TestDefaultEndpointLimits_KnownEndpoints(t *testing.T) {
 		{"drive/files/create", 120},
 		{"channels/create", 10},
 		{"ap/show", 30},
+		{"federation/update-remote-user", 30},
 		// Auth / password reset (#600 item 3): signup spam / brute-force 対策。
 		{"signup", 5},
 		{"signup-pending", 30},
@@ -568,12 +570,16 @@ func TestDefaultEndpointLimits_KnownEndpoints(t *testing.T) {
 		{"signup-application/apply", 5},
 		{"signup-application/register", 5},
 		{"signup-application/status", 30},
+		// apply を守るトークンの発行 (#2806)。読み込み直しは正常な操作なので
+		// apply より緩いが、無制限にはしない。
+		{"signup-application/form-token", 30},
 		// 初回セットアップの窓は credential 無しで通るので setupPassword の
 		// 試行に上限が要る。
 		{"admin/accounts/create", 30},
 		{"signin", 10},
 		{"signin-flow", 10},
 		{"signin-with-passkey", 200},
+		{"i/change-password", 10},
 		{"request-reset-password", 3},
 		{"reset-password", 30},
 	}
@@ -605,6 +611,9 @@ func TestDefaultEndpointLimits_UnauthenticatedEntryPoints(t *testing.T) {
 		"/api/signup-application/apply",
 		"/api/signup-application/register",
 		"/api/signup-application/status",
+		// 発行 endpoint も未認証で叩ける (#2806)。apply を守るトークンを配る
+		// 側なので、ここが無制限だと gate の前段が無制限になる。
+		"/api/signup-application/form-token",
 		"/api/signin",
 		"/api/signin-flow",
 		"/api/request-reset-password",
@@ -645,6 +654,67 @@ func TestDefaultEndpointLimits_RoleAssignmentShow(t *testing.T) {
 	}
 }
 
+// adminUserForLimit は UserBucketOnly の endpoint を認証済みで叩くための利用者。
+var adminUserForLimit = &model.User{ID: "01hzzzzzzzzzzzzzzzzzzzzzzz"}
+
+// IP を返す 4 endpoint に上限があること (#3106)。
+//
+// **値と path 解決の両方を見る。** 値だけ見ると route を rename したときに
+// 「キーはあるのに引けない」状態を見逃すし、path 解決だけ見ると上限を
+// 実質無制限 (`Max: 100000`) に緩めても通る。
+//
+// ここが抜けると**完了条件の「検索頻度制限」を固定するものが何も無くなる** —
+// 実際、初版は 3 行を削除しても全テストと `make gates` が緑だった (敵対的
+// レビュー 1 周目で実測)。limiter は未登録のキーを**素通しする**ので、
+// 気付ける経路が他に無い。
+func TestDefaultEndpointLimits_IPLookups(t *testing.T) {
+	paths := []string{
+		"/api/admin/ip/accounts",
+		"/api/admin/ip/related-accounts",
+		"/api/admin/ip/lookup-log",
+		// upstream の口。**同じ「利用者 ↔ IP の対応」を返す**ので、ここだけ
+		// 無制限だと mk-go 側に上限を置いた意味が無い (#3106)。
+		"/api/admin/get-user-ips",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			key := strings.TrimPrefix(path, "/api/")
+			limit, ok := DefaultEndpointLimits[key]
+			require.True(t, ok, "%s に上限が無い", path)
+			assert.Equal(t, time.Hour, limit.Duration)
+			assert.Equal(t, 120, limit.Max)
+
+			assert.True(t, limit.UserBucketOnly,
+				"%s は user bucket だけで数えること。IP bucket も見ると、\n"+
+					"同じ出口 IP から未認証で叩き続けるだけで正当なモデレーターを"+
+					"締め出せる (#3106)", path)
+
+			// path からキーが引けることまで見る。**認証済みで叩く** —
+			// この 4 本は UserBucketOnly なので未認証では bucket を消費しない。
+			store := &mockLimitStore{}
+			rl := NewRateLimiter(store, true, DefaultEndpointLimits)
+			e, h := setupEcho(rl)
+			doRequest(e, rl.Middleware(), h, path, adminUserForLimit)
+			require.NotEmpty(t, store.calls,
+				"%s が無制限。path からキーへの変換が合っていない", path)
+			for _, call := range store.calls {
+				assert.False(t, strings.HasPrefix(call.Key, "ip-"),
+					"%s が IP bucket を消費している (key=%s)", path, call.Key)
+			}
+
+			// **未認証では消費しない。** ここが消費すると締め出しが作れる。
+			store2 := &mockLimitStore{}
+			rl2 := NewRateLimiter(store2, true, DefaultEndpointLimits)
+			e2, h2 := setupEcho(rl2)
+			doRequest(e2, rl2.Middleware(), h2, path, nil)
+			assert.Empty(t, store2.calls,
+				"%s が未認証のリクエストで bucket を消費している。\n"+
+					"limiter は権限検査より前に走るので、403 になる相手が\n"+
+					"正当なモデレーターの窓を食い潰せる (#3106)", path)
+		})
+	}
+}
+
 func TestDefaultEndpointLimits_MinIntervalEndpoints(t *testing.T) {
 	cases := []struct {
 		endpoint    string
@@ -654,6 +724,7 @@ func TestDefaultEndpointLimits_MinIntervalEndpoints(t *testing.T) {
 		{"notes/unrenote", time.Second},
 		{"notes/reactions/delete", 3 * time.Second},
 		{"bubble-game/register", 30 * time.Second},
+		{"i/change-password", time.Second},
 		{"signin", time.Second},
 		{"signin-flow", time.Second},
 		{"signin-with-passkey", 250 * time.Millisecond},
@@ -904,4 +975,147 @@ func TestNewRedisRateLimiter_Integration(t *testing.T) {
 	c.Set(string(UserContextKey), &model.User{ID: "testuser"})
 	_ = mw(handler)(c)
 	assert.Equal(t, http.StatusTooManyRequests, rec.Code)
+}
+
+// chat のメッセージ送信は 3 つの path から同じ handler に入る
+// (`create` は `create-to-user` / `create-to-room` の alias)。**limiter のキーは
+// route path なので、1 つでも登録から漏れると上限そのものを迂回できる** —
+// 未登録の path はフォールバック無しで素通しになる。
+func TestDefaultEndpointLimits_ChatMessageSendPathsAgree(t *testing.T) {
+	paths := []string{
+		"chat/messages/create",
+		"chat/messages/create-to-user",
+		"chat/messages/create-to-room",
+	}
+	want := DefaultEndpointLimits[paths[0]]
+	require.NotNil(t, want, "%s が未登録", paths[0])
+	for _, p := range paths[1:] {
+		got := DefaultEndpointLimits[p]
+		require.NotNil(t, got, "%s が未登録", p)
+		assert.Equal(t, want.Duration, got.Duration, "%s の Duration が %s と違う", p, paths[0])
+		assert.Equal(t, want.Max, got.Max, "%s の Max が %s と違う", p, paths[0])
+	}
+}
+
+// TestDefaultEndpointLimits_RelationListEndpoints guards the public relation
+// lists against bulk harvesting (#2953).
+//
+// **UnauthenticatedEntryPoints に相乗りしない。** あちらの doc は「サーバー側に
+// 行やメールを作る入口」を守ると宣言しているが、こちらは**作らない、漏らす**
+// 側なので、混ぜると既存テストの説明が嘘になる。
+//
+// **テーブルに載っていないエンドポイントは無制限**になる。この 2 つは未認証で
+// 全件を引けるので、載っていないと収集の速度に上限が無い。
+func TestDefaultEndpointLimits_RelationListEndpoints(t *testing.T) {
+	paths := []string{
+		"/api/users/following",
+		"/api/users/followers",
+	}
+	for _, path := range paths {
+		t.Run(path, func(t *testing.T) {
+			store := &mockLimitStore{}
+			rl := NewRateLimiter(store, true, DefaultEndpointLimits)
+			e, h := setupEcho(rl)
+
+			doRequest(e, rl.Middleware(), h, path, nil)
+
+			require.NotEmptyf(t, store.calls,
+				"%s が無制限。DefaultEndpointLimits にキーが無いか、"+
+					"path からキーへの変換が合っていない", path)
+		})
+	}
+}
+
+// **窓は短く保つ。** store は拒否したリクエストも記録するので、429 を無視して
+// 叩き続けるクライアントは Retry-After を 1 窓ぶんに押し戻し続ける。長い窓を
+// 置くと、行儀の悪いタブ 1 つで CGNAT 配下が丸ごとその時間だけ閲覧不能になる。
+func TestRelationListLimitsUseAShortWindow(t *testing.T) {
+	for _, key := range []string{"users/following", "users/followers"} {
+		limit, ok := DefaultEndpointLimits[key]
+		require.Truef(t, ok, "%s の定義が無い", key)
+		require.LessOrEqualf(t, limit.Duration, time.Minute,
+			"%s の窓が長すぎる (%s)。拒否も記録されるので、長い窓は"+
+				"共有 IP の巻き添えを長引かせる", key, limit.Duration)
+		// 人間のスクロール (1 リクエスト 30 行) を明確に上回ること。
+		require.GreaterOrEqualf(t, limit.Max, 30,
+			"%s の上限が低すぎる。通常の閲覧が 429 になる", key)
+	}
+}
+
+// TestDefaultEndpointLimits_ApplicationEntryPoints guards the authenticated
+// endpoints that create rows in a moderation queue.
+//
+// **テーブルに載っていないエンドポイントは無制限になる** (上の
+// UnauthenticatedEntryPoints と同じ理由)。認証が要るので誰でも叩けるわけでは
+// ないが、**1 人が審査キューを無制限に積める**のは未認証の入口と同じ害になる。
+// `emoji_application` の pending 一意制約は `(userId, name)` なので、名前を
+// 変えれば何件でも通る。
+//
+// #2935 で**任意のノートの絵文字メニューから 2 クリック**になり、露出が大きく
+// 変わった (従来は drive へ上げてから専用ページを開く必要があった)。
+func TestDefaultEndpointLimits_ApplicationEntryPoints(t *testing.T) {
+	// **値まで見る (#2958 レビュー L2)。** 「何らかの上限があるか」だけだと、
+	// 1 分 5000 回のような実質無制限へ緩めても緑のまま通る。#2958 が足した
+	// ロール別の期間上限は総量を絞るもので、こちらの連打の抑止とは層が違う
+	// ため、片方が消えたときにもう片方が代わりを務めることはない。
+	cases := []struct {
+		path     string
+		duration time.Duration
+		max      int
+	}{
+		{"/api/emoji-application/create", time.Hour, 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			store := &mockLimitStore{}
+			rl := NewRateLimiter(store, true, DefaultEndpointLimits)
+			e, h := setupEcho(rl)
+
+			doRequest(e, rl.Middleware(), h, tc.path, nil)
+
+			require.NotEmpty(t, store.calls,
+				"%s が無制限。DefaultEndpointLimits にキーが無いか、"+
+					"path からキーへの変換が合っていない", tc.path)
+
+			key := strings.TrimPrefix(tc.path, "/api/")
+			limit, ok := DefaultEndpointLimits[key]
+			require.Truef(t, ok, "DefaultEndpointLimits に %q が無い", key)
+			require.Equalf(t, tc.duration, limit.Duration,
+				"%s の窓が変わっている。緩めるなら期間上限 (#2958) との役割分担を先に確認すること", tc.path)
+			require.Equalf(t, tc.max, limit.Max,
+				"%s の上限が変わっている。緩めるなら期間上限 (#2958) との役割分担を先に確認すること", tc.path)
+		})
+	}
+}
+
+// **存在確認のオラクルに上限を置く (#3037)。**
+//
+// `username/available` / `email-address/available` はどちらも未認証で叩けて、
+// 返るのは「使われているか」という真偽値そのもの。止めたいのは 1 件ずつの
+// 確認ではなく総当たり — 辞書を回して実在する利用者名の一覧を作る、手持ちの
+// メールアドレス一覧からこのサーバーの登録者を割り出す、といった使い方。
+//
+// upstream には上限が無い (`meta` に `limit` が無い) mk-go 独自の追加。
+func TestDefaultEndpointLimits_AvailabilityOracles(t *testing.T) {
+	for _, endpoint := range []string{"username/available", "email-address/available"} {
+		t.Run(endpoint, func(t *testing.T) {
+			limit, ok := DefaultEndpointLimits[endpoint]
+			require.True(t, ok, "%s に上限が無い", endpoint)
+			// **窓は短く。** 拒否も記録されるので、長い窓だと行儀の悪い
+			// クライアント 1 つで共有 IP の配下が登録フォームを使えなくなる。
+			assert.LessOrEqual(t, limit.Duration, time.Minute, "窓が長すぎる")
+			// **実使用の 2 倍を要求する。** 同梱フロントは API 呼び出しだけを
+			// debounce 1000ms しており、trailing なので打ち続けている間は
+			// 0 回。最大化しても 1 タブ 1 分に 59-60 回が上限。
+			//
+			// 未認証は IP bucket しか無く NAT 配下で共有されるので、実使用と
+			// 同値だと 2 人目で当たり、送信ボタンが押せなくなる (#3037
+			// レビュー 2 周目で email 側が 60 = 余裕ゼロだった)。**下限は
+			// 実使用そのものではなく倍で留めること** — 60 まで緩めると
+			// 回帰した値がそのまま通る。
+			const perTabCeiling = 60
+			assert.GreaterOrEqual(t, limit.Max, perTabCeiling*2, "実使用に対する余裕が足りない")
+			assert.LessOrEqual(t, limit.Max, 200, "総当たりの速度として緩すぎる")
+		})
+	}
 }

@@ -16,6 +16,7 @@ import (
 	corechat "github.com/shiroha-a/mk/internal/core/chat"
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	corenote "github.com/shiroha-a/mk/internal/core/note"
+	"github.com/shiroha-a/mk/internal/core/notification"
 	corereaction "github.com/shiroha-a/mk/internal/core/reaction"
 	corereversi "github.com/shiroha-a/mk/internal/core/reversi"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -36,10 +37,18 @@ var (
 
 // RelayStatusMarker is the minimal interface needed from core/relay.Service
 // for the inbox processor to toggle relay status on Accept / Reject
-// activities whose id matches `/activities/follow-relay/{id}`.
+// activities whose id matches `{baseURL}/activities/follow-relay/{id}`.
 type RelayStatusMarker interface {
 	MarkAccepted(ctx context.Context, id string) error
 	MarkRejected(ctx context.Context, id string) error
+	// FindByID returns the relay row identified by id, or an error when no
+	// such row exists.
+	//
+	// status を書き換える前に「送信元 actor がその relay 自身か」を確かめる
+	// ために要る。行が持っている identity は inbox URI だけなので、
+	// 突き合わせはその host と act.actor の host で行う
+	// (relayActorOwnsRelay)。
+	FindByID(ctx context.Context, id string) (*model.Relay, error)
 }
 
 // RelayActorChecker reports whether a given remote user is one of the locally
@@ -67,8 +76,17 @@ type Processor struct {
 	blockingService *coreblocking.Service
 	abuseReportRepo repository.AbuseReportRepository
 	abuseIDGen      id.Generator
-	pinningRepo     repository.UserNotePiningRepository
-	pinningIDGen    id.Generator
+	// abuseModeratorLister / abuseInAppNotifier はリモートからの通報 (AP Flag)
+	// をモデレーターの通知欄に出す (#2868)。local の report-abuse と同じ扱いに
+	// するためで、片方でも nil なら通知しない。
+	//
+	// **admin stream と system webhook はこの経路では飛んでいない** (local 側の
+	// #1549 / #1542 が users handler にしかない既存の穴)。ここで in-app だけを
+	// 足すのは、通報の出どころで通知の有無が変わる非対称を作らないため。
+	abuseModeratorLister AbuseModeratorLister
+	abuseInAppNotifier   AbuseInAppNotifier
+	pinningRepo          repository.UserNotePiningRepository
+	pinningIDGen         id.Generator
 
 	// Reversi federation hooks (Phase 9.7). All four are set via
 	// SetReversi; if nil, reversi inbox types are treated as unsupported.
@@ -160,6 +178,13 @@ func (p *Processor) SetLocalBaseURL(baseURL string) {
 	p.localBaseURL = baseURL
 }
 
+// HasLocalBaseURL reports whether the local base URL was wired.
+//
+// **未配線だと静かに壊れる。** relay の Accept / Reject は activity id が
+// 自ホストの URI であることを要求する (fail-closed) ので、ここが空だと
+// relay の状態遷移が全て落ちる。ローカル URI の判定も全部外れる。
+func (p *Processor) HasLocalBaseURL() bool { return p.localBaseURL != "" }
+
 // resolveTargetUser looks up a user referenced by URI in an inbound activity.
 // ローカルユーザの user.uri は DB 上 NULL なので FindByURI では解決できない。
 // 対策として localBaseURL 配下の URI ("{baseURL}/users/{id}") を検出し、
@@ -183,7 +208,9 @@ func (p *Processor) resolveTargetUser(uri string) (*model.User, error) {
 
 // ChatMessageReceiver handles inbound Misskey:ChatMessage activities.
 type ChatMessageReceiver interface {
-	CreateMessageViaAP(ctx context.Context, uri string, fromUser *model.User, toUserID, text string) (*model.ChatMessage, error)
+	// mfmSource は相手が併記した MFM の原文 (`source` / `_misskey_content`)。
+	// 空なら text (HTML) から戻す。
+	CreateMessageViaAP(ctx context.Context, uri string, fromUser *model.User, toUserID, text, mfmSource string) (*model.ChatMessage, error)
 }
 
 // Hook mutation contract (TimelineFanoutHook / NotificationHook / NoteChartHook):
@@ -330,7 +357,11 @@ type genericActivity struct {
 // hop reordering) eventually converges. Verified at the time of #534:
 //
 //   - Follow / Accept: swallow ErrAlreadyFollowing / ErrAlreadyRequested /
-//     ErrRequestNotFound (so re-deliveries are no-ops)
+//     ErrRequestNotFound (so re-deliveries are no-ops). Accept also swallows
+//     ErrBlocking / ErrBlocked, returned by AcceptRequest's defense-in-depth
+//     block check (a block condition never clears on retry; Follow itself
+//     handles ErrBlocking / ErrBlocked separately via auto-unblock / Reject
+//     before reaching this generic list)
 //   - Undo Follow / Like / Block: swallow ErrNotFollowing / ErrReactionNotFound /
 //     ErrNotBlocking
 //   - Like / Block: swallow ErrAlreadyReacted / ErrAlreadyBlocking
@@ -379,6 +410,15 @@ func (p *Processor) process(body []byte, signer *model.User) error {
 
 	normalized, err := activitypub.Normalize(body)
 	if err != nil {
+		// **retry しても結果が変わらないものは ack する (レビュー L1)。** 衝突
+		// キーを持つ document も JSON として壊れた body も、同じ body を何度
+		// 投げ直しても同じ error になる。生で返すと inbox job が 8 回 retry して
+		// dead letter に積まれるだけ。この PR の他の判断 (禁止語 / chat の
+		// 恒久エラー) と揃える。
+		if errors.Is(err, activitypub.ErrConflictingKeys) {
+			slog.Warn("activitypub: conflicting json-ld keys", "err", err)
+			return ErrUnsupportedActivity
+		}
 		return fmt.Errorf("invalid activity json: %w", err)
 	}
 	body = normalized
@@ -401,9 +441,18 @@ func (p *Processor) process(body []byte, signer *model.User) error {
 	// まだ DB に無く suspended にもなり得ないので素通し)。fetch はせず DB read
 	// のみなので追加コストは小さい。
 	if p.userRepo != nil {
-		if actor, err := p.userRepo.FindByURI(act.Actor); err == nil && actor != nil && actor.IsSuspended {
+		actor, err := p.userRepo.FindByURI(act.Actor)
+		switch {
+		case err == nil && actor != nil && actor.IsSuspended:
 			slog.Info("federation: dropping activity from suspended actor", "actor", act.Actor, "type", act.Type)
 			return nil
+		case err != nil && !repository.IsNotFound(err):
+			// **判定できないまま素通しにしない** (#3116)。以前は `err == nil` を
+			// 条件にしていたので、**DB 障害のあいだ凍結済み actor の activity が
+			// そのまま処理されていた** (moderation の fail-open)。not-found は
+			// 「まだ取り込んでいない actor」= 凍結されているはずがないので素通しが
+			// 正しいが、障害は retry させる。
+			return fmt.Errorf("suspended actor check: %w", err)
 		}
 	}
 
@@ -648,10 +697,71 @@ func (p *Processor) SetBlockingService(svc *coreblocking.Service) {
 	p.blockingService = svc
 }
 
+// HasBlockingService reports whether the blocking service was wired.
+//
+// 未配線だと inbound の Block / Undo(Block) が `ErrUnsupportedActivity` に
+// なるだけでなく、**reversi の Invite からブロック判定が丸ごと飛ぶ**
+// (`reversi_inbox.go` の `p.blockingService != nil` guard)。ブロック済みの
+// リモート利用者が対象の `reversi:<userID>` ストリームへ `invited` を push
+// できる。起動時検査に使う。
+func (p *Processor) HasBlockingService() bool { return p != nil && p.blockingService != nil }
+
 // SetAbuseReportRepo wires the abuse report repository for Flag activities.
 func (p *Processor) SetAbuseReportRepo(repo repository.AbuseReportRepository, idGen id.Generator) {
 	p.abuseReportRepo = repo
 	p.abuseIDGen = idGen
+}
+
+// AbuseModeratorLister lists moderator/administrator users (#2868)。
+// 実装は core/role.Service。
+type AbuseModeratorLister interface {
+	GetModerators() ([]*model.User, error)
+}
+
+// AbuseInAppNotifier creates the in-app notification moderators see for a new
+// report (#2868)。実装は core/notification.Service。
+type AbuseInAppNotifier interface {
+	Create(ctx context.Context, in notification.CreateInput) (*notification.Notification, error)
+}
+
+// SetAbuseReportNotification wires the in-app notification for reports that
+// arrive over ActivityPub (#2868)。片方でも nil なら通知しない。
+func (p *Processor) SetAbuseReportNotification(lister AbuseModeratorLister, notifier AbuseInAppNotifier) {
+	p.abuseModeratorLister = lister
+	p.abuseInAppNotifier = notifier
+}
+
+// notifyModeratorsOfRemoteAbuseReport mirrors the local report-abuse fanout for
+// reports received over ActivityPub (#2868)。best-effort。
+func (p *Processor) notifyModeratorsOfRemoteAbuseReport(report *model.AbuseUserReport) {
+	if p.abuseModeratorLister == nil || p.abuseInAppNotifier == nil {
+		return
+	}
+	mods, err := p.abuseModeratorLister.GetModerators()
+	if err != nil {
+		slog.Warn("remote abuse report: list moderators failed", "err", err)
+		return
+	}
+	for _, m := range mods {
+		// notifier は通報者 (リモートユーザー)。通報者自身がローカルの
+		// モデレーターになることは無いので self-notification は起きないが、
+		// 起きても正しい挙動なので同じく警告に出さない。
+		_, nerr := p.abuseInAppNotifier.Create(context.Background(), notification.CreateInput{
+			NotifieeID: m.ID,
+			NotifierID: report.ReporterID,
+			Type:       notification.TypeAbuseReport,
+			// **comment は入れない (#2868)。** 通報コメントは定型フォームの全文が
+			// 入るので通知欄に出しても読めず、出さない以上 Redis に通報本文の
+			// 複製を残す理由が無い (権限を失った元モデレーターに読まれる面も減る)。
+			Extra: map[string]any{
+				"reportId":     report.ID,
+				"targetUserId": report.TargetUserID,
+			},
+		})
+		if nerr != nil && !errors.Is(nerr, notification.ErrSelfNotification) {
+			slog.Warn("remote abuse report: in-app notification failed", "moderator", m.ID, "err", nerr)
+		}
+	}
 }
 
 // SetPinningRepo wires the note pinning repository for Add/Remove activities.
@@ -661,8 +771,9 @@ func (p *Processor) SetPinningRepo(repo repository.UserNotePiningRepository, idG
 }
 
 // SetRelayMarker wires a RelayStatusMarker so inbound Accept / Reject
-// activities whose id matches the follow-relay URI pattern can flip
-// the corresponding relay row to accepted / rejected.
+// activities whose id is a follow-relay URI issued by this instance can flip
+// the corresponding relay row to accepted / rejected. 反映するのは送信元
+// actor がその relay 自身だったときだけ (relayStatusChangeAllowed)。
 func (p *Processor) SetRelayMarker(m RelayStatusMarker) {
 	p.relayMarker = m
 }
@@ -734,19 +845,84 @@ func (p *Processor) SetNoteChartHook(h NoteChartHook) {
 	p.noteChartHook = h
 }
 
-// followRelayIDPattern extracts the relay id embedded in
-// `.../activities/follow-relay/{id}` URIs. Must stay in lockstep with
+// followRelayPath is the path prefix of the Follow(Relay) activity ids this
+// instance issues. Must stay in lockstep with
 // activitypub.URLBuilder.FollowRelayURI.
-var followRelayIDPattern = regexp.MustCompile(`/activities/follow-relay/([\w-]+)$`)
+const followRelayPath = "/activities/follow-relay/"
 
-// matchFollowRelayID returns the relay id if uri is a follow-relay URI,
-// otherwise the empty string.
-func matchFollowRelayID(uri string) string {
-	m := followRelayIDPattern.FindStringSubmatch(uri)
-	if len(m) < 2 {
+// followRelayIDPattern matches the id part of a Follow(Relay) activity URI
+// (the `{id}` in `{baseURL}/activities/follow-relay/{id}`). 字種は旧実装の
+// 末尾正規表現と同じ集合に揃えてあり、path 区切りを含む値 (`rel/../other`
+// のような細工) は relay 行の主キーとして受け付けない。
+var followRelayIDPattern = regexp.MustCompile(`^[\w-]+$`)
+
+// matchFollowRelayID returns the relay id when uri is a Follow(Relay) activity
+// URI **issued by this instance**, otherwise the empty string.
+//
+// localBaseURL を必須にしているのが要点。relay への Follow はこちらが出した
+// ものなので、その id は必ず自ホストの URI になる。旧実装はパス末尾だけを
+// 正規表現で見ていたため `https://evil.test/activities/follow-relay/<id>` の
+// ような他ホストの id でも relay 行を特定でき、任意のリモート actor が
+// relay の status を書き換えられた (upstream ApInboxService の accept() /
+// reject() も同じ形)。localBaseURL が未配線 (空) のときは fail-closed で
+// "" を返す。
+func matchFollowRelayID(uri, localBaseURL string) string {
+	if localBaseURL == "" {
 		return ""
 	}
-	return m[1]
+	rest, ok := strings.CutPrefix(uri, localBaseURL+followRelayPath)
+	if !ok || !followRelayIDPattern.MatchString(rest) {
+		return ""
+	}
+	return rest
+}
+
+// relayActorOwnsRelay reports whether actorURI belongs to the same host as the
+// relay's registered inbox.
+//
+// relay 行は inbox URI しか identity を持たないので host で突き合わせる。
+// host は hostFromURI で punycode + 小文字に正規化してから比較するため、
+// `https://Relay.Example/actor` と `https://relay.example/inbox` は一致する。
+// port は host の一部として扱う (別 authority を同一視しない安全側)。
+//
+// 既知の限界: relay と同じ host に別 actor を立てられる相手 (マルチテナントな
+// relay サーバー) は依然としてその relay の status を動かせる。行が inbox URI
+// しか持たない以上ここが上限で、actor の advertise する inbox と管理者が
+// 登録した inbox が完全一致する保証は無い (末尾スラッシュ等で正当な relay を
+// 落とすほうが害が大きい)。
+func relayActorOwnsRelay(actorURI string, rel *model.Relay) bool {
+	if rel == nil || rel.Inbox == "" || actorURI == "" {
+		return false
+	}
+	actorHost, err := hostFromURI(actorURI)
+	if err != nil || actorHost == "" {
+		return false
+	}
+	inboxHost, err := hostFromURI(rel.Inbox)
+	if err != nil || inboxHost == "" {
+		return false
+	}
+	return actorHost == inboxHost
+}
+
+// relayStatusChangeAllowed reports whether the actor that signed an inbound
+// Accept / Reject may flip the status of the relay row referenced by relayID.
+//
+// kind はログ用の activity 種別 ("Accept" / "Reject")。検証に落ちたケースは
+// 呼び出し側で状態を変えずに drop する (ack して retry しない)。
+func (p *Processor) relayStatusChangeAllowed(actorURI, relayID, kind string) bool {
+	rel, err := p.relayMarker.FindByID(context.Background(), relayID)
+	if err != nil || rel == nil {
+		slog.Info("federation: dropping relay "+kind+" for unknown relay",
+			"actor", actorURI, "relayId", relayID, "err", err)
+		return false
+	}
+	if !relayActorOwnsRelay(actorURI, rel) {
+		slog.Warn("federation: dropping forged relay "+kind+" (actor is not the relay)",
+			"actor", actorURI, "relayId", relayID, "relayInbox", rel.Inbox)
+		return false
+	}
+	return true
 }
 
 // SetReversi wires the reversi federation dependencies. When any of the
@@ -943,7 +1119,15 @@ func (p *Processor) handleUndoAccept(act genericActivity, inner genericActivity)
 	} else {
 		follower, err = p.userRepo.FindByURI(followerURI)
 	}
-	if err != nil || follower == nil {
+	if err != nil {
+		// **#3115 が Accept / Reject で確立した原則の裏返し** (#3116)。ack すると
+		// job が retry されず、**accept を撤回された相手をフォローし続ける**。
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("undo accept: lookup follower: %w", err)
+	}
+	if follower == nil {
 		return nil
 	}
 	if err := p.followingService.Unfollow(follower.ID, followee.ID); err != nil {
@@ -1111,10 +1295,49 @@ func (p *Processor) handleUndoAnnounce(act genericActivity, inner genericActivit
 	return nil
 }
 
+// lookup の失敗を ack するか伝播させるかの規則 (#3115 / #3116 / #3121)。
+//
+//  1. **inbox job / queue job から到達する経路は分ける。** not-found は retry しても
+//     結果が変わらないので ack、それ以外は伝播させて queue に retry させる。
+//     `repository.IsNotFound` で判定する。ack すると job が成功扱いになるので、
+//     **一時的な接続断だけで activity が恒久的に失われる** — 相手の再送は
+//     当てにできない (inbox は enqueue した時点で 202 を返す)。
+//  2. **fire-and-forget な hook は ack のまま。** 配送 hook は `safeGo` で
+//     投げっぱなしに呼ばれ、戻り値も retry の仕組みも無いので、error を返しても
+//     行き先が無い。**理由を書いて残す** (`note_delivery_hook.go` の
+//     `findNoteAuthor` に書いてある。他はそこを参照する)。
+//  3. **#534 の idempotency invariant と混同しない。** あれは「retry しても結果が
+//     変わらないもの」の話で、`ErrRequestNotFound` / `ErrBlocking` / `ErrBlocked` が
+//     それに該当する。**retry すれば成功しうる障害はそこに入らない。**
+//  4. **「確かめられなかった」は「無かった」ではない (#3121)。** 署名検証の失敗は
+//     既定で ack する — 署名が合わない body を retry しても結果は変わらないため。
+//     しかし検証は DB も読むので、そのまま書くと **DB 障害のあいだに届いた
+//     activity まで同じ ack に落ちる**。actor / 公開鍵の lookup は
+//     `ErrLookupUnavailable` で種別を残し、`inbox.go` がそれだけ retry に倒す。
+//     **落とす側は 1 箇所ではない** — HTTP 署名 (`verifyPayload`)、転送 activity の
+//     認可 (`authorizeActor` → LD-Signature の creator 解決と鍵引き)、Headers 無しの
+//     legacy 経路 (`ldVerifier.VerifyIfPresent`) の 3 つが同じ sentinel を見る。
+//
+// この規則で数えれば対象は導ける (件数を別に持たない)。
+//
+// **#3121 時点で ack のまま残っているもの** (どれも規則 1-4 で説明が付く):
+//   - `resolver.go` の `fetchActor` / `fetchNote` の失敗 — リモートが取れないという
+//     相手側の事情で、**こちらの retry で取り戻せるとは限らない**。分けるなら HTTP
+//     status から一時的か恒久的かを決める別の設計が要るので、ここでは触っていない。
+//   - 同 `userRepo.Create` / `noteRepo.Create` の失敗 — 読み側を先に分けたので、DB が
+//     落ちていれば手前の lookup で止まる。ここに来るのは列に入らない値のように
+//     retry しても変わらないものが主だが、**書き込みだけが落ちている状態は
+//     取りこぼす**。
+//   - `post_scheduled_note.go` の publish 失敗 — 二重 publish / 二重通知を避ける
+//     ための意図的な設計 (#2106 L61)。予約投稿の job は attempts を積むように
+//     なったが (#3121)、retry されるのは **publish に到達する前の失敗だけ**。
+//   - 配送 hook 一式 — 規則 2。
+
 // handleAccept processes an inbound Accept activity. リモートfolloweeがローカル
 // followerからのフォローリクエストを承認した場合に、フォロー関係を確立する。
-// inner.id が follow-relay パターンにマッチすれば relay の Accept とみなし、
-// RelayStatusMarker.MarkAccepted を呼び出す (upstream ApInboxService 互換)。
+// inner.id が自ホストの follow-relay URI で、かつ送信元 actor がその relay
+// 自身であれば relay の Accept とみなし、RelayStatusMarker.MarkAccepted を
+// 呼び出す (所有権検証は upstream に無い mk-go 側の硬化)。
 func (p *Processor) handleAccept(act genericActivity) error {
 	var inner genericActivity
 	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
@@ -1133,7 +1356,13 @@ func (p *Processor) handleAccept(act genericActivity) error {
 	if !strings.EqualFold(inner.Type, "follow") {
 		return nil
 	}
-	if relayID := matchFollowRelayID(inner.ID); relayID != "" && p.relayMarker != nil {
+	if relayID := matchFollowRelayID(inner.ID, p.localBaseURL); relayID != "" && p.relayMarker != nil {
+		// 送信元がその relay 自身でなければ状態を変えずに drop する。
+		// 通さないと、署名が通る任意のリモート actor が未承認 / 拒否済みの
+		// relay を accepted に倒せ、全公開ノートがその inbox へ流れ出す。
+		if !p.relayStatusChangeAllowed(act.Actor, relayID, "Accept") {
+			return nil
+		}
 		return p.relayMarker.MarkAccepted(context.Background(), relayID)
 	}
 	// actorはリモートfollowee（承認した側）
@@ -1155,12 +1384,34 @@ func (p *Processor) handleAccept(act genericActivity) error {
 		follower, err = p.userRepo.FindByURI(followerURI)
 	}
 	if err != nil {
-		return nil
+		// **not-found だけ ack する** (#3115)。その利用者が居ないことは retry
+		// しても変わらないので、7 回 retry (試行は計 8 回、
+		// `defaultInboxJobMaxAttempts`) してから dead letter に積む意味が無い。
+		//
+		// **DB 障害は伝播させる。** ack すると**job が成功扱いになって queue が
+		// retry しない**ので、一時的な接続断だけで Accept が恒久的に失われ、
+		// ローカル利用者のフォローリクエストは「リクエスト中」のまま永久に残る。
+		// **相手の再送は当てにできない** — inbox は enqueue した時点で 202 を
+		// 返すので、worker が ack しようが error を返そうが相手が見る応答は
+		// 変わらない。#534 の idempotency invariant は「retry しても結果が
+		// 変わらないもの」の話で、**retry すれば成功しうる障害はそこに入らない**
+		// (#2792 と同じ判断)。
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return err
 	}
 	// フォローリクエストを承認してフォロー関係を確立
 	if err := p.followingService.AcceptRequest(followee.ID, follower.ID); err != nil {
 		// フォローリクエストが存在しない場合は無視（既にフォロー済み等）
 		if errors.Is(err, corefollowing.ErrRequestNotFound) {
+			return nil
+		}
+		// block 関係による拒否 (AcceptRequest の多層防御、#3111 レビュー) も
+		// retry しても結果は変わらないので ack する。生で返すと inbox job が
+		// 8 回 retry してから dead letter に積まれ、その間 inbox health の
+		// 統計にも失敗として乗る (#534 の idempotency invariant)。
+		if errors.Is(err, corefollowing.ErrBlocking) || errors.Is(err, corefollowing.ErrBlocked) {
 			return nil
 		}
 		return err
@@ -1336,20 +1587,62 @@ func (p *Processor) handleCreate(act genericActivity, signer *model.User) error 
 	// chatRoomReceiver が処理するのでどちらか配線済みなら probe する。
 	if p.chatService != nil || p.chatRoomReceiver != nil {
 		var probe struct {
-			Type        string          `json:"type"`
-			ID          string          `json:"id"`
-			Content     string          `json:"content"`
-			MisskeyTalk bool            `json:"_misskey_talk"`
-			To          json.RawMessage `json:"to"`
-			Context     json.RawMessage `json:"@context"`
+			Type    string `json:"type"`
+			ID      string `json:"id"`
+			Content string `json:"content"`
+			// **MFM の原文も拾う。** `content` は HTML なので、MFM に戻すと
+			// 情報が落ちる (装飾・色・絵文字・引用の改行など)。note 取り込みは
+			// 同じ 3 段 (source -> _misskey_content -> content) で拾っており、
+			// chat だけ `content` しか見ていなかった。
+			Source *struct {
+				Content   string `json:"content"`
+				MediaType string `json:"mediaType"`
+			} `json:"source"`
+			MisskeyContent string          `json:"_misskey_content"`
+			MisskeyTalk    bool            `json:"_misskey_talk"`
+			To             json.RawMessage `json:"to"`
+			Context        json.RawMessage `json:"@context"`
 		}
 		if err := json.Unmarshal(act.Object, &probe); err == nil && probe.MisskeyTalk && probe.Type == "Note" {
+			mfmSource := ""
+			if probe.Source != nil && probe.Source.MediaType == "text/x.misskeymarkdown" {
+				mfmSource = probe.Source.Content
+			}
+			if mfmSource == "" {
+				mfmSource = probe.MisskeyContent
+			}
+			// **メッセージの id を配送してきた actor のホストに縛る。**
+			//
+			// この分岐は `ingestCreateNote` の手前で短絡するので、通常の note に
+			// 掛かる `id host == attributedTo host` の検査 (`resolver.go` の
+			// `validateNote` 相当) を一度も通らない。縛らないと、署名が通る
+			// リモート actor が**任意ホストの URI を名乗って chat メッセージを
+			// 1 通送れる**。以後その URI を使う正規の連合 chat メッセージは
+			// `FindMessageByURI` が hit して黙って捨てられる (= 相手のメッセージを
+			// 先回りして潰せる)。
+			//
+			// **`sameDeliveryHost` を使う。`assertRequestHostMatches` では緩い。**
+			// あちらは `normalizeMatchHost` 経由で **`www.` を剥がして同一視する**
+			// ので、`www.remote.example` の actor が `remote.example` の id を
+			// 名乗れてしまう。`normalizeMatchHost` 自身のコメントが「actor が
+			// 申告する値の host 検証には `sameDeliveryHost` を使うこと」と書いて
+			// いて (#2662)、chat の id はまさに actor の申告値。note 側の
+			// `validateNote` も `punyHost` 比較で `www.` を剥がさない。
+			//
+			// **1-on-1 と room の両方の手前に置く。** どちらも同じ `probe.ID` を
+			// メッセージの uri として保存する。
+			if !sameDeliveryHost(act.Actor, probe.ID) {
+				slog.Warn("federation: chat message id host does not match delivering actor",
+					"actor", act.Actor, "id", probe.ID)
+				// retry では解決しないので ack して drop する。
+				return ErrUnsupportedActivity
+			}
 			// note の @context が room URI なら group chat message (#1209)。
 			// それ以外は従来の 1-on-1 DM。
-			if roomID, isRoom := chatRoomIDFromContext(probe.Context); isRoom {
-				return p.handleChatRoomMessageCreate(actor, probe.ID, probe.Content, roomID)
+			if roomURI, isRoom := chatRoomURIFromContext(probe.Context); isRoom {
+				return p.handleChatRoomMessageCreate(actor, probe.ID, probe.Content, mfmSource, roomURI)
 			}
-			return p.handleChatCreate(actor, probe.ID, probe.Content, probe.To)
+			return p.handleChatCreate(actor, probe.ID, probe.Content, mfmSource, probe.To)
 		}
 	}
 	// 本家 ApInboxService.create は resolve 前に activity.to/cc を Note object の
@@ -1747,8 +2040,14 @@ func (p *Processor) handleAnnounce(act genericActivity, signer *model.User) erro
 				"id", truncateRunes(act.ID, noteURIMaxRunes))
 			return ErrInvalidNote
 		}
-		if _, err := p.noteRepo.FindByURI(act.ID); err == nil {
+		switch _, err := p.noteRepo.FindByURI(act.ID); {
+		case err == nil:
+			// 既に取り込み済み。
 			return nil
+		case !repository.IsNotFound(err):
+			// **障害を「重複でない」に倒さない** (#3116)。倒すと DB 障害のあいだ
+			// 同じ Announce が二重の renote になる。
+			return fmt.Errorf("announce dedup: %w", err)
 		}
 	}
 	// 遅延配送 Announce では activity.published を採用して timeline 並びを
@@ -1932,10 +2231,18 @@ func (p *Processor) handleDelete(act genericActivity) error {
 	// actor の delete を受け取り続けて queue が膨れる" 既存 bug)。
 	if isActorDelete(act.Actor, targetURI, act.Object) {
 		if _, ferr := p.userRepo.FindByURI(targetURI); ferr != nil {
-			// gorm の ErrRecordNotFound は明示 import せず、user が見つからない
-			// 場合は ferr != nil で代表させる (他の DB error も "ignore して
-			// retry を避ける" 方が retry 蓄積よりマシ)。
-			return nil
+			// **not-found だけ ack する** (#3116)。存在しない actor の delete は
+			// retry しても結果が変わらないので、ここで止めないと queue が膨れる
+			// (上のコメントの元の動機)。
+			//
+			// **DB 障害は伝播させる。** 以前は「他の DB error も ignore して
+			// retry を避ける方がマシ」と書いて**種別を見ずに ack** していたが、
+			// それだと一時的な接続断だけでリモートのアカウント削除を取りこぼす。
+			// #3115 が Accept / Reject で確立した原則と正面から衝突していた。
+			if repository.IsNotFound(ferr) {
+				return nil
+			}
+			return fmt.Errorf("actor delete: lookup actor: %w", ferr)
 		}
 		// 存在する actor の delete は従来通り resolve に進む。
 	}
@@ -1950,8 +2257,13 @@ func (p *Processor) handleDelete(act genericActivity) error {
 	}
 	note, err := p.noteRepo.FindByURI(targetURI)
 	if err != nil {
-		// 既に存在しないなら成功扱い
-		return nil
+		// 既に存在しないなら成功扱い。**障害は伝播させる** (#3116) —
+		// ack すると job が成功扱いになって retry されず、**削除されたはずの
+		// ノートがこちらに残り続ける**。
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete note: lookup note: %w", err)
 	}
 	if note.UserID != author.ID {
 		return errors.New("delete from non-author")
@@ -2068,8 +2380,12 @@ func (p *Processor) handleUpdate(act genericActivity) error {
 		return nil
 	}
 	if _, err := p.userRepo.FindByURI(person.ID); err != nil {
-		// 未取得のリモートユーザーなら無視 (次回 follow/inbox などで取り込まれる)
-		return nil
+		// 未取得のリモートユーザーなら無視 (次回 follow/inbox などで取り込まれる)。
+		// **障害は伝播させる** (#3116) — ack するとプロフィールの更新が消える。
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("update person: lookup user: %w", err)
 	}
 	// upstream ApInboxService.update -> ApPersonService.updatePerson は actor を
 	// 強制再取得して name だけでなく avatar/banner/bio/fields/isBot/isCat/
@@ -2130,8 +2446,9 @@ func isBearcapURI(raw json.RawMessage) bool {
 //
 // 想定: 自分 (ローカル follower) が remote followee に対して Follow を送ったが
 // 拒否された場合に呼ばれる。inner.Follow.actor がローカル follower、object が
-// remote followee。inner.id が follow-relay パターンなら relay 関連として
-// RelayStatusMarker.MarkRejected を呼ぶ。
+// remote followee。inner.id が自ホストの follow-relay URI で、かつ送信元
+// actor がその relay 自身なら relay 関連として RelayStatusMarker.MarkRejected
+// を呼ぶ。
 func (p *Processor) handleReject(act genericActivity) error {
 	var inner genericActivity
 	// 型エラーを握らないと、直後の normalizeActor (#999) が救うはずの
@@ -2149,7 +2466,12 @@ func (p *Processor) handleReject(act genericActivity) error {
 	if !strings.EqualFold(inner.Type, "follow") {
 		return ErrUnsupportedActivity
 	}
-	if relayID := matchFollowRelayID(inner.ID); relayID != "" && p.relayMarker != nil {
+	if relayID := matchFollowRelayID(inner.ID, p.localBaseURL); relayID != "" && p.relayMarker != nil {
+		// Accept 側と同じ理由で送信元を検証する。こちらを通すと稼働中の
+		// relay 配送を任意の actor が無言で止められる。
+		if !p.relayStatusChangeAllowed(act.Actor, relayID, "Reject") {
+			return nil
+		}
 		return p.relayMarker.MarkRejected(context.Background(), relayID)
 	}
 	followee, err := p.resolver.ResolveActor(act.Actor)
@@ -2166,7 +2488,14 @@ func (p *Processor) handleReject(act genericActivity) error {
 	// ままになる。
 	follower, err := p.resolveTargetUser(followerURI)
 	if err != nil {
-		return nil
+		// **Accept と同じ扱い** (#3115)。not-found は retry しても変わらないので
+		// ack するが、**DB 障害を ack すると job が成功扱いになって retry されず**、
+		// 直上のコメントが書いている「FollowRequest が永遠に pending」がそのまま
+		// 起きる。Accept と Reject は同じ決定の裏表なので、片方だけ直さない。
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return err
 	}
 	// 既存のフォローがあれば解除する。pending な follow request も同様。
 	// #2106 N11: upstream remoteReject は AP 配送を伴わない内部削除なので、federating な
@@ -2332,6 +2661,7 @@ func (p *Processor) handleFlag(act genericActivity) error {
 		slog.Warn("failed to create abuse report from flag activity", "err", err)
 		return err
 	}
+	p.notifyModeratorsOfRemoteAbuseReport(report)
 	return nil
 }
 
@@ -2389,6 +2719,72 @@ func (p *Processor) handleAdd(act genericActivity) error {
 			return err
 		}
 	}
+	// **ピン留めできるのは自分の投稿だけ。** これを見ないと、署名付きの
+	// リモート actor が**他人のノートを自分のプロフィールに並べられる**。
+	// ローカルの非公開ノートも対象になりうる (`ResolveNote` はローカル URI を
+	// 可視性を見ずに引く) ので、`users/show` の `pinnedNoteIds` 経由でその ID が
+	// 未認証の相手に出る。
+	//
+	// **同じ規則が `featured.go` に既にある** (pull 側の featured 取り込み)。
+	// こちらの push 側 (`Add`) だけが取り残されていた。upstream も
+	// `NotePiningService.addPinned` が `findOneBy({id, userId: user.id})` で
+	// 弾いている。
+	if note.UserID != actor.ID {
+		return nil
+	}
+	// **件数にも上限を置く。** `Add` は署名さえ通れば何度でも送れるので、
+	// 上限が無いと `user_note_pining` を無制限に増やせる。しかも
+	// `internal/api/users/handler.go` の設計メモ (#1489) は `pinnedNoteIds` を
+	// 絞らない理由として「pinning は per-user 上限が厳しい (= 数件) ので
+	// mass enumeration リスクは低い」と書いており、**その前提がここで壊れる**。
+	//
+	// 値は pull 側の `featuredPinLimit` と同じ。片方だけ緩いと、同じ
+	// リモート actor が経路によって違う上限を受けることになる。
+	//
+	// **上限に当たったら古い方を外して入れ替える。捨てない。** upstream は
+	// `Remove(A)` と `Add(B)` を**別々の deliver job** で配る
+	// (`NotePiningService.deliverPinnedChange`)。こちらの inbox は並列に
+	// 処理するので `Add(B)` が先に着くことがあり、そこで捨てると
+	// (`return nil` は inbox job を成功扱いにするので再試行されない) B は
+	// **次の actor 更新まで現れない** (既定 TTL 24 時間)。
+	//
+	// **再試行にはしない。** upstream は throw して job を再送させるが、
+	// mk-go でそれをやると、上限を超える `Add` を投げ続けるだけで job が
+	// 8 倍に膨らむ — この上限が防いでいる負荷を別の形で呼び込む。入れ替えなら
+	// 行数は上限に収まったまま、順序の入れ替わりも拾える。
+	//
+	// **数えられなかったら errで返す。** ここで握り潰すと上限が効かないまま
+	// 進むし、`nil` で捨てると inbox job が「処理済み」として再試行しない。
+	// error なら再試行されるので、DB 障害が上限の無効化にも取りこぼしにも
+	// 化けない (#2792 と同じ判断)。
+	// **既にピン留め済みなら何もしない。** 再送や順序の入れ替わりで同じ
+	// `Add` が二度届く。上限判定より前に置く — ここを通すと「既にあるものを
+	// 入れるために別のピンを外す」ことになる。
+	switch existing, ferr := p.pinningRepo.FindByPair(actor.ID, note.ID); {
+	case ferr == nil && existing != nil:
+		return nil
+	case ferr != nil && !repository.IsNotFound(ferr):
+		// **障害を「まだ無い」に倒さない** (#3116)。倒すと上限判定の側へ進み、
+		// 「既にあるものを入れるために別のピンを外す」ことになる。
+		return fmt.Errorf("pin dedup: %w", ferr)
+	}
+	count, cerr := p.pinningRepo.CountByUser(actor.ID)
+	if cerr != nil {
+		return fmt.Errorf("count pinned notes: %w", cerr)
+	}
+	if count >= featuredPinLimit {
+		rows, lerr := p.pinningRepo.ListByUser(actor.ID)
+		if lerr != nil {
+			return fmt.Errorf("list pinned notes: %w", lerr)
+		}
+		// `ListByUser` は id DESC なので末尾が最も古い。新しい方を
+		// `featuredPinLimit - 1` 件残して、あふれる分を外す。
+		for i := featuredPinLimit - 1; i < len(rows); i++ {
+			if derr := p.pinningRepo.Delete(rows[i]); derr != nil {
+				return fmt.Errorf("evict pinned note: %w", derr)
+			}
+		}
+	}
 	now := nowFn()
 	pin := &model.UserNotePining{
 		ID:     p.pinningIDGen.Generate(now),
@@ -2415,12 +2811,12 @@ func (p *Processor) handleRemove(act genericActivity) error {
 	// chat room target の Remove は group chat の leave (#1364)。featured pin
 	// より先に判定する (pinningRepo 未配線でも chat leave は処理する)。actor の
 	// membership を削除する (cherrypick ApInboxService.remove と同じく actor 基準)。
-	if roomID := extractChatRoomID(target.Target); roomID != "" && p.chatRoomReceiver != nil {
+	if roomURI := chatRoomURI(target.Target); roomURI != "" && p.chatRoomReceiver != nil {
 		actor, err := p.resolver.ResolveActor(act.Actor)
 		if err != nil {
 			return err
 		}
-		if err := p.chatRoomReceiver.RemoveMemberViaAP(roomID, actor.ID); err != nil {
+		if err := p.chatRoomReceiver.RemoveMemberViaAP(roomURI, actor.ID); err != nil {
 			if errors.Is(err, corechat.ErrNotFound) || errors.Is(err, corechat.ErrInvalidTarget) {
 				return ErrUnsupportedActivity
 			}
@@ -2444,13 +2840,26 @@ func (p *Processor) handleRemove(act genericActivity) error {
 	}
 	note, err := p.noteRepo.FindByURI(noteURI)
 	if err != nil {
-		return nil
+		// 理由は handleAccept と同じ (#3115)。ここで DB 障害を ack すると
+		// job が成功扱いになって retry されず、pin が外れないまま残る。
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return err
 	}
 	pin, err := p.pinningRepo.FindByPair(actor.ID, note.ID)
 	if err != nil {
-		return nil
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return err
 	}
-	_ = p.pinningRepo.Delete(pin)
+	// **書き込みの失敗も伝播させる** (#3115)。lookup だけ retry に倒して
+	// ここを捨てると、「pin が外れないまま残る」という同じ結末が DELETE 側で
+	// 残る。対になる `handleAdd` は Create / eviction の Delete を両方伝播する。
+	if err := p.pinningRepo.Delete(pin); err != nil {
+		return fmt.Errorf("unpin note: %w", err)
+	}
 	return nil
 }
 
@@ -2550,10 +2959,10 @@ func readActorString(act genericActivity) (string, error) {
 // として扱う。**1-on-1 経路なのでそれで正しい。**
 //
 // group chat は別プロトコルで、note の `@context` に room URI が入る形で届く。
-// Create の入口 (`chatRoomIDFromContext`) が先に振り分け、
+// Create の入口 (`chatRoomURIFromContext`) が先に振り分け、
 // `handleChatRoomMessageCreate` → `CreateRoomMessageViaAP` が room のメンバー
 // 全員に配る。ここに複数 recipient が来ることはない。
-func (p *Processor) handleChatCreate(sender *model.User, noteURI, content string, toRaw json.RawMessage) error {
+func (p *Processor) handleChatCreate(sender *model.User, noteURI, content, mfmSource string, toRaw json.RawMessage) error {
 	if p.chatService == nil {
 		return ErrUnsupportedActivity
 	}
@@ -2579,7 +2988,7 @@ func (p *Processor) handleChatCreate(sender *model.User, noteURI, content string
 	if !recipient.IsLocal() {
 		return fmt.Errorf("chat create: recipient %s is not local", to)
 	}
-	_, err = p.chatService.CreateMessageViaAP(context.Background(), noteURI, sender, recipient.ID, content)
+	_, err = p.chatService.CreateMessageViaAP(context.Background(), noteURI, sender, recipient.ID, content, mfmSource)
 	// 列に収まらない uri は retry しても解決しないので drop する (#2726)。
 	if errors.Is(err, corechat.ErrInvalidTarget) {
 		slog.Warn("chat create: message cannot be stored", "actor", sender.ID)
@@ -2627,6 +3036,12 @@ func (p *Processor) handleChatMessage(act genericActivity) error {
 		AttributedTo string `json:"attributedTo"`
 		To           string `json:"to"`
 		Content      string `json:"content"`
+		// Create 経由の probe と同じ 3 段で MFM の原文も拾う。
+		Source *struct {
+			Content   string `json:"content"`
+			MediaType string `json:"mediaType"`
+		} `json:"source"`
+		MisskeyContent string `json:"_misskey_content"`
 	}
 	if err := json.Unmarshal(act.raw, &raw); err != nil {
 		return fmt.Errorf("chat message: unmarshal: %w", err)
@@ -2656,7 +3071,23 @@ func (p *Processor) handleChatMessage(act genericActivity) error {
 	if !recipient.IsLocal() {
 		return fmt.Errorf("chat message: recipient %s is not local", raw.To)
 	}
-	_, err = p.chatService.CreateMessageViaAP(context.Background(), act.ID, sender, recipient.ID, raw.Content)
+	// **id を配送元ホストに縛る。** `Create` + `_misskey_talk` 側と同じ理由で、
+	// ここも `act.ID` をそのままメッセージの uri として保存する
+	// (`CreateMessageViaAP` の呼び出しはこの 2 箇所だけ)。片方だけ塞いでも、
+	// この兄弟の活動型で同じ squat が通る。
+	if !sameDeliveryHost(act.Actor, act.ID) {
+		slog.Warn("federation: chat message id host does not match delivering actor",
+			"actor", act.Actor, "id", act.ID)
+		return ErrUnsupportedActivity
+	}
+	mfmSource := ""
+	if raw.Source != nil && raw.Source.MediaType == "text/x.misskeymarkdown" {
+		mfmSource = raw.Source.Content
+	}
+	if mfmSource == "" {
+		mfmSource = raw.MisskeyContent
+	}
+	_, err = p.chatService.CreateMessageViaAP(context.Background(), act.ID, sender, recipient.ID, raw.Content, mfmSource)
 	// handleChatCreate と同じ理由で non-retry に落とす (#2726)。
 	if errors.Is(err, corechat.ErrInvalidTarget) {
 		slog.Warn("chat message: message cannot be stored", "actor", act.Actor)

@@ -200,6 +200,10 @@ func (s *Service) FindManyByIDs(ids []string) ([]*model.User, error) {
 func (s *Service) ShowByID(id string) (*UserWithProfile, error) {
 	u, err := s.userRepo.FindByID(id)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrUserNotFound
 	}
 	// Profileの取得失敗は致命ではないので無視する
@@ -259,16 +263,26 @@ func (s *Service) ShowManyByIDs(ids []string) ([]*UserWithProfile, error) {
 // resolver 未設定の場合は ErrUserNotFound を返し (後方互換)、設定済みで解決
 // に失敗した場合は ErrFailedToResolveRemoteUser を返す。
 func (s *Service) ShowByUsername(username string, host *string) (*UserWithProfile, error) {
-	// **ここで正規化しない。** repository の `hostMatch` は正規化形と生の両方に
-	// 当てるが、先に正規化してしまうと生の腕が死に、非正規化で保存された行が
-	// この経路から引けなくなる (#2704 review HIGH-1)。upstream が読み取り側で
-	// toPuny を掛けられるのは、**保存側で正規化しているから**
-	// (`ApPersonService.ts:307`)。mk-go の保存側は生なので、揃えるのは
-	// リモートへ問い合わせる直前だけにする。
+	// **正規化は repository に任せる。** `FindByUsernameLower` が引く直前に
+	// `idnhost.Puny` を掛けるので (#2704)、ここで掛けると二度手間になるだけ。
+	//
+	// **非正規化のまま保存された行は引けない (#2996)。** その場合は下のリモート解決
+	// (WebFinger) へ落ちる。**行は増えない** — 解決先の actor URI は変わらないので
+	// `ResolveActor` の `FindByURI` が既存行に当たる。増えるのは**呼ばれるたびの
+	// 外向きリクエスト**のほうで、`LookupActorURI` にキャッシュは無い。
+	// `backfill-remote-host` を流していない環境で上げるとこの形になる
+	// (経路ごとの症状は docs/deployment.md)。
 	u, err := s.userRepo.FindByUsernameLower(username, host)
 	if err == nil {
 		profile, _ := s.userRepo.FindProfileByUserID(u.ID)
 		return &UserWithProfile{User: u, Profile: profile}, nil
+	}
+	// **DB 障害を not-found に丸めない (#2792 / #2799)。** 丸めると接続断のような
+	// 一過性の障害がそのまま下の WebFinger 問い合わせに化ける。`users/show` は
+	// 未認証でも叩けるので、DB が不調なあいだ外向きリクエストを外部から任意に
+	// 焚き付けられることになる。`ShowByUsernameDB` は #2799 で同じ形に直してある。
+	if !repository.IsNotFound(err) {
+		return nil, err
 	}
 	// ローカル DB miss。host 指定なしや resolver 未注入の場合は従来どおり
 	// ErrUserNotFound を返し、handler 側で NO_SUCH_USER にマップさせる。
@@ -295,6 +309,10 @@ func (s *Service) ShowByUsername(username string, host *string) (*UserWithProfil
 func (s *Service) ShowByUsernameDB(username string, host *string) (*UserWithProfile, error) {
 	u, err := s.userRepo.FindByUsernameLower(username, host)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrUserNotFound
 	}
 	profile, _ := s.userRepo.FindProfileByUserID(u.ID)
@@ -303,11 +321,24 @@ func (s *Service) ShowByUsernameDB(username string, host *string) (*UserWithProf
 
 // GetProfile returns the profile for the given user ID, or nil if not found.
 func (s *Service) GetProfile(userID string) *model.UserProfile {
+	profile, _ := s.GetProfileErr(userID)
+	return profile
+}
+
+// GetProfileErr returns the profile and the lookup error.
+//
+// **DB 障害と not-found を分ける必要がある呼び出し元はこちらを使う** (#2799)。
+// `GetProfile` は err を捨てるので、パスワードの有無を見る経路が接続断中に
+// 「パスワードが設定されていません」を返していた。
+//
+// プロフィールが無くても続行するのが正しい用途 (achievement / ap /
+// recommendation) は `GetProfile` のままでよい。
+func (s *Service) GetProfileErr(userID string) (*model.UserProfile, error) {
 	profile, err := s.userRepo.FindProfileByUserID(userID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return profile
+	return profile, nil
 }
 
 // GetProfilesByUserIDs returns a userID → profile map for the given IDs in
@@ -504,6 +535,10 @@ type FieldItem struct {
 func (s *Service) UpdateProfile(userID string, in UpdateInput) (*UserWithProfile, error) {
 	existing, err := s.userRepo.FindByID(userID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrUserNotFound
 	}
 
@@ -746,6 +781,12 @@ func (s *Service) applyMediaUpdate(userID string, idPtr *string, prefix string, 
 		return nil
 	}
 	file, err := s.driveFileRepo.FindByID(*idPtr)
+	// **DB 障害を not-found に丸めない** (#2799)。呼び出し元は
+	// `ErrAvatarNotFound` / `ErrBannerNotFound` を渡し handler が 4xx にするので、
+	// 丸めると接続断が「そのアバターは存在しない」になる。
+	if err != nil && !repository.IsNotFound(err) {
+		return err
+	}
 	if err != nil || file == nil {
 		return notFoundErr
 	}
@@ -759,7 +800,18 @@ func (s *Service) applyMediaUpdate(userID string, idPtr *string, prefix string, 
 		return notImageErr
 	}
 	userFields[prefix+"Id"] = file.ID
-	userFields[prefix+"Url"] = file.URL
+	// **原本 (`file.URL`) を入れない。** あれは所有者にしか渡さない値で
+	// (`entity.GetSelfURL` の doc)、EXIF / XMP が載ったままになる。アイコンと
+	// バナーの URL はタイムライン・`users/show`・ActivityPub の actor icon に
+	// 出るので、原本を入れると撮影位置を含む画像がそのまま公開される。
+	// upstream も `getPublicUrl(avatar, 'avatar')` で `webpublicUrl ?? url` を
+	// 通している (`DriveFileEntityService.ts`)。
+	//
+	// **プロキシには通さない。** ここは DB に保存する値で、mk-go の
+	// `ProxiedURL` は `sig=` に HMAC を付けるため、保存するとプロキシの secret を
+	// 変えた瞬間に全員のアイコン URL が無効になる。リモート origin の包み直しは
+	// packer 側 (`entity.PackUserLite` → `ProxyAvatarURL`) が既に行う。
+	userFields[prefix+"Url"] = entity.WebpublicOrOriginalURL(file)
 	if file.Blurhash != nil {
 		userFields[prefix+"Blurhash"] = *file.Blurhash
 	} else {
@@ -779,6 +831,13 @@ func (s *Service) publishMeUpdated(bundle *UserWithProfile) {
 	// profile update / pin / unpin は頻度が低く hot path ではないため
 	// full pack する (UserLite ではなく UserDetailed)。
 	body := entity.PackUserDetailed(bundle.User, bundle.Profile, s.idGen)
+	// **本人にはカウントを見せる。** packer は `followersVisibility` /
+	// `followingVisibility` が public でないカウントを既定で伏せるので、
+	// self event でゲートを通さないと 0 が流れる。fork frontend は
+	// `meUpdated` を `$i` にそのまま merge するので、**プロフィール更新や
+	// pin のたびに自分のフォロー数の表示が 0 に化ける** (リロードまで戻らない)。
+	// upstream `UserEntityService.pack` も `isMe` に実数を返す。
+	entity.GateCountVisibility(&body, true, false, false)
 	// meUpdated は本人自身の main channel に流す self event なので、
 	// follower-only の followedMessage も本人には見せる (#1558)。PackUserDetailed
 	// は followedMessage を set しない (privacy gate) ため、self event では
@@ -825,6 +884,10 @@ func (s *Service) emitMeUpdatedForUser(userID, contextLabel string) {
 func (s *Service) PinNote(userID, noteID string) error {
 	note, err := s.noteRepo.FindByID(noteID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrNoteNotFound
 	}
 	if note.UserID != userID {
@@ -872,6 +935,10 @@ func (s *Service) PinNote(userID, noteID string) error {
 func (s *Service) UnpinNote(userID, noteID string) error {
 	p, err := s.piningRepo.FindByPair(userID, noteID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrPinNotFound
 	}
 	if err := s.piningRepo.Delete(p); err != nil {
@@ -906,6 +973,14 @@ func (s *Service) UpdateUserFields(userID string, fields map[string]any) error {
 // UpdateProfileFields updates arbitrary fields on the user_profile table.
 func (s *Service) UpdateProfileFields(userID string, fields map[string]any) error {
 	return s.userRepo.UpdateProfile(userID, fields)
+}
+
+// RemoveBackupCode atomically deletes one single-use 2FA backup code.
+//
+// **読んだ配列を書き戻さない** (#2852)。別のコードを使う同時実行が互いの消費を
+// 打ち消し合うため、消す操作そのものを DB 側で行う。
+func (s *Service) RemoveBackupCode(userID, code string) error {
+	return s.userRepo.RemoveBackupCode(userID, code)
 }
 
 // FindProfileByVerifyCode looks up a profile by emailVerifyCode.

@@ -644,6 +644,91 @@ func TestService_UpdateProfile_AvatarDecorationsClear(t *testing.T) {
 	assert.JSONEq(t, `[]`, string(userRepo.Users["u1"].AvatarDecorations))
 }
 
+// アイコン / バナーに設定した画像の URL は**原本ではなく公開用**でなければ
+// ならない。原本は EXIF / XMP が載ったままで、`avatarUrl` はタイムライン・
+// `users/show`・ActivityPub の actor icon に出るため、入れると撮影位置を含む
+// 画像がそのまま公開される。upstream も `webpublicUrl ?? url` を通している。
+func TestService_UpdateProfile_MediaUsesPublicURL(t *testing.T) {
+	webpublic := "https://cdn.example/webpublic.webp"
+	emptyWebpublic := ""
+
+	cases := []struct {
+		name       string
+		file       *model.DriveFile
+		wantAvatar string
+	}{
+		{
+			name: "webpublic があればそちらを入れる",
+			file: &model.DriveFile{
+				Type:         "image/jpeg",
+				URL:          "https://cdn.example/original.jpg",
+				WebpublicURL: &webpublic,
+			},
+			wantAvatar: webpublic,
+		},
+		{
+			name: "webpublic が無ければ原本に落ちる",
+			file: &model.DriveFile{
+				Type: "image/png",
+				URL:  "https://cdn.example/original.png",
+			},
+			wantAvatar: "https://cdn.example/original.png",
+		},
+		{
+			name: "webpublic が空文字なら原本に落ちる",
+			file: &model.DriveFile{
+				Type:         "image/png",
+				URL:          "https://cdn.example/original.png",
+				WebpublicURL: &emptyWebpublic,
+			},
+			wantAvatar: "https://cdn.example/original.png",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, userRepo, _, _ := newFullSvc(t)
+			userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice"}
+			driveRepo := testutil.NewMockDriveFileRepository()
+			owner := "u1"
+
+			avatar := *tc.file
+			avatar.ID = "f1"
+			avatar.UserID = &owner
+			driveRepo.Files["f1"] = &avatar
+
+			// banner も同じ経路 (applyMediaUpdate 共有) なので同時に見る。
+			banner := *tc.file
+			banner.ID = "b1"
+			banner.UserID = &owner
+			driveRepo.Files["b1"] = &banner
+
+			svc.SetDriveFileRepository(driveRepo)
+
+			avatarID, bannerID := "f1", "b1"
+			bundle, err := svc.UpdateProfile("u1", user.UpdateInput{
+				AvatarID: &avatarID,
+				BannerID: &bannerID,
+			})
+			require.NoError(t, err)
+
+			require.NotNil(t, bundle.User.AvatarURL)
+			assert.Equal(t, tc.wantAvatar, *bundle.User.AvatarURL, "avatarUrl")
+			require.NotNil(t, bundle.User.BannerURL)
+			assert.Equal(t, tc.wantAvatar, *bundle.User.BannerURL, "bannerUrl")
+
+			// **原本が漏れていないこと**を直接見る。上の Equal だけだと、
+			// 将来 want をうっかり原本に書き換えたときに気付けない。
+			if tc.file.WebpublicURL != nil && *tc.file.WebpublicURL != "" {
+				assert.NotEqual(t, tc.file.URL, *bundle.User.AvatarURL,
+					"原本の URL を avatarUrl に入れてはいけない")
+				assert.NotEqual(t, tc.file.URL, *bundle.User.BannerURL,
+					"原本の URL を bannerUrl に入れてはいけない")
+			}
+		})
+	}
+}
+
 func TestService_UpdateProfile_BannerSet(t *testing.T) {
 	// banner は avatar と applyMediaUpdate 共有なので smoke test 1 件のみ。
 	svc, userRepo, _, _ := newFullSvc(t)
@@ -895,7 +980,7 @@ func TestService_ListPinnedNotes_Empty(t *testing.T) {
 
 // --- Failing-repo error paths ---
 
-var stubError = errors.New("stub error")
+var errStub = errors.New("stub error")
 
 type failingUserRepo struct {
 	*testutil.MockUserRepository
@@ -905,14 +990,14 @@ type failingUserRepo struct {
 
 func (f *failingUserRepo) UpdateUser(userID string, fields map[string]any) error {
 	if f.failUpdateUser {
-		return stubError
+		return errStub
 	}
 	return f.MockUserRepository.UpdateUser(userID, fields)
 }
 
 func (f *failingUserRepo) UpdateProfile(userID string, fields map[string]any) error {
 	if f.failUpdateProfile {
-		return stubError
+		return errStub
 	}
 	return f.MockUserRepository.UpdateProfile(userID, fields)
 }
@@ -925,14 +1010,14 @@ type failingPiningRepo struct {
 
 func (f *failingPiningRepo) CountByUser(userID string) (int, error) {
 	if f.failCount {
-		return 0, stubError
+		return 0, errStub
 	}
 	return f.MockUserNotePiningRepository.CountByUser(userID)
 }
 
 func (f *failingPiningRepo) ListByUser(userID string) ([]*model.UserNotePining, error) {
 	if f.failListByU {
-		return nil, stubError
+		return nil, errStub
 	}
 	return f.MockUserNotePiningRepository.ListByUser(userID)
 }
@@ -945,7 +1030,7 @@ func TestService_UpdateProfile_UserUpdateError(t *testing.T) {
 	svc := user.NewService(uRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
 
 	_, err := svc.UpdateProfile("u1", user.UpdateInput{IsLocked: ptr(true)})
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 func TestService_UpdateProfile_ProfileUpdateError(t *testing.T) {
@@ -956,7 +1041,7 @@ func TestService_UpdateProfile_ProfileUpdateError(t *testing.T) {
 	svc := user.NewService(uRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
 
 	_, err := svc.UpdateProfile("u1", user.UpdateInput{Description: ptr(ptr("hi"))})
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 func TestService_PinNote_CountError(t *testing.T) {
@@ -969,7 +1054,7 @@ func TestService_PinNote_CountError(t *testing.T) {
 	svc := user.NewService(mockUR, mockNR, piningRepo, idGen)
 
 	err := svc.PinNote("u1", "n1")
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 func TestService_ListPinnedNotes_Error(t *testing.T) {
@@ -979,7 +1064,7 @@ func TestService_ListPinnedNotes_Error(t *testing.T) {
 	svc := user.NewService(mockUR, testutil.NewMockNoteRepository(), piningRepo, idGen)
 
 	_, err := svc.ListPinnedNotes("u1")
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 func TestUpdateUserFields(t *testing.T) {
@@ -1328,8 +1413,8 @@ func (r *recordingResolver) ResolveByUsernameHost(username, host string) (*model
 //
 // 引く側は Unicode で来ることがある (フロントの mention リンクは
 // `toUnicode(host)` で URL を組む)。正規化しないと「通知からは開けるのに
-// メンションからは開けない」という形で出る。**backfill 前の行は非正規化のまま**なので、
-// 正規化形と生の両方に当てる (repository の hostCandidates)。
+// メンションからは開けない」という形で出る。引く前に正規化し、正規形の完全一致で
+// 当てる (repository の hostMatch、#2996)。
 func TestShowByUsername_IDNHost(t *testing.T) {
 	const puny = "xn--eckve.example"
 
@@ -1416,15 +1501,18 @@ func TestShowByUsername_LocalHostShortCircuit(t *testing.T) {
 	}
 }
 
-// **非正規化で保存された行が主経路 (users/show) から引けること** (#2704 review
-// HIGH-1)。
+// **非正規化で保存された行は主経路 (users/show) から引けなくなる (#2996)。**
 //
-// backfill 前の行は非正規化のまま (#2706 以前の `hostFromURI` は `url.Parse(uri).Host` をそのまま
-// 入れる) ので、`https://Mixed.Example/users/x` を出すサーバーの行は大文字
-// 混じりで入る。DB を引く前に正規化すると repository の両当たりが死んで、
-// この経路から引けなくなる。upstream が読み取り側で toPuny を掛けられるのは
-// **保存側で正規化しているから** (`ApPersonService.ts:307`)。
-func TestShowByUsername_NonNormalizedStoredHost(t *testing.T) {
+// 生の形にも当てる互換経路を撤去したので、backfill 前の行 (#2706 以前の
+// `hostFromURI` は `url.Parse(uri).Host` をそのまま入れる) は DB から引けず、
+// **リモート解決 (WebFinger) へ落ちる**。
+//
+// **行は増えない** — 解決先の actor URI は変わらないので `ResolveActor` の
+// `FindByURI` が既存行に当たる。増えるのは**呼ばれるたびの外向きリクエスト**の
+// ほうで、`LookupActorURI` にキャッシュは無い。「引けない」ではなく「WebFinger へ
+// 落ちる」ところまで固定するのが要点。
+// アップグレード前に `backfill-remote-host` を流す前提 (docs/deployment.md)。
+func TestShowByUsername_NonNormalizedStoredHostFallsBackToRemote(t *testing.T) {
 	for _, stored := range []string{"Mixed.Example", "XN--ECKVE.EXAMPLE"} {
 		t.Run(stored, func(t *testing.T) {
 			repo := testutil.NewMockUserRepository()
@@ -1433,14 +1521,85 @@ func TestShowByUsername_NonNormalizedStoredHost(t *testing.T) {
 				ID: "u1", Username: "Alice", UsernameLower: "alice", Host: &h,
 			}
 			svc := user.NewService(repo, nil, nil, nil)
-			res := &recordingResolver{err: errors.New("must not be called")}
+			res := &recordingResolver{err: errors.New("not resolvable in test")}
 			svc.SetRemoteUserResolver(res)
 
 			q := stored
-			got, err := svc.ShowByUsername("alice", &q)
-			require.NoError(t, err, "保存されている文字列そのもので引けること")
-			assert.Equal(t, "u1", got.User.ID)
-			assert.Empty(t, res.calls, "DB に居るのにリモート解決へ落ちないこと")
+			_, err := svc.ShowByUsername("alice", &q)
+			require.Error(t, err)
+			assert.NotEmpty(t, res.calls, "DB で引けないのにリモート解決へ落ちていない")
 		})
 	}
+}
+
+// **DB 障害を DB miss として扱わない (#2792 / #2799)。**
+//
+// `ShowByUsername` は「引けなかった」ことをリモート解決の合図に使うので、接続断の
+// ような一過性の障害を not-found に丸めると**外向きリクエストに化ける**。
+// `users/show` は未認証でも叩けるため、DB が不調なあいだ外部から任意に焚き付け
+// られる形になる。**リモート解決を撃たないこと**まで固定するのが要点。
+func TestShowByUsername_DBErrorIsNotTreatedAsMiss(t *testing.T) {
+	boom := errors.New("connection reset by peer")
+	repo := testutil.NewMockUserRepository()
+	repo.FindByUsernameLowerFn = func(string, *string) (*model.User, error) { return nil, boom }
+	svc := user.NewService(repo, nil, nil, nil)
+	res := &recordingResolver{}
+	svc.SetRemoteUserResolver(res)
+
+	h := "remote.example"
+	_, err := svc.ShowByUsername("alice", &h)
+	require.ErrorIs(t, err, boom, "DB のエラーをそのまま返すこと")
+	assert.Empty(t, res.calls, "DB 障害でリモート解決を撃たないこと")
+}
+
+// RemoveBackupCode は repo へそのまま委譲する (#2852)。
+//
+// **消費を DB 側の array_remove に移した経路。** service が引数を落とすと
+// 「消したはずのコードが残る」形で壊れるので、委譲そのものを固定する。
+func TestService_RemoveBackupCode(t *testing.T) {
+	repo := testutil.NewMockUserRepository()
+	var gotUser, gotCode string
+	repo.RemoveBackupCodeFn = func(userID, code string) error {
+		gotUser, gotCode = userID, code
+		return nil
+	}
+	idGen, _ := id.NewGenerator("aidx")
+	svc := user.NewService(repo, testutil.NewMockNoteRepository(),
+		testutil.NewMockUserNotePiningRepository(), idGen)
+
+	require.NoError(t, svc.RemoveBackupCode("u1", "c2"))
+	assert.Equal(t, "u1", gotUser)
+	assert.Equal(t, "c2", gotCode)
+}
+
+// **self event は本人のカウントを載せること。**
+//
+// packer は `followersVisibility` / `followingVisibility` が public でない
+// カウントを既定で伏せる (呼び忘れても漏れないようにするため)。self event で
+// ゲートを通さないと 0 が流れ、fork frontend は `meUpdated` を `$i` にそのまま
+// merge するので**プロフィール更新や pin のたびに自分のフォロー数の表示が 0 に
+// 化ける** (リロードまで戻らない)。
+func TestService_UpdateProfile_MeUpdatedCarriesOwnCounts(t *testing.T) {
+	svc, repo, _, _ := newFullSvc(t)
+	repo.Users["u1"] = &model.User{
+		ID: "u1", Username: "alice",
+		FollowersCount: 42, FollowingCount: 7,
+	}
+	repo.Profiles["u1"] = &model.UserProfile{
+		UserID: "u1", FollowersVisibility: "followers", FollowingVisibility: "private",
+	}
+	pub := &stubMainStreamPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	_, err := svc.UpdateProfile("u1", user.UpdateInput{Name: ptr(ptr("Alice"))})
+	require.NoError(t, err)
+
+	require.Len(t, pub.calls, 1)
+	raw, err := json.Marshal(pub.calls[0].body)
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(raw, &m))
+	// 期待値はリテラル。非公開の設定でも本人には実数が出る。
+	assert.EqualValues(t, 42, m["followersCount"], "本人の meUpdated にフォロワー数が出ること")
+	assert.EqualValues(t, 7, m["followingCount"], "本人の meUpdated にフォロー数が出ること")
 }

@@ -237,7 +237,11 @@ func (h *Handler) Show(c echo.Context) error {
 		if errors.Is(err, coreantenna.ErrAccessDenied) {
 			return apierr.JSONAccessDenied(c)
 		}
-		// Show は ErrAntennaNotFound 以外を返さない (未マップ含む)
+		// **DB 障害を not-found に丸めない** (#2799)。`Show` は #2799 で raw DB
+		// error も返すようになったので、sentinel かどうかで分ける。
+		if !errors.Is(err, coreantenna.ErrAntennaNotFound) {
+			return apierr.JSONInternalError(c)
+		}
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ANTENNA", "No such antenna.", "c06569fb-b025-4f23-b22d-1fcd20d2816b"))
 	}
 	return c.JSON(http.StatusOK, h.antennaToMap(a))
@@ -388,7 +392,10 @@ func (h *Handler) Notes(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)

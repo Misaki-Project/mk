@@ -1,12 +1,26 @@
 package model
 
 // ChatRoom represents the `chat_room` table.
+//
+// **ID はローカルの行 ID で、リモート room の身元ではない (#2994)。** room id は
+// 相手が自由に決められる値 (`https://<host>/chat/rooms/{id}` から取り出す) なので、
+// ID 空間はホストをまたいで共有されている。ID だけで keying していた頃は、
+// あるホストが先に同じ id の room を作ると、別のホストの正規の room からの Invite が
+// owner 不一致で恒久的に drop されていた。リモート room の身元は URI で持つ。
 type ChatRoom struct {
 	ID          string `gorm:"column:id;type:varchar(32);primaryKey" json:"id"`
 	Name        string `gorm:"column:name;type:varchar(256);not null" json:"name"`
 	OwnerID     string `gorm:"column:ownerId;type:varchar(32);not null" json:"ownerId"`
 	Description string `gorm:"column:description;type:varchar(2048);default:''" json:"description"`
 	IsArchived  bool   `gorm:"column:isArchived;default:false" json:"isArchived"`
+
+	// Host is the origin host of a remote room, NULL for local ones
+	// (`user.host` / `emoji.host` と同じ規約)。
+	Host *string `gorm:"column:host;type:varchar(128)" json:"-"`
+	// URI is the canonical AP URI of a remote room, NULL for local ones
+	// (`note.uri` / `chat_message.uri` と同じ規約)。部分 UNIQUE index が張って
+	// あり、同じ room の二重取り込みを DB で止める。
+	URI *string `gorm:"column:uri;type:varchar(512)" json:"-"`
 
 	Owner *User `gorm:"foreignKey:OwnerID" json:"owner,omitempty"`
 }
@@ -78,8 +92,9 @@ func (ChatApproval) TableName() string { return "chat_approval" }
 // UserPending represents the `user_pending` table. It holds users awaiting
 // email confirmation during invite-based registration.
 type UserPending struct {
-	ID       string `gorm:"column:id;type:varchar(32);primaryKey" json:"id"`
-	Code     string `gorm:"column:code;type:varchar(128);not null;uniqueIndex" json:"code"`
+	ID string `gorm:"column:id;type:varchar(32);primaryKey" json:"id"`
+	// サインアップ確認コード。これを持っていればアカウントを有効化できる。
+	Code     string `gorm:"column:code;type:varchar(128);not null;uniqueIndex" json:"-"`
 	Username string `gorm:"column:username;type:varchar(128);not null" json:"username"`
 	Email    string `gorm:"column:email;type:varchar(128);not null" json:"email"`
 	Password string `gorm:"column:password;type:varchar(128);not null" json:"-"`

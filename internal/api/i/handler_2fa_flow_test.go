@@ -2,6 +2,7 @@ package i
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -393,4 +394,45 @@ func TestTwoFAUpdateKey(t *testing.T) {
 func TestTwoFAPasswordLess(t *testing.T) {
 	h, _ := newExtraHandler(t)
 	assert.Equal(t, http.StatusNoContent, postExtra(h.TwoFAPasswordLess, `{}`, stubUser).Code)
+}
+
+// 2FA を解除したら usePasswordLessLogin も落ちること。
+//
+// **落とさないと、登録済みのパスキーでパスワード無しのログインが通り続ける。**
+// `signin-with-passkey` は `TwoFactorEnabled` を見ずこの列だけを見る。しかも
+// `twoFactorEnabled` が false だと `securityKeysList` は空配列に潰れるので、
+// 利用者からは残った鍵が見えず削除もできない。
+func TestTwoFAUnregister_ClearsPasswordLessLogin(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	secret := "JBSWY3DPEHPK3PXP"
+	repo.Profiles["u1"].TwoFactorSecret = &secret
+	repo.Profiles["u1"].TwoFactorEnabled = true
+	repo.Profiles["u1"].UsePasswordLessLogin = true
+	h.SetTOTPReplayGuard(newReplayGuard(t))
+
+	// 2FA 有効中の unregister は TOTP token も要求される。
+	token, err := totp.GenerateCode(secret, time.Now())
+	require.NoError(t, err)
+	rec := postExtra(h.TwoFAUnregister, `{"password":"pass","token":"`+token+`"}`, user)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	require.False(t, repo.Profiles["u1"].TwoFactorEnabled, "2FA が解除されること")
+	require.False(t, repo.Profiles["u1"].UsePasswordLessLogin,
+		"**usePasswordLessLogin も落ちること** — 残るとパスキーでのパスワード無しログインが通り続ける")
+}
+
+// **パスワードレスの書き込みが失敗したら成功を返さないこと。**
+//
+// 捨てると、利用者が切ったつもりでも DB は真のままで `signin-with-passkey` が
+// 通り続け、しかも直後の publish が要求値を流すので UI は「オフ」を表示する。
+func TestTwoFAPasswordLess_FailureIsNotReportedAsSuccess(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	repo.Profiles["u1"].UsePasswordLessLogin = true
+	repo.UpdateProfileErr = errors.New("db down")
+
+	rec := postExtra(h.TwoFAPasswordLess, `{"value":false}`, user)
+	require.Equal(t, http.StatusInternalServerError, rec.Code,
+		"書き込みに失敗したら 500 を返すこと")
 }

@@ -10,10 +10,12 @@ import (
 	"github.com/shiroha-a/mk/internal/core/signup"
 	"github.com/shiroha-a/mk/internal/misc"
 	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/misc/password"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func newTestService(t *testing.T) (*signup.Service, *testutil.MockUserRepository, *testutil.MockMetaRepository) {
@@ -28,7 +30,7 @@ func newTestService(t *testing.T) (*signup.Service, *testutil.MockUserRepository
 
 func TestSignup_Success(t *testing.T) {
 	svc, userRepo, _ := newTestService(t)
-	result, err := svc.Signup("testuser", "password123", false)
+	result, err := svc.Signup("testuser", "password123", false, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 	assert.Equal(t, "testuser", result.User.Username)
 	assert.NotEmpty(t, result.Token)
@@ -37,13 +39,17 @@ func TestSignup_Success(t *testing.T) {
 
 	// パスワードがハッシュ化されている
 	profile := userRepo.Profiles[result.User.ID]
-	assert.NotNil(t, profile.Password)
-	assert.NotEqual(t, "password123", *profile.Password)
+	require.NotNil(t, profile.Password)
+	assert.True(t, strings.HasPrefix(*profile.Password, "$2"))
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte("password123")))
+	cost, err := bcrypt.Cost([]byte(*profile.Password))
+	require.NoError(t, err)
+	assert.Equal(t, password.Cost(), cost)
 }
 
 func TestSignup_InitialSetup_SetsRootUser(t *testing.T) {
 	svc, _, metaRepo := newTestService(t)
-	result, err := svc.Signup("admin", "pass", true)
+	result, err := svc.Signup("admin", "pass", true, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 
 	// rootUserId が設定される
@@ -53,7 +59,7 @@ func TestSignup_InitialSetup_SetsRootUser(t *testing.T) {
 
 func TestSignup_NotInitialSetup_DoesNotSetRootUser(t *testing.T) {
 	svc, _, metaRepo := newTestService(t)
-	_, err := svc.Signup("user1", "pass", false)
+	_, err := svc.Signup("user1", "pass", false, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 	assert.Nil(t, metaRepo.Meta.RootUserID)
 }
@@ -66,13 +72,13 @@ func TestSignup_DuplicateUsername(t *testing.T) {
 		UsernameLower: "taken",
 	}
 
-	_, err := svc.Signup("taken", "pass", false)
+	_, err := svc.Signup("taken", "pass", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrUsernameAlreadyExists)
 }
 
 func TestSignup_EmptyUsername(t *testing.T) {
 	svc, _, _ := newTestService(t)
-	_, err := svc.Signup("", "pass", false)
+	_, err := svc.Signup("", "pass", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrInvalidUsername)
 }
 
@@ -82,7 +88,7 @@ func TestSignup_TooLongUsername(t *testing.T) {
 	for i := range long {
 		long[i] = 'a'
 	}
-	_, err := svc.Signup(string(long), "pass", false)
+	_, err := svc.Signup(string(long), "pass", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrInvalidUsername)
 }
 
@@ -103,7 +109,7 @@ func TestSignup_UsernameLengthBoundary(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			svc, _, _ := newTestService(t)
 			username := strings.Repeat("a", tc.length)
-			_, err := svc.Signup(username, "pass", false)
+			_, err := svc.Signup(username, "pass", false, signup.UsernamePolicyPublic)
 			if tc.wantErr == nil {
 				require.NoError(t, err)
 			} else {
@@ -128,7 +134,7 @@ func TestSignup_UsernameIllegalCharsRejected(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			svc, _, _ := newTestService(t)
-			_, err := svc.Signup(tc.username, "pass", false)
+			_, err := svc.Signup(tc.username, "pass", false, signup.UsernamePolicyPublic)
 			assert.ErrorIs(t, err, signup.ErrInvalidUsername)
 		})
 	}
@@ -139,11 +145,11 @@ func TestSignup_PreservedUsernameRejected(t *testing.T) {
 	// meta.preservedUsernames に "admin" が入っている想定。
 	metaRepo.Meta.PreservedUsernames = []string{"admin", "root", "System"}
 
-	_, err := svc.Signup("admin", "pass", false)
+	_, err := svc.Signup("admin", "pass", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrUsernameReserved)
 
 	// case-insensitive (slot "System" を大文字で登録、小文字で試行)
-	_, err = svc.Signup("SYSTEM", "pass", false)
+	_, err = svc.Signup("SYSTEM", "pass", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrUsernameReserved)
 }
 
@@ -153,7 +159,7 @@ func TestSignup_PreservedUsernameBypassedOnInitialSetup(t *testing.T) {
 	svc, _, metaRepo := newTestService(t)
 	metaRepo.Meta.PreservedUsernames = []string{"admin"}
 
-	result, err := svc.Signup("admin", "pass", true)
+	result, err := svc.Signup("admin", "pass", true, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 	assert.NotNil(t, result)
 }
@@ -162,7 +168,7 @@ func TestSignup_PreservedUsernameAllowsOthers(t *testing.T) {
 	svc, _, metaRepo := newTestService(t)
 	metaRepo.Meta.PreservedUsernames = []string{"admin"}
 
-	result, err := svc.Signup("alice", "pass", false)
+	result, err := svc.Signup("alice", "pass", false, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 	assert.Equal(t, "alice", result.User.Username)
 }
@@ -187,7 +193,7 @@ func TestSignup_UserCreateError(t *testing.T) {
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := signup.NewService(repo, metaRepo, idGen)
-	_, err := svc.Signup("user1", "pass", false)
+	_, err := svc.Signup("user1", "pass", false, signup.UsernamePolicyPublic)
 	assert.Error(t, err)
 }
 
@@ -197,7 +203,7 @@ func TestSignup_ProfileCreateError(t *testing.T) {
 	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, _ := id.NewGenerator("aidx")
 	svc := signup.NewService(repo, metaRepo, idGen)
-	_, err := svc.Signup("user1", "pass", false)
+	_, err := svc.Signup("user1", "pass", false, signup.UsernamePolicyPublic)
 	assert.Error(t, err)
 }
 
@@ -216,7 +222,7 @@ func TestSignup_PasswordLengthBoundary(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			svc, _, _ := newTestService(t)
 			pw := strings.Repeat("a", tc.length)
-			_, err := svc.Signup("user1", pw, false)
+			_, err := svc.Signup("user1", pw, false, signup.UsernamePolicyPublic)
 			if tc.want == nil {
 				require.NoError(t, err)
 			} else {
@@ -238,7 +244,7 @@ func TestSignup_TokenShape(t *testing.T) {
 	seen := map[string]bool{}
 	sawNonHex := false
 	for range 40 {
-		result, err := svc.Signup("user"+strconv.Itoa(len(seen)), "pass", false)
+		result, err := svc.Signup("user"+strconv.Itoa(len(seen)), "pass", false, signup.UsernamePolicyPublic)
 		require.NoError(t, err)
 		assert.Len(t, result.Token, misc.NativeTokenLength)
 		assert.Regexp(t, `^[0-9a-zA-Z]{16}$`, result.Token)
@@ -258,7 +264,7 @@ func TestSignup_WithKeypairRepo(t *testing.T) {
 	keypairRepo := testutil.NewMockUserKeypairRepository()
 	svc.SetKeypairRepo(keypairRepo)
 
-	result, err := svc.Signup("alice", "pass", false)
+	result, err := svc.Signup("alice", "pass", false, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 
 	// Keypair created for the new user.
@@ -280,7 +286,7 @@ func TestSignup_KeypairCreateError(t *testing.T) {
 	svc, _, _ := newTestService(t)
 	svc.SetKeypairRepo(&failingCreateKeypairRepo{})
 
-	_, err := svc.Signup("alice", "pass", false)
+	_, err := svc.Signup("alice", "pass", false, signup.UsernamePolicyPublic)
 	assert.Error(t, err)
 }
 
@@ -291,7 +297,7 @@ func TestSignup_WithKeypairExtraRepo(t *testing.T) {
 	svc.SetKeypairRepo(keypairRepo)
 	svc.SetKeypairExtraRepo(keypairExtraRepo)
 
-	result, err := svc.Signup("alice", "pass", false)
+	result, err := svc.Signup("alice", "pass", false, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 
 	// Ed25519 鍵が併発行されている
@@ -322,7 +328,7 @@ func TestSignup_KeypairExtraUpsertError(t *testing.T) {
 	svc.SetKeypairRepo(testutil.NewMockUserKeypairRepository())
 	svc.SetKeypairExtraRepo(&failingUpsertKeypairExtraRepo{})
 
-	_, err := svc.Signup("alice", "pass", false)
+	_, err := svc.Signup("alice", "pass", false, signup.UsernamePolicyPublic)
 	assert.Error(t, err)
 }
 
@@ -352,7 +358,11 @@ func TestCreatePending_Success(t *testing.T) {
 	assert.Equal(t, "alice@example.com", row.Email)
 	assert.NotEmpty(t, row.Code)
 	// Password は bcrypt hash 済 (再 hash 防止)。
-	assert.NotEqual(t, "secret123", row.Password)
+	assert.True(t, strings.HasPrefix(row.Password, "$2"))
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(row.Password), []byte("secret123")))
+	cost, err := bcrypt.Cost([]byte(row.Password))
+	require.NoError(t, err)
+	assert.Equal(t, password.Cost(), cost)
 	assert.Len(t, pendingRepo.Rows, 1)
 }
 
@@ -410,6 +420,67 @@ func TestPromotePending_Success(t *testing.T) {
 	assert.Equal(t, row.Password, *prof.Password)
 }
 
+// 承認制が有効なら、申請に紐付かない pending は昇格させない (#2804)。
+//
+// **`PendingSignupTTL` は 30 分。** 承認制へ切り替える直前 30 分に発行された確認
+// メールは、申請 ID を持たないので #2576 の確定処理を通らず、ゲートが無いと承認を
+// 経ずにアカウントになる。
+func TestPromotePending_ApprovalRequiredRejectsUnappliedPending(t *testing.T) {
+	svc, userRepo, metaRepo := newTestService(t)
+	pendingRepo := testutil.NewMockUserPendingRepository()
+	svc.SetUserPendingRepo(pendingRepo)
+
+	// 切り替え前に発行された確認メールを再現する (承認制 OFF のうちに作る)。
+	row, err := svc.CreatePending("late", "late@example.com", "pw123", nil)
+	require.NoError(t, err)
+
+	metaRepo.Meta.ApprovalRequiredForSignup = true
+
+	_, err = svc.PromotePending(row.Code)
+	require.ErrorIs(t, err, signup.ErrApplicationNotApproved)
+	assert.Empty(t, userRepo.Users, "アカウントを作らない")
+	// pending は残す。承認制を戻した運用者が状況を追えるようにする。
+	assert.Len(t, pendingRepo.Rows, 1)
+}
+
+// 承認制が有効でも、申請に紐付く pending は従来どおり通る (#2804)。
+func TestPromotePending_ApprovalRequiredAllowsAppliedPending(t *testing.T) {
+	svc, userRepo, metaRepo := newTestService(t)
+	pendingRepo := testutil.NewMockUserPendingRepository()
+	svc.SetUserPendingRepo(pendingRepo)
+	metaRepo.Meta.ApprovalRequiredForSignup = true
+
+	appID := "app1"
+	row, err := svc.CreatePendingForApplication("applied", "a@example.com", "pw123", nil, &appID)
+	require.NoError(t, err)
+
+	result, err := svc.PromotePending(row.Code)
+	require.NoError(t, err)
+	assert.Equal(t, "applied", result.User.Username)
+	assert.Len(t, userRepo.Users, 1)
+}
+
+// meta が読めないときは通さない (#2804)。
+//
+// **DB 障害を承認の迂回路にしない。** ただし ErrApplicationNotApproved にも
+// 丸めない — 障害をドメインの答えに化けさせると、運用側からは「承認されていない」
+// としか見えなくなる (#2799 と同じ)。
+func TestPromotePending_ApprovalGateFailsClosedWhenMetaUnavailable(t *testing.T) {
+	svc, userRepo, metaRepo := newTestService(t)
+	pendingRepo := testutil.NewMockUserPendingRepository()
+	svc.SetUserPendingRepo(pendingRepo)
+
+	row, err := svc.CreatePending("nometa", "n@example.com", "pw123", nil)
+	require.NoError(t, err)
+
+	metaRepo.Meta = nil // Fetch が error を返す
+
+	_, err = svc.PromotePending(row.Code)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, signup.ErrApplicationNotApproved)
+	assert.Empty(t, userRepo.Users, "アカウントを作らない")
+}
+
 func TestPromotePending_NotFound(t *testing.T) {
 	svc, _, _ := newTestService(t)
 	pendingRepo := testutil.NewMockUserPendingRepository()
@@ -435,9 +506,8 @@ func TestPromotePending_UsernameClash(t *testing.T) {
 }
 
 func TestPromotePending_Expired(t *testing.T) {
-	// PendingSignupTTL = 24h と十分長く、ParseTime も成功するため通常 path で
-	// expired を再現するのは難しい。Create 後に row.ID を 24h+ 前の ULID に
-	// 書き換えて expired path を踏ませる。
+	// ParseTime が成功する形で expired を再現したいので、Create 後に row.ID を
+	// `PendingSignupTTL` より前の ULID に書き換える。
 	svc, _, _ := newTestService(t)
 	pendingRepo := testutil.NewMockUserPendingRepository()
 	svc.SetUserPendingRepo(pendingRepo)
@@ -445,9 +515,9 @@ func TestPromotePending_Expired(t *testing.T) {
 	row, err := svc.CreatePending("expuser", "exp@example.com", "pw", nil)
 	require.NoError(t, err)
 
-	// ULID を 25h 前の時刻で再生成 (idGen は newTestService で aidx 固定)。
+	// ULID を TTL より前の時刻で再生成 (idGen は newTestService で aidx 固定)。
 	idGen, _ := id.NewGenerator("aidx")
-	old := idGen.Generate(time.Now().Add(-25 * time.Hour))
+	old := idGen.Generate(time.Now().Add(-signup.PendingSignupTTL - time.Minute))
 	delete(pendingRepo.Rows, row.ID)
 	row.ID = old
 	pendingRepo.Rows[old] = row
@@ -574,16 +644,16 @@ func TestSignup_UsedUsername(t *testing.T) {
 	usedRepo.Usernames["taken"] = true
 	svc.SetUsedUsernameRepo(usedRepo)
 
-	_, err := svc.Signup("taken", "password123", false)
+	_, err := svc.Signup("taken", "password123", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrUsernameUsed)
 
 	// 大文字違いも lowercase 照合で弾く。
-	_, err = svc.Signup("TAKEN", "password123", false)
+	_, err = svc.Signup("TAKEN", "password123", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrUsernameUsed)
 
 	// repo 未配線なら skip (後方互換) — 別 svc で確認。
 	svc2, _, _ := newTestService(t)
-	_, err = svc2.Signup("taken", "password123", false)
+	_, err = svc2.Signup("taken", "password123", false, signup.UsernamePolicyPublic)
 	assert.NoError(t, err, "repo 未配線時は used_usernames を見ない")
 }
 
@@ -594,7 +664,7 @@ func TestSignup_RecordsUsedUsername(t *testing.T) {
 	usedRepo := testutil.NewMockUsedUsernameRepository()
 	svc.SetUsedUsernameRepo(usedRepo)
 
-	_, err := svc.Signup("NewUser", "password123", false)
+	_, err := svc.Signup("NewUser", "password123", false, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 
 	exists, err := usedRepo.Exists("newuser")
@@ -612,7 +682,7 @@ func (errUsedUsernameRepo) Exists(string) (bool, error) { return false, nil }
 func TestSignup_UsedUsernameCreateErrorIsBestEffort(t *testing.T) {
 	svc, _, _ := newTestService(t)
 	svc.SetUsedUsernameRepo(errUsedUsernameRepo{})
-	result, err := svc.Signup("besteffort", "password123", false)
+	result, err := svc.Signup("besteffort", "password123", false, signup.UsernamePolicyPublic)
 	require.NoError(t, err, "used_username 記録失敗でも signup は成功する")
 	require.NotNil(t, result)
 }
@@ -639,7 +709,7 @@ func TestPromotePending_NoTxRecordsUsedUsername(t *testing.T) {
 func TestSignup_ProhibitedUsername(t *testing.T) {
 	svc, _, metaRepo := newTestService(t)
 	metaRepo.Meta.ProhibitedWordsForNameOfUser = []string{"badname"}
-	_, err := svc.Signup("badname123", "pass", false)
+	_, err := svc.Signup("badname123", "pass", false, signup.UsernamePolicyPublic)
 	assert.ErrorIs(t, err, signup.ErrUsernameUsed)
 }
 
@@ -648,7 +718,7 @@ func TestSignup_ProhibitedUsername(t *testing.T) {
 func TestSignup_ProhibitedUsernameAllowedOnInitialSetup(t *testing.T) {
 	svc, _, metaRepo := newTestService(t)
 	metaRepo.Meta.ProhibitedWordsForNameOfUser = []string{"badname"}
-	result, err := svc.Signup("badname123", "pass", true)
+	result, err := svc.Signup("badname123", "pass", true, signup.UsernamePolicyPublic)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 }
@@ -661,4 +731,14 @@ func TestCreatePending_ProhibitedUsername(t *testing.T) {
 	metaRepo.Meta.ProhibitedWordsForNameOfUser = []string{"badname"}
 	_, err := svc.CreatePending("badname123", "x@example.com", "pass", nil)
 	assert.ErrorIs(t, err, signup.ErrUsernameUsed)
+}
+
+// **`PendingSignupTTL` は upstream と同じ 30 分 (#3037)。**
+//
+// `SignupApiService.ts:254` が `idService.parse(pendingUser.id).date + 30 分` を
+// 過ぎた pending を弾く。mk-go は 24h (48 倍) で、しかも doc コメントが
+// 「Misskey TS 実装では明示的な TTL は無い」と**事実と逆のこと**を書いて
+// いたので、広げている自覚がどこにも残っていなかった。
+func TestPendingSignupTTL_MatchesUpstream(t *testing.T) {
+	assert.Equal(t, 30*time.Minute, signup.PendingSignupTTL)
 }

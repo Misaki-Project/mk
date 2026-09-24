@@ -85,6 +85,13 @@ type Handler struct {
 	// myNoteFavorited1 を付与するのに使う (#1762)。未配線時は付与しない。
 	achievementGranter AchievementGranter
 	bufReader          entity.BufferedReactionsReader
+	// ugcVisibilityFn controls what unauthenticated visitors can see.
+	//
+	// **毎回読む。** 起動時に文字列を焼き込むと、運営者が管理画面で締めても
+	// プロセスを再起動するまで反映されない。`/api/meta` と管理画面は新しい値を
+	// 返し、robots.txt と SSR も毎回 meta を読むので「ブラウザで見ると効いて
+	// いる」ように見えるのに、API は匿名に本文を返し続ける。
+	ugcVisibilityFn func() string
 	// ugcVisibility controls what unauthenticated visitors can see.
 	// "all" (default), "local", "none"
 	ugcVisibility string
@@ -139,13 +146,9 @@ func (h *Handler) EnableTimelineJSONCache(ttl time.Duration) {
 
 // ScheduledNoteEnqueuer abstracts the delayed enqueue path used by
 // drafts/create. Implemented by *queue.Client (= EnqueuePostScheduledNote)。
-// SupportsScheduledNote returns whether the underlying driver provides
-// reliable schedule cancel (= mkq yes, asynq no) so handler can degrade
-// to "feature disabled" on asynq (#1045 Phase 2-C)。
 type ScheduledNoteEnqueuer interface {
 	EnqueuePostScheduledNote(payload queue.PostScheduledNotePayload, opts ...driver.EnqueueOption) error
 	ClearScheduledNote(draftID string) error
-	SupportsScheduledNote() bool
 }
 
 // SetScheduledNoteEnqueuer wires a delayed queue client used by drafts/create
@@ -214,8 +217,24 @@ func (h *Handler) SetTranslator(t *translate.DeepLClient) {
 }
 
 // SetUGCVisibility sets the visitor content visibility policy from meta.
+//
+// Deprecated: 固定値を焼き込む形。`SetUGCVisibilityLookup` を使うこと。
+// テストの利便のために残してある。
 func (h *Handler) SetUGCVisibility(v string) {
 	h.ugcVisibility = v
+}
+
+// SetUGCVisibilityLookup wires a live lookup of the policy.
+func (h *Handler) SetUGCVisibilityLookup(fn func() string) {
+	h.ugcVisibilityFn = fn
+}
+
+// ugcVisibilityNow resolves the current policy.
+func (h *Handler) ugcVisibilityNow() string {
+	if h.ugcVisibilityFn != nil {
+		return h.ugcVisibilityFn()
+	}
+	return h.ugcVisibility
 }
 
 // SetDriveFileRepo attaches a DriveFileRepository for file resolution.
@@ -583,7 +602,7 @@ func (h *Handler) Show(c echo.Context) error {
 		if n.User != nil && n.User.RequireSigninToViewContents {
 			return c.JSON(http.StatusBadRequest, apierr.Error("CONTENT_RESTRICTED_BY_USER", "This content is not available because the author requires sign-in to view it.", "fbcc002d-37d9-4944-a6b0-d9e29f2d33ab"))
 		}
-		if h.ugcVisibility == "none" || (h.ugcVisibility == "local" && n.UserHost != nil) {
+		if v := h.ugcVisibilityNow(); v == "none" || (v == "local" && n.UserHost != nil) {
 			return c.JSON(http.StatusBadRequest, apierr.Error("CONTENT_RESTRICTED_BY_SERVER", "This content is not available for visitors on this server.", "145f88d2-b03d-4087-8143-a78928883c4b"))
 		}
 	}
@@ -673,7 +692,12 @@ func (r *listRequest) normalize() bool {
 	r.Limit = &limit
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。serveList から
 	// 呼ばれて Renotes / Replies / Children の 3 handler で一括適用される。
-	r.SinceID, r.UntilID = id.NormalizeCursor(r.SinceID, r.UntilID, r.SinceDate, r.UntilDate)
+	// **列に入らないカーソルもここで ok=false にする (#3025)。**
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(r.SinceID, r.UntilID, r.SinceDate, r.UntilDate)
+	if !cursorOK {
+		return false
+	}
+	r.SinceID, r.UntilID = cursorSince, cursorUntil
 	return true
 }
 
@@ -836,7 +860,10 @@ func (h *Handler) Search(c echo.Context) error {
 	}
 
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 
 	viewer := middleware.GetUser(c)
 
@@ -906,7 +933,11 @@ func (h *Handler) State(c echo.Context) error {
 	viewer := middleware.GetUser(c)
 	st, err := h.queryService.State(viewer, req.NoteID)
 	if err != nil {
-		// 現状QueryService.StateはErrNoteNotFound以外を返さない
+		// **DB 障害を not-found に丸めない** (#2799)。`State` は #2799 で
+		// raw DB error も返すようになったので、sentinel かどうかで分ける。
+		if !errors.Is(err, note.ErrNoteNotFound) {
+			return apierr.JSONInternalError(c)
+		}
 		return apierr.JSONNoSuchNote(c)
 	}
 	return c.JSON(http.StatusOK, st)
@@ -936,7 +967,11 @@ func (h *Handler) Conversation(c echo.Context) error {
 	viewer := middleware.GetUser(c)
 	notes, err := h.queryService.Conversation(viewer, req.NoteID, limit, req.Offset)
 	if err != nil {
-		// 現状QueryService.ConversationはErrNoteNotFound以外を返さない
+		// **DB 障害を not-found に丸めない** (#2799)。`Conversation` は #2799 で
+		// raw DB error も返すようになったので、sentinel かどうかで分ける。
+		if !errors.Is(err, note.ErrNoteNotFound) {
+			return apierr.JSONInternalError(c)
+		}
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "e1035875-9551-45ec-afa8-1ded1fcb53c8"))
 	}
 	// Conversation は非可視な祖先も raw に返すので、ここで CanSee 判定して
@@ -1008,7 +1043,10 @@ func (h *Handler) BulkShow(c echo.Context) error {
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	notes, err := h.noteRepo.ListPublicNotes(model.PublicNotesFilter{
 		Local:     req.Local,
 		Reply:     req.Reply,
@@ -1197,4 +1235,4 @@ func (h *Handler) HasUserFollowingRepo() bool { return h.userFollowingRepo != ni
 //
 // **空文字は gate 無効**と同義 (`"none"` でも `"local"` でもないので素通し)。
 // 列は `NOT NULL DEFAULT 'local'` なので、空になるのは配線が漏れたときだけ。
-func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibility != "" }
+func (h *Handler) HasUGCVisibility() bool { return h.ugcVisibilityNow() != "" }

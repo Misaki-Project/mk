@@ -23,7 +23,7 @@ func (j jobQueueRedisInfo) QueueRedisInfo(ctx context.Context) (string, error) {
 // queueStatsInspectorAdapter adapts queue.Inspector to the minimal
 // stream.QueueInspector interface needed by QueueStatsPublisher. Keeping this
 // adapter in internal/server prevents internal/stream from importing
-// internal/queue (which would create a circular dep via asynq types).
+// internal/queue (which would create a circular dep via the driver types).
 type queueStatsInspectorAdapter struct {
 	inner *queue.Inspector
 }
@@ -117,6 +117,11 @@ func (a *queueInspectorAdapter) ListFailedTasks(qname string, page, pageSize int
 
 func (a *queueInspectorAdapter) ListRetryTasks(qname string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
 	rows, err := a.inner.ListRetryTasks(qname, page, pageSize)
+	return taskSummariesToAdmin(rows), err
+}
+
+func (a *queueInspectorAdapter) ListDelayedTasks(qname string, page, pageSize int) ([]*apiadmin.QueueTaskSummary, error) {
+	rows, err := a.inner.ListDelayedTasks(qname, page, pageSize)
 	return taskSummariesToAdmin(rows), err
 }
 

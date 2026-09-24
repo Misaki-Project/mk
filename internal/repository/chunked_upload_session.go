@@ -1,7 +1,6 @@
 package repository
 
 import (
-	"errors"
 	"time"
 
 	"github.com/shiroha-a/mk/internal/model"
@@ -61,6 +60,9 @@ func (r *chunkedUploadSessionRepository) Create(s *model.ChunkedUploadSession) e
 }
 
 func (r *chunkedUploadSessionRepository) FindByID(id string) (*model.ChunkedUploadSession, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var s model.ChunkedUploadSession
 	if err := r.db.Where(`"id" = ?`, id).First(&s).Error; err != nil {
 		return nil, err
@@ -146,10 +148,4 @@ func (r *chunkedUploadSessionRepository) ListExpired(now time.Time, limit int) (
 		Limit(limit).
 		Find(&out).Error
 	return out, err
-}
-
-// IsChunkedUploadSessionNotFound reports whether err means the session row was
-// absent. Callers map this to NO_SUCH_UPLOAD_SESSION.
-func IsChunkedUploadSessionNotFound(err error) bool {
-	return errors.Is(err, gorm.ErrRecordNotFound)
 }

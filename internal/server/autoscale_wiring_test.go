@@ -33,9 +33,9 @@ type scriptableDriver struct {
 	insp *scriptableInspector
 
 	// 呼び出し経路の検証用。autoscaler は集計 API (GetQueueInfo) ではなく
-	// PendingCount を使うべき (#2605)。
-	queueInfoCalls    atomic.Int64
-	pendingCountCalls atomic.Int64
+	// DispatchableCount を使うべき (#2605)。
+	queueInfoCalls         atomic.Int64
+	dispatchableCountCalls atomic.Int64
 	// resizeCeiling caps what Resize actually applies (0 = uncapped).
 	resizeCeiling int
 }
@@ -102,14 +102,14 @@ func (i *scriptableInspector) GetQueueInfo(qname string) (*driver.InspectorInfo,
 	return &driver.InspectorInfo{Queue: qname, Pending: i.parent.pending[qname]}, nil
 }
 
-// PendingCount serves the same scripted depth as GetQueueInfo. **同じ値を
+// DispatchableCount serves the same scripted depth as GetQueueInfo. **同じ値を
 // 返させる。** autoscaler が読む経路はこちらに変わったので、ここがずれると
 // 制御ループのテストが何も検証しなくなる。
-func (i *scriptableInspector) PendingCount(qname string) (int, error) {
+func (i *scriptableInspector) DispatchableCount(qname string) (int, error) {
 	i.parent.mu.Lock()
 	defer i.parent.mu.Unlock()
 	// 集計 API を経由していないことを見えるようにする。
-	i.parent.pendingCountCalls.Add(1)
+	i.parent.dispatchableCountCalls.Add(1)
 	return i.parent.pending[qname], nil
 }
 
@@ -136,6 +136,9 @@ func (i *scriptableInspector) ListScheduledTasks(qname string, page, pageSize in
 	return nil, nil
 }
 func (i *scriptableInspector) ListRetryTasks(qname string, page, pageSize int) ([]*driver.TaskSummary, error) {
+	return nil, nil
+}
+func (i *scriptableInspector) ListDelayedTasks(qname string, page, pageSize int) ([]*driver.TaskSummary, error) {
 	return nil, nil
 }
 func (i *scriptableInspector) GetTaskInfo(qname, taskID string) (*driver.TaskSummary, error) {
@@ -206,16 +209,27 @@ func TestStartAutoScale_DeliverInboxKnobsOnly_OthersStillManaged(t *testing.T) {
 	assert.Equal(t, ic, d.WorkerCount("inbox"), "inbox should retain explicit knob value")
 }
 
-// TestStartAutoScale_RejectsAsynqDriver verifies that auto-scale + a
-// driver that returns ErrResizeNotSupported → startup error (= asynq).
-func TestStartAutoScale_RejectsAsynqDriver(t *testing.T) {
+// TestStartAutoScale_ResizeNotSupportedDoesNotPreventStart pins that a
+// driver which cannot resize no longer blocks startup (#2985)。
+//
+// 以前は ErrResizeNotSupported だけを起動エラーにしていたが、**その判定は
+// production では一度も発火しない**。mkq driver があれを返すのは
+// `Driver.Server()` を一度も呼んでいないときだけで、`newServer` は構築時に
+// `queue.NewServer(queueDriver)` 経由で呼ぶため (実測)。asynq を消して
+// 「resize できない driver」自体が無くなったので判定ごと外した。
+//
+// **述語を `err != nil` へ広げる形は採れない** — すぐ下の
+// TestStartAutoScale_InitialResizeFailureDoesNotPreventStart が固定している
+// とおり、Redis の瞬断で起動できなくなる。
+func TestStartAutoScale_ResizeNotSupportedDoesNotPreventStart(t *testing.T) {
 	cfg := &config.Config{JobQueueAutoScale: true}
 	d := newScriptableDriver(nil)
 	d.resizeErr = driver.ErrResizeNotSupported
 
-	_, err := startAutoScale(context.Background(), cfg, d, queuemetrics.New(), nil)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, driver.ErrResizeNotSupported)
+	runner, err := startAutoScale(context.Background(), cfg, d, queuemetrics.New(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, runner)
+	t.Cleanup(func() { runner.Stop(context.Background()) })
 }
 
 // TestStartAutoScale_MinWorkersFloorExceedsGlobalCapRejected verifies the
@@ -451,8 +465,8 @@ func TestStartAutoScale_InitialResizeFailureDoesNotPreventStart(t *testing.T) {
 	defer func() { d.resizeErr = nil }()
 
 	runner, err := startAutoScale(context.Background(), cfg, d, queuemetrics.New(), nil)
-	// startup-time validation passes (Resize is called but failure is logged
-	// and tolerated); only ErrResizeNotSupported triggers startup rejection.
+	// startup-time validation passes: Resize failure is logged and tolerated
+	// so a Redis hiccup cannot make the process unbootable.
 	require.NoError(t, err)
 	require.NotNil(t, runner)
 	t.Cleanup(func() { runner.Stop(context.Background()) })
@@ -521,7 +535,7 @@ func TestStartAutoScale_RecordsScaleEventsForAdminUI(t *testing.T) {
 //
 // delayed が federation 障害で数千件に膨らむと GetQueueInfo のコストも
 // それに比例するので、常時経路から外しておく意味は平常時より大きい。
-func TestStartAutoScale_UsesPendingCountNotQueueInfo(t *testing.T) {
+func TestStartAutoScale_UsesDispatchableCountNotQueueInfo(t *testing.T) {
 	cfg := &config.Config{JobQueueAutoScale: true}
 	d := newScriptableDriver(map[string]int{"export": 4})
 
@@ -532,10 +546,10 @@ func TestStartAutoScale_UsesPendingCountNotQueueInfo(t *testing.T) {
 
 	// tick を数回踏ませる。
 	deadline := time.After(5 * time.Second)
-	for d.pendingCountCalls.Load() < 3 {
+	for d.dispatchableCountCalls.Load() < 3 {
 		select {
 		case <-deadline:
-			t.Fatalf("PendingCount が呼ばれていない (%d 回)", d.pendingCountCalls.Load())
+			t.Fatalf("DispatchableCount が呼ばれていない (%d 回)", d.dispatchableCountCalls.Load())
 		case <-time.After(10 * time.Millisecond):
 		}
 	}

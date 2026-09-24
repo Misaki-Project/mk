@@ -8,6 +8,7 @@ import (
 	"path"
 
 	"github.com/shiroha-a/mk/internal/core/drive"
+	"github.com/shiroha-a/mk/internal/core/emojiapplication"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/safehttp"
 )
@@ -17,6 +18,13 @@ import (
 // bytes. Real-world custom emoji rarely exceed a few hundred KB; 8 MiB leaves
 // generous headroom for animated PNG / APNG / WebP.
 const MaxEmojiImageBytes int64 = 8 << 20
+
+// MaxEmojiCopyBytes caps the local drive file duplicated on approval (#2966).
+//
+// **定義は core に 1 つだけ置く (2 周目レビュー M2)。** 申請側 (`checkFile`) と
+// 承認側でこの値が食い違うと、「申請はできたのに承認だけが恒久的に失敗する」
+// サイズ帯が生まれる。別名にして、片方だけ動かせないようにする。
+const MaxEmojiCopyBytes = emojiapplication.MaxEmojiCopyBytes
 
 // DefaultEmojiCopyAccept matches the headers Misskey TS sends when fetching
 // emoji images via DriveService.uploadFromUrl. */* fallback is required since
@@ -105,4 +113,27 @@ func (f *EmojiImageFetcherImpl) FetchAndStore(ctx context.Context, imageURL stri
 		return nil, fmt.Errorf("upload to drive: %w", err)
 	}
 	return df, nil
+}
+
+// CopyToSystemFile implements EmojiImageFetcher (#2966).
+//
+// 承認した絵文字が申請者の drive ファイルに依存し続けるのを断つための複製。
+// 申請者がファイルを消しても、アカウントを消しても、絵文字は生き残る。
+//
+// **実体は `drive.Service` が持つ。** 既存データを直すバッチ (#2990) が
+// `cmd/` から同じ複製を回すので、ここに置いたままだと api 層を import させるか、
+// 同じ処理をもう 1 つ書くことになる。後者は「片方だけ直して気付かない」形。
+func (f *EmojiImageFetcherImpl) CopyToSystemFile(ctx context.Context, src *model.DriveFile, name string, sensitive bool) (*model.DriveFile, error) {
+	if f.driveSvc == nil {
+		return nil, fmt.Errorf("emoji image fetcher not wired")
+	}
+	return f.driveSvc.CopyToSystemFile(ctx, src, name, sensitive, MaxEmojiCopyBytes)
+}
+
+// DeleteSystemFile implements EmojiImageFetcher (#2966).
+func (f *EmojiImageFetcherImpl) DeleteSystemFile(_ context.Context, fileID string) error {
+	if f.driveSvc == nil {
+		return fmt.Errorf("emoji image fetcher not wired")
+	}
+	return f.driveSvc.DeleteSystemFile(fileID)
 }

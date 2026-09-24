@@ -2,6 +2,7 @@ package resetpassword
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,8 +13,11 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/misc"
 	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/misc/password"
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
+	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
@@ -121,7 +125,20 @@ func (m *mockUserRepo) UpdateProfile(userID string, fields map[string]any) error
 	return nil
 }
 
-var errMock = assert.AnError
+func (m *mockUserRepo) RemoveBackupCode(_, _ string) error { return nil }
+
+func (m *mockUserRepo) UpdatePasswordIfCurrent(userID, currentHash, newHash string) (bool, error) {
+	p, ok := m.profiles[userID]
+	if !ok || p.Password == nil || *p.Password != currentHash {
+		return false, nil
+	}
+	p.Password = &newHash
+	return true, nil
+}
+
+// **not-found を模す。** 汎用 error だと #2792 の「DB 障害は 500」に引っかかる。
+// repository は GORM の error をそのまま返すので、テストもそれに揃える。
+var errMock = repository.ErrNotFound
 
 type mockResetRepo struct {
 	requests map[string]*model.PasswordResetRequest
@@ -208,6 +225,64 @@ func TestRequestReset_Success(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestRequestReset_SendsJapaneseEmailFromMetaLangsWhenProfileLangUnset(t *testing.T) {
+	h, userRepo, resetRepo := newTestHandler()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x", Langs: []string{"ja-JP"}}
+	h.SetMetaRepo(metaRepo)
+
+	email := "test@example.com"
+	userRepo.users["u1"] = &model.User{ID: "u1", Username: "testuser", UsernameLower: "testuser"}
+	userRepo.profiles["u1"] = &model.UserProfile{UserID: "u1", Email: &email, EmailVerified: true}
+
+	var mu sync.Mutex
+	var sent miscsmtp.Message
+	h.SetEmailSender(func(_ string, msg miscsmtp.Message) {
+		mu.Lock()
+		defer mu.Unlock()
+		sent = msg
+	})
+
+	rec := post(h.RequestReset, `{"username":"testuser","email":"test@example.com"}`)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Len(t, resetRepo.requests, 1)
+
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	assert.Equal(t, "パスワードのリセット", sent.Subject)
+	mu.Unlock()
+}
+
+func TestRequestReset_SendsJapaneseEmailWhenProfileLangIsJa(t *testing.T) {
+	h, userRepo, resetRepo := newTestHandler()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x", Langs: []string{"en-US", "ja-JP"}}
+	h.SetMetaRepo(metaRepo)
+
+	email := "test@example.com"
+	ja := "ja-JP"
+	userRepo.users["u1"] = &model.User{ID: "u1", Username: "testuser", UsernameLower: "testuser"}
+	userRepo.profiles["u1"] = &model.UserProfile{UserID: "u1", Email: &email, EmailVerified: true, Lang: &ja}
+
+	var mu sync.Mutex
+	var sent miscsmtp.Message
+	h.SetEmailSender(func(_ string, msg miscsmtp.Message) {
+		mu.Lock()
+		defer mu.Unlock()
+		sent = msg
+	})
+
+	rec := post(h.RequestReset, `{"username":"testuser","email":"test@example.com"}`)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Len(t, resetRepo.requests, 1)
+
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	assert.Equal(t, "パスワードのリセット", sent.Subject)
+	assert.Contains(t, sent.Text, "パスワードをリセット")
+	mu.Unlock()
+}
+
 func TestRequestReset_UserNotFound(t *testing.T) {
 	h, _, resetRepo := newTestHandler()
 
@@ -282,7 +357,11 @@ func TestReset_Success(t *testing.T) {
 
 	// パスワードが更新されている
 	newPw := *userRepo.profiles["u1"].Password
+	assert.True(t, strings.HasPrefix(newPw, "$2"))
 	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(newPw), []byte("newpassword")))
+	cost, err := bcrypt.Cost([]byte(newPw))
+	require.NoError(t, err)
+	assert.Equal(t, password.Cost(), cost)
 
 	// トークンが削除されている
 	assert.Len(t, resetRepo.requests, 0)
@@ -347,3 +426,30 @@ func (m *mockUserRepo) HardDeleteUser(string) error { return nil }
 
 // DeleteOrphanRemoteUsers implements repository.UserRepository (#2340).
 func (m *mockUserRepo) DeleteOrphanRemoteUsers(_, _ int) (int64, error) { return 0, nil }
+
+// failingResetRepo makes every token lookup look like a database failure.
+type failingResetRepo struct {
+	*mockResetRepo
+	err error
+}
+
+func (r *failingResetRepo) FindByToken(string) (*model.PasswordResetRequest, error) {
+	return nil, r.err
+}
+
+// **DB 障害を「そんなトークンは無い」にしない** (#2792)。
+//
+// パスワードリセットは利用者がアカウントを取り戻す最後の経路なので、障害を
+// 400 で返すと「リンクが切れた」と判断して問い合わせが来る。
+func TestReset_DBFailureIsNot4xx(t *testing.T) {
+	idGen, _ := id.NewGenerator("aidx")
+	h := NewHandler(newMockUserRepo(), &failingResetRepo{
+		mockResetRepo: newMockResetRepo(),
+		err:           errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"),
+	}, idGen)
+
+	rec := post(h.Reset, `{"token":"t","password":"newpassword"}`)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func (m *mockUserRepo) EmailVerifiedInUse(string) (bool, error) { return false, nil }

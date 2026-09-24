@@ -82,10 +82,10 @@ func (p *WebhookProcessor) HandleSystem(ctx context.Context, t driver.Task) erro
 func (p *WebhookProcessor) handle(ctx context.Context, t driver.Task, user bool) error {
 	payload, err := queue.DecodeWebhookPayload(t.Payload())
 	if err != nil {
-		return fmt.Errorf("decode webhook payload: %w: %w", err, driver.SkipRetry)
+		return fmt.Errorf("decode webhook payload: %w: %w", err, driver.ErrSkipRetry)
 	}
 	if payload.WebhookID == "" {
-		return fmt.Errorf("webhook payload missing webhookId: %w", driver.SkipRetry)
+		return fmt.Errorf("webhook payload missing webhookId: %w", driver.ErrSkipRetry)
 	}
 
 	// i/webhooks/test の override (#1546): 非空なら保存済 webhook を引かず指定の
@@ -96,13 +96,22 @@ func (p *WebhookProcessor) handle(ctx context.Context, t driver.Task, user bool)
 		var err error
 		url, secret, err = p.resolveTarget(payload.WebhookID, user)
 		if err != nil {
-			return fmt.Errorf("resolve webhook %s: %w: %w", payload.WebhookID, err, driver.SkipRetry)
+			// **not-found と DB 障害を分ける (#2792)。** 種別を見ずに
+			// `ErrSkipRetry` へ潰すと、DB が詰まった瞬間に配送待ちだった webhook が
+			// **1 回で恒久 failed** になる (本来は 4 回 + backoff)。
+			// 同じディレクトリの `deliver_keysource.go` /
+			// `post_scheduled_note.go` は `repository.IsNotFound` で分けている。
+			// 配線の問題 (repo 未設定) も恒久エラー。retry しても直らない。
+			if repository.IsNotFound(err) || errors.Is(err, errWebhookConfig) {
+				return fmt.Errorf("resolve webhook %s: %w: %w", payload.WebhookID, err, driver.ErrSkipRetry)
+			}
+			return fmt.Errorf("resolve webhook %s: %w", payload.WebhookID, err)
 		}
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload.Body))
 	if err != nil {
-		return fmt.Errorf("build webhook request: %w: %w", err, driver.SkipRetry)
+		return fmt.Errorf("build webhook request: %w: %w", err, driver.ErrSkipRetry)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", p.userAgent)
@@ -146,16 +155,20 @@ func (p *WebhookProcessor) handle(ctx context.Context, t driver.Task, user bool)
 		return nil
 	case resp.StatusCode == http.StatusTooManyRequests:
 		// #2106 N30: 429 は 4xx だが upstream status-error.ts では retryable。
-		// rate-limited な webhook 先には backoff 付きで再試行する (SkipRetry を付けない)。
+		// rate-limited な webhook 先には backoff 付きで再試行する (ErrSkipRetry を付けない)。
 		return errors.New("webhook rate limited: " + resp.Status)
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		// 4xx は受信側の不正リクエスト扱いでリトライしない。
-		return fmt.Errorf("webhook client error (%d): %w", resp.StatusCode, driver.SkipRetry)
+		return fmt.Errorf("webhook client error (%d): %w", resp.StatusCode, driver.ErrSkipRetry)
 	default:
 		// 5xx 等は一時的障害としてリトライ。
 		return errors.New("webhook server error: " + resp.Status)
 	}
 }
+
+// errWebhookConfig marks a wiring problem (repository not configured), which
+// retrying cannot fix.
+var errWebhookConfig = errors.New("webhook processor is not configured")
 
 // resolveTarget looks up a webhook row's URL and secret. For user webhooks it
 // queries the WebhookRepository; for system webhooks it uses the
@@ -163,7 +176,7 @@ func (p *WebhookProcessor) handle(ctx context.Context, t driver.Task, user bool)
 func (p *WebhookProcessor) resolveTarget(id string, user bool) (url, secret string, err error) {
 	if user {
 		if p.userRepo == nil {
-			return "", "", errors.New("user webhook repo not configured")
+			return "", "", fmt.Errorf("user webhook repo not configured: %w", errWebhookConfig)
 		}
 		h, err := p.userRepo.FindByID(id)
 		if err != nil {
@@ -172,7 +185,7 @@ func (p *WebhookProcessor) resolveTarget(id string, user bool) (url, secret stri
 		return h.URL, h.Secret, nil
 	}
 	if p.systemRepo == nil {
-		return "", "", errors.New("system webhook repo not configured")
+		return "", "", fmt.Errorf("system webhook repo not configured: %w", errWebhookConfig)
 	}
 	h, err := p.systemRepo.FindByID(id)
 	if err != nil {

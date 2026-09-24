@@ -307,6 +307,58 @@ func TestMarkAllAsRead_OK(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+// POST /api/notifications/mark-all-as-read は明示的な既読操作なので、読み取り
+// 位置が動かなくても readAllNotifications を再送する (#2831)。バッジのカウンタは
+// クライアント側にしか無く、イベントを取りこぼした状態からの復帰手段はこれだけ。
+func TestMarkAllAsRead_ForcesRepublishWhenAlreadyRead(t *testing.T) {
+	h, svc := newTestHandler(t)
+	_, err := svc.Create(context.Background(), notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	// Create 由来の unreadNotification を拾わないよう、通知を作ってから wire する。
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	// 1 回目で read marker が最新まで進む。
+	c, _ := newJSONRequest(t, "/api/notifications/mark-all-as-read", `{}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.MarkAllAsRead(c))
+	require.Len(t, pub.types("alice"), 1)
+
+	c2, rec2 := newJSONRequest(t, "/api/notifications/mark-all-as-read", `{}`)
+	setAuth(c2, &model.User{ID: "alice"})
+	require.NoError(t, h.MarkAllAsRead(c2))
+	assert.Equal(t, http.StatusNoContent, rec2.Code)
+	assert.Equal(t, []string{"readAllNotifications", "readAllNotifications"}, pub.types("alice"),
+		"explicit mark-all-as-read must re-publish even when the marker does not move")
+}
+
+// 暗黙既読 (通知一覧 fetch の副作用) は force を立てない。毎 fetch で再送すると
+// 保留中の unreadNotification を潰してバッジが点かなくなる (#420 follow-up)。
+func TestShow_ImplicitMarkAsReadDoesNotForce(t *testing.T) {
+	h, svc := newTestHandler(t)
+	_, err := svc.Create(context.Background(), notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	// Create 由来の unreadNotification を拾わないよう、通知を作ってから wire する。
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	for i := 0; i < 2; i++ {
+		c, rec := newJSONRequest(t, "/api/i/notifications", `{}`)
+		setAuth(c, &model.User{ID: "alice"})
+		require.NoError(t, h.Show(c))
+		require.Equal(t, http.StatusOK, rec.Code)
+	}
+
+	assert.Equal(t, []string{"readAllNotifications"}, pub.types("alice"),
+		"implicit mark-as-read must publish only while the marker actually moves")
+}
+
 func TestMarkAllAsRead_RedisError(t *testing.T) {
 	closed := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	_ = closed.Close()
@@ -1133,4 +1185,329 @@ func TestShow_VisibleEmbedCarriesFiles(t *testing.T) {
 	require.Len(t, files, 1, "可視な embed にも添付が乗ること")
 	df := files[0].(map[string]any)
 	assert.Equal(t, "f2", df["id"])
+}
+
+// upstream i/notifications.ts が getNotifications の前に持つ 2 つの早期 return
+// と同じく、type filter だけで結果が空と決まる fetch では既読化しない (#2835)。
+//
+// **既読位置が飛ぶのが問題。** MarkAllAsRead が進める先は fetch が返した行では
+// なくストリームの最新エントリなので、1 件も返していないのに未読が全部消える。
+func TestShow_IncludeTypesEmptyDoesNotMarkAsRead(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications", `{"includeTypes":[]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	// **wire 上 `[]` であること。** nil を返す変異は `var resp []map[string]any`
+	// への Unmarshal では nil slice になって Empty を通ってしまう。misskey-js /
+	// misskey_dart は Notification[] を non-null で受けるので、null が出ると
+	// 通知ページごと落ちる。
+	assert.Equal(t, "[]", strings.TrimSpace(rec.Body.String()))
+
+	assert.NotContains(t, pub.types("alice"), "readAllNotifications",
+		"explicit includeTypes:[] must not publish readAllNotifications")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.Empty(t, readID, "explicit includeTypes:[] must not advance the read marker")
+}
+
+// excludeTypes が upstream notificationTypes を全て覆う場合も同じ (#2835)。
+// **obsolete type は数えない** — 覆う対象は notificationTypeList の 20 種だけで、
+// pollVote / groupInvited を足さなくても早期 return する。
+func TestShow_ExcludeAllTypesDoesNotMarkAsRead(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	body, err := json.Marshal(map[string]any{"excludeTypes": notificationTypeList})
+	require.NoError(t, err)
+	c, rec := newJSONRequest(t, "/api/i/notifications", string(body))
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "[]", strings.TrimSpace(rec.Body.String()))
+
+	assert.NotContains(t, pub.types("alice"), "readAllNotifications",
+		"excludeTypes covering every type must not publish readAllNotifications")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.Empty(t, readID, "excludeTypes covering every type must not advance the read marker")
+}
+
+// 1 つでも残っていれば早期 return しない = 従来どおり fetch して既読化する。
+// これが無いと「excludeTypes が空でなければ常に空を返す」形の変異が素通りする。
+func TestShow_ExcludeAllButOneStillMarksAsRead(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	// "follow" だけ残す。行は返るので既読化する。
+	rest := make([]string, 0, len(notificationTypeList))
+	for _, t2 := range notificationTypeList {
+		if t2 != "follow" {
+			rest = append(rest, t2)
+		}
+	}
+	body, err := json.Marshal(map[string]any{"excludeTypes": rest})
+	require.NoError(t, err)
+	c, rec := newJSONRequest(t, "/api/i/notifications", string(body))
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	assert.Contains(t, pub.types("alice"), "readAllNotifications",
+		"one remaining type means the query still runs and marks as read")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.NotEmpty(t, readID)
+}
+
+// enum 検証は早期 return より先 (#2835)。upstream は ajv の paramDef 検証が
+// handler 本体より前に走るので、不正な type を含むリクエストは 200 [] ではなく
+// 400 になる。emptyByTypeFilter を bindListRequest より前に出す変異が
+// 素通りしないよう固定する。
+func TestShow_InvalidTypeIsRejectedBeforeEarlyReturn(t *testing.T) {
+	h, _ := newTestHandler(t)
+	c, rec := newJSONRequest(t, "/api/i/notifications",
+		`{"includeTypes":[],"excludeTypes":["bogus"]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	assert.Equal(t, http.StatusBadRequest, rec.Code,
+		"enum validation must run before the type-filter early return")
+}
+
+// notificationTypeEnum は 2 つの list から組み立てる。手で二重に持つと片方が
+// 古いまま残り、emptyByTypeFilter の全指定判定が足りない type を無視して
+// **早く空を返しすぎる**方向に壊れる。
+func TestNotificationTypeEnumMatchesLists(t *testing.T) {
+	// **内容をリテラルで固定する。** 件数と自己参照ループだけだと、list から
+	// 1 つ落としても両辺が同時に減って通ってしまう (変異で確認)。落ちた type は
+	// enum からも消えるので、正当な excludeTypes が 400 になり、同時に
+	// emptyByTypeFilter の被覆集合が縮んで「早く空を返しすぎる」側に倒れる。
+	//
+	// **突き合わせ先は registry の KindUpstream (#2898)。** notificationTypeList
+	// (= UpstreamTypeNames) と同じ集合になるので直接比較でも今は通るが、
+	// **見たいのは「upstream 由来と宣言した集合」**であって被覆判定用の list では
+	// ない。両者を同一視すると、被覆判定の中身を変えたときにこのテストの意味も
+	// 一緒に変わる (初版で固有型を list に入れて既読位置が飛ぶ回帰を起こしたとき、
+	// テストは緑のままだった)。
+	var upstreamTypes []string
+	for _, d := range notification.Descriptors() {
+		if d.Kind == notification.KindUpstream {
+			upstreamTypes = append(upstreamTypes, string(d.Type))
+		}
+	}
+	assert.Equal(t, []string{
+		"note", "follow", "mention", "reply", "renote",
+		"quote", "reaction", "pollEnded", "scheduledNotePosted",
+		"scheduledNotePostFailed", "receiveFollowRequest", "followRequestAccepted",
+		"roleAssigned", "chatRoomInvitationReceived", "achievementEarned",
+		"exportCompleted", "login", "createToken", "app", "test",
+	}, upstreamTypes, "upstream types.ts の notificationTypes と一致すること")
+	assert.Equal(t, []string{"pollVote", "groupInvited"}, obsoleteNotificationTypeList,
+		"upstream types.ts の obsoleteNotificationTypes と一致すること")
+
+	// notificationTypeList は upstream 由来を全て含み、かつ obsolete を含まない。
+	for _, ty := range upstreamTypes {
+		assert.Contains(t, notificationTypeList, ty,
+			"%s is an upstream type and must be counted by emptyByTypeFilter", ty)
+	}
+
+	// enum は upstream + obsolete + mk-go 固有。全指定判定 (notificationTypeList)
+	// は upstream のみ — 固有型を入れると upstream 由来のクライアントの
+	// 「すべて無効」が被覆判定を外れ、既読位置が飛ぶ (#2898)。
+	mkgoTypes := notification.MkGoTypeNames()
+	require.NotEmpty(t, mkgoTypes)
+	require.Len(t, notificationTypeEnum,
+		len(notificationTypeList)+len(obsoleteNotificationTypeList)+len(mkgoTypes))
+	for _, ty := range notificationTypeList {
+		assert.True(t, notificationTypeEnum[ty], "%s must be in the enum", ty)
+	}
+	for _, ty := range obsoleteNotificationTypeList {
+		assert.True(t, notificationTypeEnum[ty], "%s must be in the enum", ty)
+	}
+	for _, ty := range mkgoTypes {
+		assert.True(t, notificationTypeEnum[ty], "%s must be in the enum", ty)
+		assert.NotContains(t, notificationTypeList, ty,
+			"%s は mk-go 固有なので全指定判定に入れてはいけない", ty)
+	}
+	// obsolete は全指定判定の対象外。
+	for _, ty := range obsoleteNotificationTypeList {
+		assert.NotContains(t, notificationTypeList, ty,
+			"%s is obsolete and must not be counted by emptyByTypeFilter", ty)
+	}
+}
+
+// includeTypes が obsolete type だけのときは「filter 無し = 全件」になる (#2837)。
+//
+// upstream は早期 return の後に obsolete を除去し、除去後に空になった includeTypes は
+// `includeTypes && length > 0` の分岐に入らないので filter が掛からない。
+// mk-go は除去せず渡していたため全件落ちて `[]` を返していた。
+//
+// **`includeTypes:[]` とは結果が逆になる。** あちらは明示的に「何も含めない」で
+// 空配列。順序 (早期 return が先、obsolete 除去が後) がこの差を作る。
+func TestShow_IncludeTypesObsoleteOnlyReturnsAll(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications", `{"includeTypes":["pollVote"]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp, 1, "obsolete-only includeTypes means no filter, so all rows come back")
+	assert.Equal(t, "follow", resp[0]["type"])
+}
+
+// obsolete と実在 type の混在では、実在 type だけが残って filter として効く。
+// これが無いと「obsolete を含むなら filter を丸ごと捨てる」形の変異が素通りする。
+func TestShow_IncludeTypesObsoleteMixedStillFilters(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+	_, err = svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeMention, NoteID: "n1",
+	})
+	require.NoError(t, err)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications",
+		`{"includeTypes":["follow","pollVote"]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp, 1, "the non-obsolete half must still filter")
+	assert.Equal(t, "follow", resp[0]["type"])
+}
+
+// excludeTypes 側も除去する。obsolete を混ぜても実在 type の除外は効き続ける。
+func TestShow_ExcludeTypesObsoleteMixedStillFilters(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+	_, err = svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeMention, NoteID: "n1",
+	})
+	require.NoError(t, err)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications",
+		`{"excludeTypes":["follow","pollVote"]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Len(t, resp, 1)
+	assert.Equal(t, "mention", resp[0]["type"])
+}
+
+// stripObsoleteTypes の単体。nil / 空 / 全除去 / 部分除去 / 除去なしを固定する。
+func TestStripObsoleteTypes(t *testing.T) {
+	assert.Nil(t, stripObsoleteTypes(nil))
+	// 明示的な空はそのまま (非 nil の長さ 0)。全除去は nil。**この 2 つを混ぜない。**
+	// 前者は「何も含めない」、後者は「filter 無し」で意味が逆。
+	explicitEmpty := stripObsoleteTypes([]string{})
+	assert.NotNil(t, explicitEmpty, "explicit [] must stay non-nil")
+	assert.Empty(t, explicitEmpty)
+	assert.Nil(t, stripObsoleteTypes([]string{"pollVote", "groupInvited"}),
+		"fully stripped means no filter, which must be nil")
+	assert.Equal(t, []string{"follow"}, stripObsoleteTypes([]string{"follow", "pollVote"}))
+	assert.Equal(t, []string{"follow", "mention"},
+		stripObsoleteTypes([]string{"follow", "mention"}))
+}
+
+// excludeTypes が obsolete だけなら除去後に nil になり、filter が掛からない (#2837)。
+//
+// **obsolete type の行を実際に積んで確かめる。** 混在ケース
+// (TestShow_ExcludeTypesObsoleteMixedStillFilters) は該当行が無いので strip の
+// 有無で結果が変わらず、exclude 側の適用行を消す変異が素通りしていた。
+//
+// pollVote は notificationTypeList の外にある唯一の type で、現在は producer が
+// 無い (#690 で無効化) が、それ以前に積まれた行はストリームに残りうる。
+func TestShow_ExcludeTypesObsoleteOnlyDoesNotFilter(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypePollVote, NoteID: "n1",
+	})
+	require.NoError(t, err)
+	_, err = svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications", `{"excludeTypes":["pollVote"]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Show(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp []map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Len(t, resp, 2,
+		"obsolete-only excludeTypes is stripped to nil, so nothing is filtered out")
+}
+
+// collectNotificationsWithDropped の fail-closed guard を直接固定する (#2837)。
+//
+// Show / Grouped は emptyByTypeFilter で先に抜けるので**この guard には到達
+// しない**。直接呼ぶ経路が増えたときのための防御なので、endpoint 経由の
+// テストでは守れない。ここだけは中を直接叩く。
+//
+// stripObsoleteTypes が全除去で nil を返すのは、除去後の「filter 無し」を
+// ここへ「何も含めない」として渡さないため。両者の区別がこの guard の前提。
+func TestCollectNotificationsWithDropped_ExplicitEmptyIncludeTypesReturnsNothing(t *testing.T) {
+	h, svc := newTestHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	limit := 10
+	c, _ := newJSONRequest(t, "/api/i/notifications", `{}`)
+	user := &model.User{ID: "alice"}
+
+	// 明示的な空 = 何も含めない。
+	all, _, _, _, err := h.collectNotificationsWithDropped(c, user,
+		ListRequest{Limit: &limit, IncludeTypes: []string{}}, false)
+	require.NoError(t, err)
+	assert.Empty(t, all, "explicit includeTypes:[] must select nothing")
+
+	// nil = 全 type を通す (対比)。
+	all, _, _, _, err = h.collectNotificationsWithDropped(c, user,
+		ListRequest{Limit: &limit, IncludeTypes: nil}, false)
+	require.NoError(t, err)
+	assert.Len(t, all, 1, "nil includeTypes must not filter")
 }

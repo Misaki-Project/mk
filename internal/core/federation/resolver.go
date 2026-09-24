@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/shiroha-a/mk/internal/misc/hashtag"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/misc/idnhost"
+	"github.com/shiroha-a/mk/internal/misc/keyword"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
 	"gorm.io/datatypes"
@@ -77,6 +79,13 @@ type HashtagHook interface {
 var (
 	// ErrInvalidActor is returned when the fetched JSON cannot be parsed.
 	ErrInvalidActor = errors.New("invalid actor document")
+	// ErrLocalActor is returned when an actor URI points at this instance.
+	//
+	// upstream ApPersonService.createPerson の
+	// `throw new StatusError('cannot resolve local user', 400, ...)` に対応する。
+	// **ErrInvalidActor を包む** ので、既存の `isPermanentSkipError` (= ack して
+	// retry しない) と呼び出し側の分岐がそのまま効く。
+	ErrLocalActor = fmt.Errorf("%w: cannot resolve local user", ErrInvalidActor)
 	// ErrInvalidNote is returned when a fetched Note cannot be parsed.
 	ErrInvalidNote = errors.New("invalid note document")
 	// ErrHostNotAllowed is returned when the resolver is asked to fetch /
@@ -279,8 +288,16 @@ func (r *Resolver) resolveNoteAuthor(uri string, ephemeral bool, depth int, chai
 		// これまでどおり featured を引く。
 		return r.resolveActor(uri, false, depth > 0, chain)
 	}
-	if existing, err := r.userRepo.FindByURI(uri); err == nil && existing != nil {
+	existing, err := r.userRepo.FindByURI(uri)
+	switch {
+	case err == nil && existing != nil:
 		return existing, nil
+	case err != nil && !repository.IsNotFound(err):
+		// **引けなかったら ephemeral 側へ落とさない** (#3121)。落とすと、上の
+		// 手順 1 が守っている「ミュート済み / materialize 済みの著者は実 ID を
+		// 使う」が DB 障害中だけ崩れ、**ミュートした相手の投稿が別 ID の
+		// ephemeral 行としてタイムラインに戻る**。retry に倒すほうが安全側。
+		return nil, fmt.Errorf("%w: note author %q: %v", ErrLookupUnavailable, truncateRunes(uri, userURIMaxRunes), err)
 	}
 	ctx := context.Background()
 	if id, err := r.ephemeralSink.UserIDByURI(ctx, uri); err == nil && id != "" {
@@ -389,6 +406,10 @@ type Resolver struct {
 	publickeyExtraRepo PublickeyExtraStore         // optional: 追加公開鍵 (Ed25519 / Multikey) の永続化
 	capabilities       SignatureCapabilityDeclarer // optional: Ed25519 対応宣言の記録 (#2393)
 	pollRepo           repository.PollRepository   // optional: Question(投票)のPoll作成
+	// suspensionOriginRepo は凍結の由来 (local / remote) の記録先 (#2973)。
+	// **未配線なら `toot:suspended` を読まない** — 由来を持てない状態で自動
+	// 凍結すると、モデレーターが解除しても次の refresh で無言で戻る。
+	suspensionOriginRepo repository.UserSuspensionOriginRepository
 	// pinningRepo / pinningIDGen はリモート actor の featured コレクション
 	// (ピン留め投稿) の取り込み先 (#2552)。未配線なら取り込まない。
 	pinningRepo   repository.UserNotePiningRepository
@@ -410,6 +431,9 @@ type Resolver struct {
 	// を除くためのもの。残すと hydrate で ephemeral 側が拾われ二重表示になる。
 	ephemeralTimeline EphemeralTimelineRemover
 	imageProbeClient  *http.Client
+	// probeBudget は 1 document 分の dimension probe に許す合計時間。0 なら
+	// attachmentProbeBudget を使う (テストだけが縮める)。
+	probeBudget time.Duration
 	// hostBlocker は federation 設定 (none / specified / blockedHosts) を
 	// 評価する gate。fetchActor / resolveNoteOnce / IngestNoteWithCreated
 	// の入口で URI の host / attributedTo の host を判定して、ホワイト
@@ -420,6 +444,10 @@ type Resolver struct {
 	// silencedChecker は remote note ingest 時に meta.silencedHosts 該当 host の
 	// public note を home に降格する判定に使う (#2106 N14)。未配線時は降格しない。
 	silencedChecker SilencedHostChecker
+
+	// prohibitedWordsProvider は meta.prohibitedWords の読み取り元。nil なら
+	// hostBlocker から optional interface で拾う (prohibitedWords() を参照)。
+	prohibitedWordsProvider ProhibitedWordsProvider
 
 	// resolveActorGroup / resolveNoteGroup は同一 URI への並行 ResolveActor /
 	// ResolveNote 呼び出しを 1 度の DB lookup + HTTP fetch に collapse する
@@ -527,6 +555,73 @@ func (r *Resolver) SetPollRepo(repo repository.PollRepository) {
 	r.pollRepo = repo
 }
 
+// resolveSuspensionChange decides whether to follow the actor's `suspended`.
+//
+// **ローカルの判断には触らない。** Mastodon の `ProcessAccountService#set_suspension!`
+// と同じ形で、最初に由来を見て local なら何もしない:
+//
+//	return if @account.suspended? && @account.suspension_origin_local?
+//
+// 由来が remote (= こちらが actor を見て凍結した) なら、発信元の解除にも追従する。
+// 記録が無い行 (この表より前から凍結されている / まだ一度も判断していない) は
+// **local 扱い**にする — モデレーターが凍結した可能性があるものをリモートに
+// 解除させないため。安全側に倒しても、誤って local にした行はモデレーターが
+// 手で戻せる。
+//
+// 2 つ目の戻り値は「変更するかどうか」。false なら呼び出し元は触らない。
+func (r *Resolver) resolveSuspensionChange(existing *model.User, actorSuspended bool) (bool, bool) {
+	if r.suspensionOriginRepo == nil {
+		// 由来を記録できないなら読まない (#2951 の制約を再生産しない)。
+		return false, false
+	}
+	if existing.IsSuspended == actorSuspended {
+		return false, false
+	}
+	// **削除済みの行には触らない** (#2973)。`admin/accounts/delete` は
+	// `isSuspended` と `isDeleted` を同時に立てるので、発信元由来の凍結が
+	// 残っている tombstone を発信元が解除できてしまう。inbound の gate は
+	// `isSuspended` しか見ない (`processor.go` の dispatch 前チェック) ので、
+	// 解除されると削除済みアカウントからの activity が再び通る。
+	if existing.IsDeleted {
+		return false, false
+	}
+	origin, err := r.suspensionOriginRepo.Origin(existing.ID)
+	if err != nil {
+		// **DB 障害では判断しない。** 「記録が無い」と取り違えると、
+		// 接続断の瞬間にモデレーターの判断を上書きしうる。
+		slog.Warn("federation: failed to read suspension origin; leaving state untouched",
+			"userId", existing.ID, "err", err)
+		return false, false
+	}
+	if actorSuspended {
+		// 凍結する側: 記録が無い = まだ誰も判断していないので従う。
+		// local なら「モデレーターが解除した」ので従わない。
+		if origin == model.SuspensionOriginLocal {
+			return false, false
+		}
+		return true, true
+	}
+	// 解除する側: **remote 由来のときだけ従う。** 記録が無い行を解除すると、
+	// この表より前にモデレーターが凍結したものをリモートが解除できてしまう。
+	if origin != model.SuspensionOriginRemote {
+		return false, false
+	}
+	return false, true
+}
+
+// SetSuspensionOriginRepo wires the store that records who decided a user's
+// suspension state (#2973).
+//
+// **未配線なら actor の `toot:suspended` を読まない。** 由来を持てない状態で
+// 自動凍結すると、モデレーターが `admin/unsuspend-user` で解除しても次の
+// actor refresh で無言で戻る (#2951 の既知の制約そのもの)。
+func (r *Resolver) SetSuspensionOriginRepo(repo repository.UserSuspensionOriginRepository) {
+	r.suspensionOriginRepo = repo
+}
+
+// HasSuspensionOriginRepo reports whether the store is wired.
+func (r *Resolver) HasSuspensionOriginRepo() bool { return r.suspensionOriginRepo != nil }
+
 // SetPinningRepo wires the pinned-notes store used to import a remote actor's
 // featured collection (#2552). 未配線なら featured の取り込み自体を行わない。
 func (r *Resolver) SetPinningRepo(repo repository.UserNotePiningRepository, idGen id.Generator) {
@@ -593,6 +688,128 @@ func (r *Resolver) SetSilencedHostChecker(c SilencedHostChecker) {
 	r.silencedChecker = c
 }
 
+// ProhibitedWordsProvider exposes meta.prohibitedWords to the inbound note
+// ingest path. *instance.Service implements it.
+type ProhibitedWordsProvider interface {
+	ProhibitedWords() []string
+}
+
+// SetProhibitedWordsProvider overrides where meta.prohibitedWords is read from.
+//
+// **通常は配線不要。** 既定では hostBlocker (router.go が core/instance.Service を
+// 渡す、= prohibitedWords と同じ meta を読む実体) から optional interface で
+// 拾う。専用の Set* を必須にすると、配線を忘れたときに「検査していないのに緑」に
+// なる — 本番で必ず立っている依存から取るほうが安全側で、`fetcher` の
+// finalURLFetcher と同じ方式。この setter はテストと、将来 hostBlocker とは
+// 別の実体から読みたくなった場合のための逃げ道。
+func (r *Resolver) SetProhibitedWordsProvider(p ProhibitedWordsProvider) {
+	r.prohibitedWordsProvider = p
+}
+
+// HasProhibitedWordsSource reports whether a source for meta.prohibitedWords is
+// reachable (either the explicit setter or the hostBlocker's optional面).
+//
+// **未配線だと禁止語が AP 経路だけ静かに効かなくなる (レビュー L2)。**
+// fallback が optional interface なので、`SetHostBlockChecker` に
+// `ProhibitedWords()` を持たない型を渡した瞬間に無検査へ落ちる。起動時に
+// 気付けるよう述語を出す。
+func (r *Resolver) HasProhibitedWordsSource() bool {
+	if r.prohibitedWordsProvider != nil {
+		return true
+	}
+	_, ok := r.hostBlocker.(ProhibitedWordsProvider)
+	return ok
+}
+
+// prohibitedWords returns the configured meta.prohibitedWords, or nil when no
+// source is wired / meta is unreadable (= 判定を skip、他の meta ゲートと同じ
+// ベストエフォート)。
+func (r *Resolver) prohibitedWords() []string {
+	if r.prohibitedWordsProvider != nil {
+		return r.prohibitedWordsProvider.ProhibitedWords()
+	}
+	if p, ok := r.hostBlocker.(ProhibitedWordsProvider); ok {
+		return p.ProhibitedWords()
+	}
+	return nil
+}
+
+// containsProhibitedWords reports whether cw / text / poll choices hit
+// meta.prohibitedWords.
+//
+// 判定そのものは `internal/misc/keyword` (= `core/note.checkProhibitedWords` と
+// `matchesSensitiveWords` が使うのと同じ実装) に委ねる。`/regex/flags` と
+// スペース区切り AND、case-sensitive の扱いをローカル投稿経路と揃えるため。
+// 検査対象の 3 つ (cw / text / poll choices) も upstream の
+// `checkProhibitedWordsContain` と同じ。
+func (r *Resolver) containsProhibitedWords(text, cw *string, pollChoices []string) bool {
+	words := r.prohibitedWords()
+	if len(words) == 0 {
+		return false
+	}
+	if cw != nil && *cw != "" && keyword.IsKeyWordIncluded(*cw, words) {
+		return true
+	}
+	if text != nil && *text != "" && keyword.IsKeyWordIncluded(*text, words) {
+		return true
+	}
+	for _, choice := range pollChoices {
+		if choice != "" && keyword.IsKeyWordIncluded(choice, words) {
+			return true
+		}
+	}
+	return false
+}
+
+// apPollChoices returns the AP Question's choice labels in the same normalized
+// form createPollFromQuestion would store, so the prohibited-word check sees
+// what the row would hold.
+func apPollChoices(apNote *activitypub.Note) []string {
+	choices := apNote.OneOf
+	if len(apNote.AnyOf) > 0 {
+		choices = apNote.AnyOf
+	}
+	if len(choices) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(choices))
+	for _, c := range choices {
+		out = append(out, remotePollChoice(c.Name))
+	}
+	return out
+}
+
+// selfHost returns this instance's own host in the same normalized form
+// hostFromURI produces, or "" when the URL builder is unwired.
+func (r *Resolver) selfHost() string {
+	if r.urls == nil {
+		return ""
+	}
+	// UserURI("") = `<baseURL>/users/`。URLBuilder は baseURL を公開しないので
+	// 既存の組み立てから取り出す。正規化は host を作る唯一の規則を通す。
+	return NormalizeGateHost(r.urls.UserURI(""))
+}
+
+// isSelfHost reports whether host is this instance's own host.
+//
+// **host で判定する (URI の接頭辞ではない)。** upstream も
+// `host === toPuny(config.host)` で見る。接頭辞一致 (`urls.IsLocalURI`) だと
+// scheme 違い (`http://` を名乗る) で素通りし、その後の host binding は
+// 通ってしまうので shadow 行が作られる。
+func (r *Resolver) isSelfHost(host string) bool {
+	self := r.selfHost()
+	return self != "" && host != "" && host == self
+}
+
+// isSelfHostURI reports whether uri is served by this instance.
+func (r *Resolver) isSelfHostURI(uri string) bool {
+	host, err := hostFromURI(uri)
+	if err != nil {
+		return false
+	}
+	return r.isSelfHost(host)
+}
+
 // hostAllowed reports whether the resolver may talk to / persist content
 // authored on host. host == "" (= local) は常に true。未配線時も true。
 func (r *Resolver) hostAllowed(host string) bool {
@@ -615,6 +832,16 @@ func (r *Resolver) hostAllowedForURI(uri string) bool {
 	return r.hostAllowed(host)
 }
 
+// ErrLookupUnavailable marks "we could not look it up", as opposed to "we
+// looked and it is not there" (#3121).
+//
+// **署名検証の失敗は既定で ack する** — 署名が合わない body を retry しても
+// 結果は変わらないため。しかし検証は DB も読むので、**DB 障害のあいだに届いた
+// activity まで同じ ack に落ちる**。落ちた側は相手が再送してくれるとは限らない
+// (inbox は enqueue した時点で 202 を返す) ので、確かめられなかったぶんだけは
+// 区別して job に retry させる。
+var ErrLookupUnavailable = errors.New("lookup unavailable")
+
 // PublicKeyForActor returns the cached public key PEM for an actor ID.
 // in-memory → DB → miss の順で探索する。TTL超過は miss として扱い、呼び出し
 // 側が ResolveActor を再実行することで refresh をトリガできる。
@@ -633,11 +860,17 @@ func (r *Resolver) PublicKeyForActor(actorID string) (string, error) {
 	}
 	// 2. DB fallback
 	if r.publickeyRepo != nil {
-		if pk, err := r.publickeyRepo.FindByUserID(actorID); err == nil {
+		pk, err := r.publickeyRepo.FindByUserID(actorID)
+		switch {
+		case err == nil:
 			r.keysMu.Lock()
 			r.keys[actorID] = publicKeyEntry{pem: pk.KeyPEM, fetchedAt: r.clock()}
 			r.keysMu.Unlock()
 			return pk.KeyPEM, nil
+		case !repository.IsNotFound(err):
+			// **「鍵が無い」に潰さない** (#3121)。潰すと呼び出し側が署名検証の
+			// 失敗として ack し、DB 障害のあいだ届いた activity が失われる。
+			return "", fmt.Errorf("%w: public key for actor %q: %v", ErrLookupUnavailable, actorID, err)
 		}
 	}
 	return "", fmt.Errorf("public key for actor %q not cached", actorID)
@@ -711,7 +944,20 @@ func (r *Resolver) resolveActorOnceWithID(uri string, allowCrossHost bool, preas
 	if strings.Contains(uri, "#") {
 		return nil, ErrResolveFragment
 	}
-	if existing, err := r.userRepo.FindByURI(uri); err == nil {
+	// **FindByURI より前に弾く。** ローカル利用者は `user.uri` が NULL なので
+	// ここで引けるのは「過去に作られた shadow 行」だけで、返すと refresh まで
+	// 走る。upstream の `resolvePerson` は自ホスト URI を DB から引いて
+	// ローカル利用者を返すが、mk-go では**返さない** — `resolveNoteAuthor` が
+	// この戻り値をそのまま note の著者にするので、`allowCrossHost` 経路で
+	// 「ローカル利用者名義の偽ノート」を作れるようになってしまう。
+	// ローカル利用者を URI から引きたい呼び出し側は ExtractLocalUserID +
+	// userRepo.FindByID を使うこと。
+	if r.isSelfHostURI(uri) {
+		return nil, ErrLocalActor
+	}
+	existing, ferr := r.userRepo.FindByURI(uri)
+	switch {
+	case ferr == nil:
 		if r.shouldRefreshActor(existing) {
 			r.refreshActor(existing, uri, skipFeatured, chain)
 		} else {
@@ -725,6 +971,22 @@ func (r *Resolver) resolveActorOnceWithID(uri string, allowCrossHost bool, preas
 			}
 		}
 		return existing, nil
+	case !repository.IsNotFound(ferr):
+		// **障害を「まだ知らない actor」に倒さない** (#3121)。倒すとリモートへ
+		// fetch しに行くが、通常経路ではその直後の `Create` が同じ障害で落ちる
+		// ので、呼び出し側からは「解決できなかった」としか見えない。
+		// **署名検証はその結果を ack する**ので、DB 障害のあいだに届いた
+		// activity がまるごと失われる。種別を残しておけば inbox が retry に
+		// 倒せるし、落ちている DB を相手に無駄な remote fetch もしない。
+		//
+		// **ephemeral (リレー) 経路もここで止まる。** あちらは `Create` に到達
+		// しないので (下の `if ephemeral` で戻る)、倒せば Redis 側で完結できて
+		// しまうが、**倒さない**。倒すと「DB が落ちているあいだだけミュート済み
+		// / materialize 済みの著者を引けず、別 ID の ephemeral 行として
+		// タイムラインに戻る」— `resolveNoteAuthor` が DB を先に引く理由
+		// そのもの (#2332) が崩れる。**DB 障害中はリレー由来の取り込みも
+		// 止まる**が、その間 timeline は DB を読めないので失うものは小さい。
+		return nil, fmt.Errorf("%w: actor %q: %v", ErrLookupUnavailable, truncateRunes(uri, userURIMaxRunes), ferr)
 	}
 
 	actor, err := r.fetchActor(uri, allowCrossHost)
@@ -735,6 +997,16 @@ func (r *Resolver) resolveActorOnceWithID(uri string, allowCrossHost bool, preas
 	host, err := hostFromURI(actor.ID)
 	if err != nil {
 		return nil, ErrInvalidActor
+	}
+	// **fetch 後にも見る。** 通常は finalURL ↔ id の binding
+	// (`assertResponseHostMatches`) が先に落とす (実測: `allowCrossHost` でも
+	// そちらが `ErrObjectHostMismatch` を返す) が、あれは **fetcher が最終 URL を
+	// 返せるときにしか効かない**。id が自ホストを指す document を「リモート
+	// actor」として取り込む経路を、binding が無い条件でも閉じておく。
+	if r.isSelfHost(host) {
+		slog.Warn("federation: refusing to create a remote row for a local actor URI",
+			"uri", truncateRunes(actor.ID, userURIMaxRunes))
+		return nil, ErrLocalActor
 	}
 	// **必須の値が列に入らないなら actor ごと拒否する** (#2723)。`uri` / `host` は
 	// 身元そのもので、切ると別人になるし捨てるわけにもいかない (lookup の鍵)。
@@ -769,6 +1041,28 @@ func (r *Resolver) resolveActorOnceWithID(uri string, allowCrossHost bool, preas
 		// AP仕様が崩れる。
 		IsLocked:      actor.ManuallyApproves.Bool(),
 		LastFetchedAt: &now,
+		// **発信元が凍結を明示しているなら、作る時点で凍結しておく** (#2951)。
+		// Mastodon 系は凍結しても `Delete` を送らず actor に `suspended` を
+		// 立てるだけなので、読まないと「相手は切ったのにこちらでは生きている」
+		// 状態になる。
+		//
+		// **`Delete` 経路と同じ結末にはならない。** あちらは `isDeleted` を
+		// 立ててノート・ドライブ・following 行を消すが、こちらは `isSuspended`
+		// を立てて読み取り時に隠すだけ。逆に `applySuspendedAuthorExclusion`
+		// は `isSuspended` しか見ないので、**その人宛のローカル利用者の返信や
+		// リノートまで timeline から消える** (`Delete` 経路では消えない)。
+		// 詳細は docs/divergence.md §3-3a。
+		IsSuspended: actor.Suspended.Bool(),
+	}
+	if user.IsSuspended {
+		// **由来を持てないなら凍結しない。** 記録できないまま凍結すると、
+		// モデレーターが解除しても次の refresh で無言で戻る (#2951 の制約)。
+		if r.suspensionOriginRepo == nil {
+			user.IsSuspended = false
+		} else {
+			slog.Info("federation: creating remote actor as suspended per toot:suspended",
+				"uri", actor.ID, "userId", user.ID)
+		}
 	}
 	if name := remoteDisplayName(actor.Name.String()); name != "" {
 		user.Name = &name
@@ -834,6 +1128,22 @@ func (r *Resolver) resolveActorOnceWithID(uri string, allowCrossHost bool, preas
 	}
 	if err := r.userRepo.Create(user); err != nil {
 		return nil, err
+	}
+	// **凍結して作ったなら由来も刻む** (#2973)。刻まないと、この行は次の
+	// refresh で「由来不明 = 解除方向では local 扱い」になり、**発信元が
+	// 解除しても永久に凍結のまま**になる (two-way が効かない層ができる)。
+	//
+	// FK があるので Create の後でしか書けない。失敗したら宣言どおり凍結を
+	// 取り下げる — 記録の無い凍結は解除できるかが運任せになるため。
+	if user.IsSuspended && r.suspensionOriginRepo != nil {
+		if oerr := r.suspensionOriginRepo.Set(user.ID, model.SuspensionOriginRemote); oerr != nil {
+			slog.Warn("federation: failed to record suspension origin on create; unsuspending",
+				"userId", user.ID, "err", oerr)
+			if uerr := r.userRepo.UpdateUser(user.ID, map[string]any{"isSuspended": false}); uerr != nil {
+				slog.Warn("federation: failed to roll back suspension", "userId", user.ID, "err", uerr)
+			}
+			user.IsSuspended = false
+		}
 	}
 	// リレー経由で初めて観測した行を記録する (#2340)。孤児掃除の対象をリレー
 	// 由来に限定するために使う。**新規作成時のみ**。既に DB に在る行 (上の
@@ -1025,7 +1335,7 @@ const (
 // description は mfm.FromHTML が NUL を落とすが、**_misskey_summary は
 // FromHTML を通らない** ので description も対象に含める。
 func sanitizeRemoteText(s string) string {
-	return colfit.StripNUL(s)
+	return colfit.ToStorable(s)
 }
 
 // apTypeOf returns an AP object's `type`, tolerating the array form.
@@ -1251,6 +1561,26 @@ func (r *Resolver) refreshActor(existing *model.User, uri string, skipFeatured b
 	// された場合にローカルの判定もずれないように)。
 	fields["isLocked"] = actor.ManuallyApproves.Bool()
 	existing.IsLocked = actor.ManuallyApproves.Bool()
+	// **由来 (#2973) を見て決める。** `local` = モデレーターの判断には触らず、
+	// `remote` = こちらが actor を見て凍結した行だけが発信元の解除に追従する。
+	// 記録が無い行は解除方向では `local` 扱い (安全側)。
+	if suspend, ok := r.resolveSuspensionChange(existing, actor.Suspended.Bool()); ok {
+		fields["isSuspended"] = suspend
+		existing.IsSuspended = suspend
+		// **痕跡を残す。** これはモデレーターの操作を伴わない変更で、
+		// moderation log には載らない。
+		slog.Info("federation: updating remote suspension per toot:suspended",
+			"uri", actor.ID, "userId", existing.ID, "suspended", suspend)
+		if err := r.suspensionOriginRepo.Set(existing.ID, model.SuspensionOriginRemote); err != nil {
+			// **由来を記録できなかったら凍結もしない。** 記録が無いまま
+			// 凍結すると、次の refresh で「由来不明」として扱われ、モデレーターが
+			// 解除しても戻せるかどうかが運任せになる。
+			slog.Warn("federation: failed to record suspension origin; skipping",
+				"uri", actor.ID, "userId", existing.ID, "err", err)
+			delete(fields, "isSuspended")
+			existing.IsSuspended = !suspend
+		}
+	}
 	if name := remoteDisplayName(actor.Name.String()); name != "" {
 		fields["name"] = &name
 		existing.Name = &name
@@ -1560,6 +1890,15 @@ func alsoKnownAsContains(csvPtr *string, uri string) bool {
 // document whose `type` is not in activitypub.ValidActorTypes — this guards
 // against a non-Actor object (e.g. a Note) being interpreted as a Person.
 func (r *Resolver) fetchActor(uri string, allowCrossHost bool) (*activitypub.Person, error) {
+	// **自ホストの actor は取りに行かない。** 取りに行くと自分の actor document が
+	// 返り、`host = 自ホスト` の「リモート扱いの」user / user_profile 行と、
+	// `notifyInstance` 経由で自ホストの instance 行 + chart まで出来る。upstream は
+	// ApPersonService.createPerson で明示的に弾く (`cannot resolve local user`)。
+	// **到達経路は未認証** — inbox の署名検証は keyId の base URL を
+	// ResolveActor に渡すのが先なので、誰でも任意のローカル利用者の URI を送れる。
+	if r.isSelfHostURI(uri) {
+		return nil, ErrLocalActor
+	}
 	// federation policy gate: ホワイトリスト連合 (federation: specified) や
 	// blockedHosts 設定下では、対象 URI の host が許可されていなければ HTTP
 	// fetch 自体を抑止する。refreshActor / refreshPublicKey / resolveActorOnce
@@ -1621,7 +1960,7 @@ func (r *Resolver) fetchActor(uri string, allowCrossHost bool) (*activitypub.Per
 	// 緩めて生値を保存すると、actor は取り込めるのに `http.NewRequest` が毎回
 	// 落ちて**配送が永久に成立しない** (末尾空白なら `%20` 付きの URL を叩いて
 	// 相手が 404)。upstream は `new URL()` を通した値を使うので、そこに揃える。
-	// deliver 側は SkipRetry を付けないので、1 人いるだけで全 activity が
+	// deliver 側は ErrSkipRetry を付けないので、1 人いるだけで全 activity が
 	// MaxAttempts 回空振りする (#2662)。
 	actor.Inbox = trimWHATWGURL(actor.Inbox)
 	actor.SharedInbox = activitypub.APLenientID(trimWHATWGURL(actor.SharedInbox.String()))
@@ -1938,19 +2277,24 @@ func (r *Resolver) cacheAssertionMethods(userID, actorURI string, ams activitypu
 // バイパス) が成立する。actor (= keyId base から解決した signer) に紐づく鍵だけを
 // 許すことで、植え込まれた cross-actor 鍵を読取段でも排除する (Fix C, 二重防御)。
 //
-// `gorm.ErrRecordNotFound` (= keyId 一致なし = 通常状態) は silent fallback、
-// それ以外の DB error は診断のため slog.Warn を出す (= silent degradation を
-// 回避)。stale assertion key の削除は cacheAssertionMethods 側で actor fetch
-// 時に diff & delete するため、ここでは古い行が引っかかる可能性は最小化される。
+// not-found (= keyId 一致なし = 通常状態) は silent fallback。それ以外の DB
+// error は **fallback せず `ErrLookupUnavailable` で返す** (#3121) — 落とすと
+// 「その keyId の鍵は無い」ことになり、呼び出し側が署名検証の失敗として ack
+// するので、DB 障害のあいだ届いた activity が失われる。stale assertion key の
+// 削除は cacheAssertionMethods 側で actor fetch 時に diff & delete するため、
+// ここでは古い行が引っかかる可能性は最小化される。
 func (r *Resolver) PublicKeyForKeyID(actorID, keyID string) (string, error) {
 	if r.publickeyExtraRepo != nil && keyID != "" {
 		row, err := r.publickeyExtraRepo.FindByUserAndKeyID(actorID, keyID)
 		if err == nil {
 			return row.KeyPEM, nil
 		}
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
+		if !repository.IsNotFound(err) {
 			slog.Warn("publickeyExtra lookup failed",
 				"actorID", actorID, "keyID", keyID, "error", err)
+			// **fallback へ落とさない** (#3121)。落とすと「その keyId の鍵は
+			// 無い」ことになり、呼び出し側が署名検証の失敗として ack する。
+			return "", fmt.Errorf("%w: publickeyExtra %q/%q: %v", ErrLookupUnavailable, actorID, keyID, err)
 		}
 	}
 	return r.PublicKeyForActor(actorID)
@@ -2378,6 +2722,12 @@ func (r *Resolver) resolveQuoteURI(uri string, depth int, ephemeral bool, chain 
 		return nil
 	}
 	// 1. ローカル note URI なら ID 抽出して DB から (fetch 不要)。
+	//
+	// **ここは障害でも ack する** (#3116)。この関数は `*model.Note` しか返さず、
+	// 呼び出し側 (ingest) は引用が解けなくてもノート自体は取り込む。retry させる
+	// 手段が無いので、DB 障害のあいだに届いた引用は**解決されないまま確定する**。
+	// 直すには signature を変えて ingest ごと retry させる必要があり、それは
+	// 「引用が解けないノートを一切取り込まない」という別の判断になる。
 	if id := r.extractLocalNoteID(uri); id != "" {
 		if n, err := r.noteRepo.FindByID(id); err == nil {
 			return n
@@ -2517,8 +2867,14 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 			"id", truncateRunes(apNote.ID, noteURIMaxRunes))
 		return nil, false, ErrInvalidNote
 	}
-	if existing, err := r.noteRepo.FindByURI(apNote.ID); err == nil {
+	switch existing, err := r.noteRepo.FindByURI(apNote.ID); {
+	case err == nil:
 		return existing, false, nil
+	case !repository.IsNotFound(err):
+		// **障害を「まだ無い」に倒さない** (#3121)。倒すと再 fetch して INSERT へ
+		// 進む。救っているのは `note.uri` の UNIQUE 制約と下の fallback だけで、
+		// その手前でリモートへの再取得が走る。retry させるほうが安い。
+		return nil, false, fmt.Errorf("ingest note: dedup lookup: %w", err)
 	}
 	// ephemeral 経路では DB の miss が「未取り込み」を意味しないので URI 逆引きも
 	// 引く (#2397)。非 ephemeral では引かない: 直接配送で DB 行を作る側は
@@ -2629,18 +2985,46 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 		empty := ""
 		note.CW = &empty
 	}
+	// 禁止語 (meta.prohibitedWords) は inbound にも掛ける。upstream の
+	// ApNoteService.ts:203 が `checkProhibitedWordsContain({cw, text, pollChoices})`
+	// を**添付とユーザーを登録する前**に呼ぶのと同じ位置づけで、ここより後ろの
+	// `upsertEmojis` / `upsertAttachments` / `noteRepo.Create` はどれも行を作る。
+	//
+	// **error ではなく (nil, false, nil) で落とす。** upstream は
+	// IdentifiableError('689ee33f-…') を投げるが、InboxProcessorService がそれを
+	// catch して `'blocked notes with prohibited words'` を返す = **ack して
+	// retry しない**。mk-go の handleCreate は未知の error をそのまま retry キューへ
+	// 戻すので、error にすると同じ note が 8 回配送し直されて dead letter に積まれる。
+	// note を作らずに抜ける形は AP vote 経路が既に使っており、呼び出し側は
+	// nil note を扱える (ResolveNoteWithCreated だけは ErrInvalidNote に倒す)。
+	if r.containsProhibitedWords(note.Text, note.CW, apPollChoices(&apNote)) {
+		slog.Info("federation: dropping inbound note containing prohibited words",
+			"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "actor", actor.ID)
+		return nil, false, nil
+	}
 	// 返信先がローカルに存在すれば紐付ける。リモート返信先の解決は後続 phase で
 	// 対応するため、現状では nil のままにする。
 	var replyTarget *model.Note
 	if apNote.InReplyTo != "" {
 		// inReplyTo も同じ (#2662)。生値だと返信チェーンが繋がらない。
 		apNote.InReplyTo = activitypub.APLenientID(trimWHATWGURL(apNote.InReplyTo.String()))
+		// **障害を「返信先が無い」に倒さない** (#3121)。倒すと `ReplyID = nil` の
+		// まま note を保存してしまい、**URI は DB に入るので retry は dedup に
+		// ヒットする** = スレッド接続が恒久的に失われる。not-found (こちらが
+		// 取り込んでいない返信先) は従来どおり nil のまま進む。
+		var replyErr error
 		if id := r.extractLocalNoteID(apNote.InReplyTo.String()); id != "" {
-			if reply, err := r.noteRepo.FindByID(id); err == nil {
-				replyTarget = reply
+			reply, err := r.noteRepo.FindByID(id)
+			replyTarget, replyErr = reply, err
+		} else {
+			reply, err := r.noteRepo.FindByURI(apNote.InReplyTo.String())
+			replyTarget, replyErr = reply, err
+		}
+		if replyErr != nil {
+			if !repository.IsNotFound(replyErr) {
+				return nil, false, fmt.Errorf("ingest note: lookup reply target: %w", replyErr)
 			}
-		} else if reply, err := r.noteRepo.FindByURI(apNote.InReplyTo.String()); err == nil {
-			replyTarget = reply
+			replyTarget = nil
 		}
 		if replyTarget != nil {
 			note.ReplyID = &replyTarget.ID
@@ -2670,7 +3054,13 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	// pollRepo / pollVoter 未配線環境では従来通り reply note として fall
 	// through する (legacy 互換)。
 	if replyTarget != nil && replyTarget.HasPoll && apNote.Name != "" && r.pollRepo != nil && r.pollVoter != nil {
-		if poll, err := r.pollRepo.FindByNoteID(replyTarget.ID); err == nil && poll != nil {
+		poll, perr := r.pollRepo.FindByNoteID(replyTarget.ID)
+		if perr != nil && !repository.IsNotFound(perr) {
+			// **障害を「poll ではない」に倒さない** (#3121)。倒すと投票が普通の
+			// 返信ノートとして確定し、dedup があるので retry でも直らない。
+			return nil, false, fmt.Errorf("ingest note: lookup poll: %w", perr)
+		}
+		if perr == nil && poll != nil {
 			// 保存側と同じ正規化を通して照合する。切った選択肢に対する投票は
 			// 生値では一致しない (#2726)。
 			want := remotePollChoice(apNote.Name.String())
@@ -2700,10 +3090,16 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	// (mentions 列はローカル create 経路と同じ user ID の配列にする)。
 	var textMentions []string
 	if note.Text != nil {
-		textMentions = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(*note.Text))
+		var merr error
+		if textMentions, merr = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(*note.Text)); merr != nil {
+			return nil, false, fmt.Errorf("ingest note: %w", merr)
+		}
 	}
 	tagHrefs := extractMentionTags(apNote.Tag)
-	tagMentions := r.resolveMentionedUserIDs(tagHrefs)
+	tagMentions, merr := r.resolveMentionedUserIDs(tagHrefs)
+	if merr != nil {
+		return nil, false, fmt.Errorf("ingest note: %w", merr)
+	}
 	note.Mentions = mergeMentionIDs(textMentions, tagMentions)
 	// upstream Misskey #17167 (= 2026.5.0 fix / triage #1004): mentionLimit を
 	// 超える note は無効と扱い、保存せずに ErrContainsTooManyMentions を返す。
@@ -2730,7 +3126,10 @@ func (r *Resolver) ingestNoteWithCreated(body []byte, deliveringActorURI string,
 	// VisibleUserIDs チェック (core/note/visibility.go) で受信者が note を
 	// 参照できるよう、ここで ID へ解決して埋める (#397)。
 	if note.Visibility == model.NoteVisibilitySpecified {
-		visible := r.resolveMentionedUserIDs(apNote.To)
+		visible, verr := r.resolveMentionedUserIDs(apNote.To)
+		if verr != nil {
+			return nil, false, fmt.Errorf("ingest note: %w", verr)
+		}
 		// reply target を必ず含める (upstream NoteCreateService.ts:603-605、
 		// ローカル create 経路の #2106 N13 と同型)。特に #17747 の clamp で
 		// `to:[Public]` の reply を specified へ降格させた場合、apNote.To から
@@ -2949,20 +3348,57 @@ func (r *Resolver) UpdateRemoteQuestion(object json.RawMessage, actorURI string)
 	}
 	note, err := r.noteRepo.FindByURI(apNote.ID)
 	if err != nil {
-		return nil
+		// 取り込んでいない note の Update は何もしない。**障害は伝播させる**
+		// (#3116) — ack すると job が retry されず、投票数が古いまま固定される。
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("update remote question: lookup note: %w", err)
 	}
 	if note.UserHost == nil {
 		// ローカル著者の poll は remote からの Update で書き換えない。
 		return nil
 	}
 	poll, err := r.pollRepo.FindByNoteID(note.ID)
+	if err != nil && !repository.IsNotFound(err) {
+		return fmt.Errorf("update remote question: lookup poll: %w", err)
+	}
 	if err != nil || poll == nil {
 		return nil
 	}
 	// attribution: Update の actor は poll 著者 (note author) と一致必須。別 user の
 	// poll URI を指定した更新を拒否する。
-	if actorURI != "" && r.userRepo != nil {
-		if author, aerr := r.userRepo.FindByID(note.UserID); aerr == nil && author != nil && author.URI != nil && *author.URI != actorURI {
+	//
+	// **一致を確認できなければ更新しない (#3037)。** 以前は
+	// 「`FindByID` が成功し、`author.URI` が非 nil で、値が違うとき」だけ
+	// 拒否していたので、**DB 障害 / 行の消失 / URI が NULL のどれでも検査が
+	// 丸ごと消える** = fail-open。ここは「他人の poll を書き換えられるか」を
+	// 決める唯一の検査なので、判定できないなら何もしない側に倒す。
+	//
+	// リモート著者は必ず URI を持つ (上で `note.UserHost == nil` を除いて
+	// いる) ので、非 nil を要求しても正当な更新は落ちない。
+	if actorURI != "" {
+		if r.userRepo == nil {
+			return nil
+		}
+		author, aerr := r.userRepo.FindByID(note.UserID)
+		if aerr != nil {
+			// **障害は黙って捨てない (#3037 レビュー)。** 「攻撃者による
+			// 不一致」と「判定できなかった」を同じ無言の nil に潰すと、
+			// 瞬断で落ちた更新が誰にも見えない (#2792 / #2725)。
+			slog.Warn("federation: cannot verify poll update attribution",
+				"id", apNote.ID, "actor", actorURI, "err", aerr)
+			// **「適用しない」と「ack する」は分ける** (#3116)。判定できない以上
+			// 適用しないのは正しい (fail-closed) が、ack すると job が retry
+			// されず、**note / poll は引けて author だけ落ちた部分障害**で
+			// 投票数が古いまま固定される — この関数が直したはずの結末そのもの。
+			// not-found (= author 行が消えている) は retry しても変わらないので ack。
+			if !repository.IsNotFound(aerr) {
+				return fmt.Errorf("update remote question: verify attribution: %w", aerr)
+			}
+			return nil
+		}
+		if author == nil || author.URI == nil || *author.URI != actorURI {
 			return nil
 		}
 	}
@@ -3034,6 +3470,13 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 	}
 	existing, err := r.noteRepo.FindByURI(apNote.ID)
 	if err != nil {
+		// **障害は伝播させる** (#3116)。ack すると job が retry されず、
+		// **リモートのノート編集 (text / cw / 添付) が恒久的に落ちる**。
+		// 同じ handler の Question 側と揃える — 片方だけ直すと、頻度の高い
+		// ほうが取りこぼされたままになる。
+		if !repository.IsNotFound(err) {
+			return nil, fmt.Errorf("update remote note: lookup note: %w", err)
+		}
 		// 未取得のリモート Note は無視 (こちらに該当データが無いものを編集する
 		// 通知が来ても反映先が無いため)。
 		return nil, nil
@@ -3052,8 +3495,22 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 	// 攻撃者の URL に差し替えられる。inbox 層の
 	// authorizeActor は signer==activity.actor と activity.id host の整合しか保証
 	// しないため、ここで対象 note の著者まで照合する (#1819、UpdateRemoteQuestion と対称)。
-	if actorURI != "" && r.userRepo != nil {
-		if author, aerr := r.userRepo.FindByID(existing.UserID); aerr == nil && author != nil && author.URI != nil && *author.URI != actorURI {
+	//
+	// **一致を確認できなければ更新しない (#3037、`UpdateRemoteQuestion` と
+	// 同じ理由)。** 以前は fail-open で、DB 障害 / 行の消失 / URI が NULL の
+	// どれでも検査が丸ごと消えていた。
+	if actorURI != "" {
+		if r.userRepo == nil {
+			return existing, nil
+		}
+		author, aerr := r.userRepo.FindByID(existing.UserID)
+		if aerr != nil {
+			// Question 側と同じ理由 (#3037 レビュー)。
+			slog.Warn("federation: cannot verify note update attribution",
+				"id", apNote.ID, "actor", actorURI, "err", aerr)
+			return existing, nil
+		}
+		if author == nil || author.URI == nil || *author.URI != actorURI {
 			return existing, nil
 		}
 	}
@@ -3070,6 +3527,43 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 	} else if apNote.Content != "" {
 		newText = mfm.FromHTML(apNote.Content)
 	}
+	// CW は**下の fields 反映より前に**決める。禁止語の判定を「更新後の値」で
+	// 行うために先に要るが、判定は `existing` を書き換える前に済ませたい
+	// (弾く場合は in-memory の note も無傷で返す)。
+	var newCW *string
+	if summary := remoteText(apNote.Summary.String(), noteCWMaxRunes); summary != "" {
+		newCW = &summary
+	} else if apNote.Sensitive {
+		// Summary が空でも sensitive なら空 CW を保つ (IngestNote と対称)。
+		empty := ""
+		newCW = &empty
+	}
+	// 禁止語 (meta.prohibitedWords) は編集経路にも掛ける。
+	//
+	// **upstream には対応物が無い** — 本家 ApInboxService.update は object が
+	// Actor でも Question でもなければ `skip: Unknown type` で捨てるので、Note の
+	// 編集を取り込むのは mk-go 固有の拡張。取り込む以上、create 側と同じ検査を
+	// 通さないと「禁止語を含まない note を投げてから Update で差し替える」で
+	// 判定を素通りできる。
+	//
+	// **書き込みより前に判定する。** 以降の `upsertEmojis` / `upsertAttachments` は
+	// note の列とは別に `emoji` / `drive_file` の行を書くので、後ろに置くと
+	// 「本文は更新しないが絵文字だけ差し替わる」形になる。poll は
+	// UpdateRemoteQuestion 側の担当なのでここでは渡さない (選択肢の文言自体は
+	// Update(Question) でも変わらない — 変わるのは投票数だけ)。
+	effectiveText := existing.Text
+	if newText != "" {
+		effectiveText = &newText
+	}
+	effectiveCW := existing.CW
+	if newCW != nil {
+		effectiveCW = newCW
+	}
+	if r.containsProhibitedWords(effectiveText, effectiveCW, nil) {
+		slog.Info("federation: dropping inbound note update containing prohibited words",
+			"uri", truncateRunes(apNote.ID, noteURIMaxRunes), "noteId", existing.ID)
+		return existing, nil
+	}
 	if newText != "" {
 		fields["text"] = &newText
 		existing.Text = &newText
@@ -3077,27 +3571,31 @@ func (r *Resolver) UpdateRemoteNote(body []byte, actorURI string) (*model.Note, 
 	// text が変わらなくても tag 配列の Mention は AP Update で変化しうる (#397)。
 	// IngestNote と同じく本文と tag 両方から mention を集めて user ID 配列に
 	// 統一する (mentions 列の意味論を local create 経路と揃えるため)。
-	var textMentions []string
+	var (
+		textMentions []string
+		merr         error
+	)
 	switch {
 	case newText != "":
-		textMentions = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(newText))
+		textMentions, merr = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(newText))
 	case existing.Text != nil:
-		textMentions = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(*existing.Text))
+		textMentions, merr = r.resolveTextMentionUserIDs(corenote.ExtractMentionStructs(*existing.Text))
 	}
-	tagMentions := r.resolveMentionedUserIDs(extractMentionTags(apNote.Tag))
+	if merr != nil {
+		return nil, fmt.Errorf("update remote note: %w", merr)
+	}
+	tagMentions, merr := r.resolveMentionedUserIDs(extractMentionTags(apNote.Tag))
+	if merr != nil {
+		return nil, fmt.Errorf("update remote note: %w", merr)
+	}
 	mentions := mergeMentionIDs(textMentions, tagMentions)
 	if !slices.Equal([]string(existing.Mentions), []string(mentions)) {
 		fields["mentions"] = mentions
 		existing.Mentions = mentions
 	}
-	if summary := remoteText(apNote.Summary.String(), noteCWMaxRunes); summary != "" {
-		fields["cw"] = &summary
-		existing.CW = &summary
-	} else if apNote.Sensitive {
-		// Summary が空でも sensitive なら空 CW を保つ (IngestNote と対称)。
-		empty := ""
-		fields["cw"] = &empty
-		existing.CW = &empty
+	if newCW != nil {
+		fields["cw"] = newCW
+		existing.CW = newCW
 	}
 	// permalink も追従する (#2729)。**捨てられた値では上書きしない** — 読めない
 	// `url` が来ただけで、取り込み時に保存した正しい permalink を消してしまう。
@@ -3285,9 +3783,14 @@ func extractMentionTags(tags []any) []string {
 // で安価に変換し、リモート URI は既知 (DB に取り込み済) のものだけ
 // userRepo.FindByURI でルックアップする。未知リモート URI は federation fetch
 // すると inbox 処理が重くなるため skip。返り値は入力順を保ち重複排除する。
-func (r *Resolver) resolveMentionedUserIDs(hrefs []string) []string {
+//
+// **引けなかったものを「未知」に潰さない** (#3121)。潰すと `mentions` や
+// specified note の `visibleUserIds` が空のまま note が確定し、**URI は DB に
+// 入るので retry は dedup にヒットして二度と直らない**。DM なら受信者本人が
+// 本文を読めなくなる (`core/note/visibility.go` の `CanView` は空配列を見る)。
+func (r *Resolver) resolveMentionedUserIDs(hrefs []string) ([]string, error) {
 	if len(hrefs) == 0 {
-		return nil
+		return nil, nil
 	}
 	seen := make(map[string]struct{}, len(hrefs))
 	out := make([]string, 0, len(hrefs))
@@ -3296,8 +3799,12 @@ func (r *Resolver) resolveMentionedUserIDs(hrefs []string) []string {
 		if local := r.ExtractLocalUserID(href); local != "" {
 			id = local
 		} else if r.userRepo != nil {
-			if u, err := r.userRepo.FindByURI(href); err == nil && u != nil {
+			u, err := r.userRepo.FindByURI(href)
+			switch {
+			case err == nil && u != nil:
 				id = u.ID
+			case err != nil && !repository.IsNotFound(err):
+				return nil, fmt.Errorf("resolve mentioned user %q: %w", truncateRunes(href, userURIMaxRunes), err)
 			}
 		}
 		if id == "" {
@@ -3309,7 +3816,7 @@ func (r *Resolver) resolveMentionedUserIDs(hrefs []string) []string {
 		seen[id] = struct{}{}
 		out = append(out, id)
 	}
-	return out
+	return out, nil
 }
 
 // resolveTextMentionUserIDs maps text-derived `@username[@host]` mentions to
@@ -3318,9 +3825,9 @@ func (r *Resolver) resolveMentionedUserIDs(hrefs []string) []string {
 // userRepo 未設定 / 未知ユーザーは skip する (NotificationService 等の
 // 既存後段は skip でも username fallback で動くが、mentions 列の query は
 // ID 完全一致なので残しても無駄)。
-func (r *Resolver) resolveTextMentionUserIDs(mentions []corenote.Mention) []string {
+func (r *Resolver) resolveTextMentionUserIDs(mentions []corenote.Mention) ([]string, error) {
 	if r.userRepo == nil || len(mentions) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]string, 0, len(mentions))
 	for _, m := range mentions {
@@ -3330,12 +3837,17 @@ func (r *Resolver) resolveTextMentionUserIDs(mentions []corenote.Mention) []stri
 			host = &h
 		}
 		u, err := r.userRepo.FindByUsernameLower(m.Username, host)
+		if err != nil && !repository.IsNotFound(err) {
+			// 上と同じ (#3121)。引けなかったものを「未知の相手」に潰すと、
+			// 通知の宛先が欠けたまま note が確定する。
+			return nil, fmt.Errorf("resolve text mention %q: %w", m.Username, err)
+		}
 		if err != nil || u == nil {
 			continue
 		}
 		out = append(out, u.ID)
 	}
-	return out
+	return out, nil
 }
 
 // extractHashtagTagNames parses the Tag array of a Note and returns the
@@ -3379,6 +3891,10 @@ func extractHashtagTagNames(tags []any) []string {
 // extractEmojiTags parses the Tag array of a Person or Note and returns
 // any elements with type "Emoji". Tag配列はJSON unmarshal後に []any
 // (各要素が map[string]any) として届くため、型アサーションで抽出する。
+//
+// **採用件数は maxRemoteEmojiTags で打ち切る。** upsertEmojis は 1 件ごとに
+// `emoji` 行を書くので、上限が無いと 1 document で任意件数の書き込みを起こせる。
+// 打ち切りは採用側で数える (Emoji 以外の tag は勘定に入れない)。
 func extractEmojiTags(tags []any) []activitypub.EmojiTag {
 	if len(tags) == 0 {
 		return nil
@@ -3429,6 +3945,9 @@ func extractEmojiTags(tags []any) []activitypub.EmojiTag {
 			Updated: updated,
 			License: license,
 		})
+		if len(out) >= maxRemoteEmojiTags {
+			break
+		}
 	}
 	return out
 }
@@ -3653,8 +4172,9 @@ func hasPublicAudience(list []string) bool {
 // 非正規化で入り、acct 解決が空振りする (#2704 / #2706)。upstream も保存時に
 // `punyHost` を掛けている (ApPersonService.ts)。
 //
-// 比較専用の punyHost とは役割が違う。あちらは**読み取り側で両辺を揃える**もので、
-// backfill 前の非正規化行が残っているあいだは併存する。
+// 比較専用の punyHost とは役割が違う。保存側 (この関数) が正規化した値に対して、
+// punyHost は**外から来る綴りを同じ正規形へ寄せる**。両者が揃っているので完全一致で
+// 引ける (#2996 で読み取り側の両当たりを撤去できたのはこのため)。
 func hostFromURI(uri string) (string, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -3664,11 +4184,16 @@ func hostFromURI(uri string) (string, error) {
 	// host 不在の URI が `":8443"` として通ってしまう。同ファイルの binding 検査
 	// (assertResponseHostMatches 等) は元から `u.Hostname()` を見ており、保存の
 	// 入口になった今は揃えないと「binding では弾かれるのに保存はされる」形が残る
-	// (#2714 review LOW-9)。返す値は port 込みのまま (`user.host` は port を持つ)。
+	// (#2714 review LOW-9)。
 	if u.Hostname() == "" {
 		return "", fmt.Errorf("missing host in %q", uri)
 	}
-	return idnhost.Puny(u.Host), nil
+	// **既定ポートは剥がして返す。** 非既定ポートは残る (`user.host` は port を
+	// 持ちうる)。`idnhost.Puny(u.Host)` で済ませていた頃は `https://h:443/x` が
+	// `h:443` として保存され、`blockedHosts` の suffix 一致から外れていた。
+	// 比較側の `sameDeliveryHost` は元から `punyHostPort` で剥がしていたので、
+	// **片側だけ正規化している**状態だった。
+	return punyHostPort(u), nil
 }
 
 // punyHost normalizes a host for comparison the way upstream
@@ -3678,8 +4203,12 @@ func hostFromURI(uri string) (string, error) {
 // 小文字化で返す (Go default の lenient UTS#46 profile では port 付き host も
 // 成功し ASCII tail はそのまま残るため、fallback は実質ほぼ発生しない)。これは
 // 保存側 (`hostFromURI`) も #2706 で同じ正規化を掛けるようになったので、両者は
-// 同じ値を作る。punyHost が今も要るのは、**backfill 前に非正規化で保存された行**と
-// 外から渡ってくる acct の host を突き合わせるため。
+// 同じ値を作る。punyHost が今も要るのは、**外から渡ってくる acct や actor の host**
+// を保存形と同じ正規形へ揃えるため (読み取り側の両当たりは #2996 で撤去した)。
+//
+// **既定ポートの扱いだけは違う。** `hostFromURI` は `https://h:443` を `h` として
+// 保存する (`punyHostPort` が剥がす) が、`punyHost` はポートを見ない。ポートを
+// 含む host を突き合わせるときは `punyHostPort` / `NormalizeGateHost` を使う。
 //
 // なお Go の idna は ideographic/fullwidth dot (U+3002 等) を `.` に畳まない
 // (Node の domainToASCII と異なるが、別 authority を同一視しない安全側)。
@@ -3837,8 +4366,7 @@ func normalizeMatchHost(u *url.URL) string {
 	host := punyHost(u.Hostname())
 	host = strings.TrimPrefix(host, "www.")
 	port := u.Port()
-	isDefaultPort := (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80")
-	if port != "" && !isDefaultPort {
+	if port != "" && !isDefaultPortForScheme(u.Scheme, port) {
 		return host + ":" + port
 	}
 	return host
@@ -3877,15 +4405,70 @@ func trimWHATWGURL(raw string) string {
 }
 
 // punyHostPort mirrors upstream's punyHost (idna host + non-default port).
-func punyHostPort(u *url.URL) string {
-	host := punyHost(u.Hostname())
-	port := u.Port()
-	isDefaultPort := (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80")
-	if port != "" && !isDefaultPort {
-		return host + ":" + port
+//
+// **規則は `idnhost.HostPort` に 1 つだけ置く。** 保存側 (#2994 の
+// `chat_room.uri`) も同じ正規形を作る必要があり、片方だけ動かすと「比較では
+// 同じ authority なのに保存は別物」という綴り違いの取り違えが生まれる。
+func punyHostPort(u *url.URL) string { return idnhost.HostPort(u) }
+
+func isDefaultPortForScheme(scheme, port string) bool {
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return false
 	}
-	return host
+	switch scheme {
+	case "https":
+		return n == 443
+	case "http":
+		return n == 80
+	}
+	return false
 }
+
+// NormalizeGateHost returns the canonical host form used by the federation
+// gates (blockedHosts / silencedHosts / federationHosts) and by `instance.host`
+// for an absolute URL string. Returns "" when the URL has no host.
+//
+// **配送側と取り込み側で同じ規則を使うための唯一の入口。** 別パッケージ
+// (`internal/queue/processors`) の inbox URL 解釈もここを通す — 規則を写すと
+// 片側だけ既定ポートを剥がす状態に戻る (#2915 review HIGH)。
+func NormalizeGateHost(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	return punyHostPort(u)
+}
+
+// maxRemoteAttachments bounds how many AP `attachment` entries one inbound
+// document can contribute.
+//
+// **upstream に上限は無い** (`ApNoteService` は `toArray(note.attachment)` を
+// そのまま回す) が、mk-go では 1 件につき `drive_file` の SELECT + INSERT と、
+// `mediaType` が `image/*` で width/height が欠けていれば**外向き GET** が
+// 直列に走る。上限が無いと、署名付き POST 1 通 (inbox の body 上限 64 KiB に
+// 添付 900 件が収まる) で inbox worker を数十分占有できる。
+//
+// 値はローカルの受け入れ上限に揃える — `notes/create` の paramDef は
+// `fileIds: maxItems 16` (upstream も同値、`validateCreateInput` 参照)。
+// profile fields (maxRemoteFields) を i/update の 16 に揃えたのと同じ決め方。
+// 超過分は落とす: 17 枚目以降を持つ note がローカルで作れない以上、リモート
+// だけ受け入れる理由が無い。
+const maxRemoteAttachments = 16
+
+// maxRemoteEmojiTags bounds how many AP `tag` Emoji entries one inbound
+// document (Note or Person) can contribute.
+//
+// upstream に上限は無いが、1 件につき `emoji` の INSERT / UPDATE が走り、名前は
+// `note.emojis` / `user.emojis` (varchar(128)[]) にも載る。無制限だと 1 通で
+// 任意件数の書き込みを強制できる。
+//
+// **hashtag の 32 には揃えない (レビュー M3)。** あちらは upstream 自身が
+// `.splice(0, 32)` で切っているが、絵文字は upstream が切っていない。**絵文字を
+// 33 種類以上使うノート (いわゆる絵文字アート) は珍しくなく**、32 にすると
+// 正当な投稿が目に見えて劣化する (超過分は `:name:` のリテラルで表示される)。
+// 実用上まず届かない値まで上げて、無制限の fan-out だけを止める。
+const maxRemoteEmojiTags = 128
 
 // extractAttachments parses the AP `attachment` array (heterogeneous []any
 // after JSON unmarshal) and returns Document entries. type が upstream の
@@ -3893,11 +4476,15 @@ func punyHostPort(u *url.URL) string {
 // いずれかで `url` を持つもののみ採用する。#378 / #2662。
 // noteSensitive は upstream の `attach.sensitive ??= note.sensitive` に対応する。
 // 添付側に `sensitive` が無いとき note レベルの値を継ぐ。
+//
+// **採用件数は maxRemoteAttachments で打ち切る。** 打ち切りは採用側で数える
+// (raw の要素数ではない) ので、type が合わない要素が前に並んでいても有効な
+// 添付が削られない。
 func extractAttachments(rawAttachments []any, noteSensitive bool) []activitypub.Document {
 	if len(rawAttachments) == 0 {
 		return nil
 	}
-	out := make([]activitypub.Document, 0, len(rawAttachments))
+	out := make([]activitypub.Document, 0, min(len(rawAttachments), maxRemoteAttachments))
 	for _, raw := range rawAttachments {
 		m, ok := raw.(map[string]any)
 		if !ok {
@@ -3955,6 +4542,9 @@ func extractAttachments(rawAttachments []any, noteSensitive bool) []activitypub.
 			Icon:      icon,
 			Blurhash:  blurhash,
 		})
+		if len(out) >= maxRemoteAttachments {
+			break
+		}
 	}
 	return out
 }
@@ -4205,6 +4795,19 @@ func (r *Resolver) upsertAttachments(docs []activitypub.Document, userID, host *
 		return model.StringArray{}
 	}
 	ids := make(model.StringArray, 0, len(docs))
+	// dimension probe の予算は**この呼び出し全体**で 1 つ。添付ごとの
+	// `imageFetchTimeout` は 1 本の GET しか縛らないので、直列に積まれると
+	// 件数分だけ待たされる (attachmentProbeBudget の説明を参照)。
+	//
+	// **ジョブの ctx は届かない。** IngestNote / upsertAttachments は ctx を
+	// 引き回していない (queue processor から resolver までの経路が ctx を取らない)
+	// ので、ここで根を作る。ctx を通す改修が入ったらこの Background を差し替える。
+	budget := r.probeBudget
+	if budget <= 0 {
+		budget = attachmentProbeBudget
+	}
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), budget)
+	defer cancelProbe()
 	for _, doc := range docs {
 		// **URL が列に入らないなら添付ごと諦める。** `drive_file.url` は
 		// varchar(1024) NOT NULL で、この添付の実体そのもの。切ると別の場所を
@@ -4286,7 +4889,7 @@ func (r *Resolver) upsertAttachments(docs []activitypub.Document, userID, host *
 		// 0/0 のまま属性 JSON を空にしておき、表示側のフォールバック
 		// に任せる。タイムアウト 3s で inbox 全体は止めない。
 		if (width == 0 || height == 0) && strings.HasPrefix(mediaType, "image/") && r.imageProbeClient != nil {
-			if w, h, ok := probeImageDimensions(r.imageProbeClient, doc.URL); ok {
+			if w, h, ok := probeImageDimensions(probeCtx, r.imageProbeClient, doc.URL); ok {
 				if width == 0 {
 					width = w
 				}

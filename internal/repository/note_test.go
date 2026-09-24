@@ -3246,11 +3246,7 @@ func TestNoteRepository_MentionsFileIdsGINIndexes(t *testing.T) {
 	// 1. index が存在し GIN 型であること (CONCURRENTLY migration が適用された
 	//    ことの確認も兼ねる)。
 	for _, idx := range []string{"IDX_note_mentions", "IDX_note_fileIds"} {
-		var indexdef string
-		err := testDB.Raw(
-			`SELECT indexdef FROM pg_indexes WHERE tablename = 'note' AND indexname = ?`, idx,
-		).Scan(&indexdef).Error
-		require.NoError(t, err)
+		indexdef := indexDef(t, "note", idx)
 		require.NotEmpty(t, indexdef, "GIN index %s must exist (migration applied)", idx)
 		assert.Contains(t, indexdef, "USING gin", "%s must be a GIN index", idx)
 	}
@@ -3886,4 +3882,238 @@ func TestNoteRepository_SearchByFilter_EscapesLikePattern(t *testing.T) {
 	out, err = repo.SearchByFilter(model.NoteSearchFilter{Query: "SNAKE_CASE", Limit: 10})
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"n_sel_3"}, idsOf(out))
+}
+
+// **返信先の note が見えないなら集計に出さない。** 集計は非正規化列
+// `"replyUserId"` を読むだけなので、返信元 (author の reply) だけを gate すると
+// 「返信元は public だが返信先は followers」の組で相手の身元が集計値に漏れる。
+// upstream も generateVisibilityQuery を 2 つのクエリ両方に足している。
+func TestNoteRepository_CountReplyTargets_ReplyTargetVisibility(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	author := insertTestUser(t, "u_crt_rt_a", "crtRtA")
+	defer cleanupUser(t, author.ID)
+	hidden := insertTestUser(t, "u_crt_rt_h", "crtRtH")
+	defer cleanupUser(t, hidden.ID)
+	shown := insertTestUser(t, "u_crt_rt_v", "crtRtV")
+	defer cleanupUser(t, shown.ID)
+	stranger := insertTestUser(t, "u_crt_rt_s", "crtRtS")
+	defer cleanupUser(t, stranger.ID)
+
+	// 返信先 2 件: hidden の followers note (stranger には見えない) と
+	// shown の public note。
+	hiddenTarget := "n_crt_rt_hidden"
+	shownTarget := "n_crt_rt_shown"
+	require.NoError(t, testDB.Create(&model.Note{ID: hiddenTarget, UserID: hidden.ID, Visibility: model.NoteVisibilityFollowers}).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, hiddenTarget)
+	require.NoError(t, testDB.Create(&model.Note{ID: shownTarget, UserID: shown.ID, Visibility: model.NoteVisibilityPublic}).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, shownTarget)
+
+	// author の返信はどちらも public = **返信元だけ見ると両方とも集計対象**。
+	for _, n := range []*model.Note{
+		{ID: "n_crt_rt_r1", UserID: author.ID, ReplyID: &hiddenTarget, ReplyUserID: &hidden.ID, Visibility: model.NoteVisibilityPublic},
+		{ID: "n_crt_rt_r2", UserID: author.ID, ReplyID: &shownTarget, ReplyUserID: &shown.ID, Visibility: model.NoteVisibilityPublic},
+	} {
+		require.NoError(t, testDB.Create(n).Error)
+		defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, n.ID)
+	}
+
+	// stranger からは shown だけが見える。hidden は返信先が followers なので出ない。
+	rows, err := repo.CountReplyTargets(author.ID, stranger.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "返信先が見えない相手が集計に出ている")
+	assert.Equal(t, shown.ID, rows[0].UserID)
+
+	// anonymous も同じ。
+	rows, err = repo.CountReplyTargets(author.ID, "", 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, shown.ID, rows[0].UserID)
+
+	// 返信先の author 自身からは両方見える (自分の followers note は見える)。
+	rows, err = repo.CountReplyTargets(author.ID, hidden.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "返信先の当人からは見えるはず")
+}
+
+// **直近 1000 件を超える返信は集計に入らない。** upstream
+// get-frequently-replied-users.ts の `ORDER BY note.id DESC LIMIT 1000` と同じ。
+// この endpoint は未認証で任意の userId に対して叩けてレート制限も無いので、
+// 上限が無いと投稿数に比例して重くなる (相関 EXISTS が 1 行ごとの PK 探索になる)。
+func TestNoteRepository_CountReplyTargets_ScanLimit(t *testing.T) {
+	// **窓のサイズはリテラルで書く。** `recentReplyScanLimit` を fixture に使うと、
+	// 定数を変える変異にテスト側が追随して境界がずれても落ちない (実測で 7 / 2000 の
+	// どちらでも PASS した)。同じブランチの emoji 側で踏んだのと同じ型。
+	const window = 1000
+	assert.Equal(t, window, recentReplyScanLimit, "upstream の limit(1000) と揃える")
+
+	repo := NewNoteRepository(testDB)
+	author := insertTestUser(t, "u_crt_lim_a", "crtLimA")
+	defer cleanupUser(t, author.ID)
+	recent := insertTestUser(t, "u_crt_lim_r", "crtLimR")
+	defer cleanupUser(t, recent.ID)
+	old := insertTestUser(t, "u_crt_lim_o", "crtLimO")
+	defer cleanupUser(t, old.ID)
+	viewer := insertTestUser(t, "u_crt_lim_v", "crtLimV")
+	defer cleanupUser(t, viewer.ID)
+
+	// **返信先は 1 件ずつ別のノートにする。** 同じノートへ 1000 回にすると、
+	// upstream は `note.id IN (replyIds)` で畳んで 1、mk-go の COUNT(*) は 1000 と
+	// なり、件数を assert すると**既知の乖離が最大に開いた形で固定される**。
+	// 別々にすれば両者とも 1000 で一致するので、乖離に依存せず件数を見られる。
+	oldTarget := "n_crt_lim_to"
+	require.NoError(t, testDB.Create(&model.Note{ID: oldTarget, UserID: old.ID, Visibility: model.NoteVisibilityPublic}).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, oldTarget)
+	defer testDB.Exec(`DELETE FROM "note" WHERE "userId" = ?`, recent.ID)
+	recentTargets := make([]*model.Note, 0, window)
+	for i := 0; i < window; i++ {
+		recentTargets = append(recentTargets, &model.Note{
+			ID: fmt.Sprintf("n_crt_lim_t%04d", i), UserID: recent.ID, Visibility: model.NoteVisibilityPublic,
+		})
+	}
+	require.NoError(t, testDB.CreateInBatches(recentTargets, 500).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE "userId" = ?`, author.ID)
+
+	// id は昇順で新しくなる。old 宛を先に (= 古い側) 5 件、recent 宛を後に 1000 件。
+	notes := make([]*model.Note, 0, window+5)
+	for i := 0; i < 5; i++ {
+		notes = append(notes, &model.Note{
+			ID: fmt.Sprintf("n_crt_lim_a%04d", i), UserID: author.ID,
+			ReplyID: &oldTarget, ReplyUserID: &old.ID, Visibility: model.NoteVisibilityPublic,
+		})
+	}
+	for i := 0; i < window; i++ {
+		tid := recentTargets[i].ID
+		notes = append(notes, &model.Note{
+			ID: fmt.Sprintf("n_crt_lim_b%04d", i), UserID: author.ID,
+			ReplyID: &tid, ReplyUserID: &recent.ID, Visibility: model.NoteVisibilityPublic,
+		})
+	}
+	require.NoError(t, testDB.CreateInBatches(notes, 500).Error)
+
+	rows, err := repo.CountReplyTargets(author.ID, viewer.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "1000 件の窓の外にいる相手が集計に出ている")
+	assert.Equal(t, recent.ID, rows[0].UserID)
+	// 返信先が全部別ノートなので upstream / mk-go とも 1000。窓のサイズを潰す変異
+	// (`.Limit(10)` など) はここで落ちる。
+	assert.EqualValues(t, window, rows[0].Count)
+}
+
+// 自己返信は窓を取った**後**に除外する。窓の内側に置くと、自己返信だけを大量に
+// 持つ利用者で LIMIT が満たされず全表走査に倒れる。
+func TestNoteRepository_CountReplyTargets_SelfRepliesConsumeWindow(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	author := insertTestUser(t, "u_crt_self_a", "crtSelfA")
+	defer cleanupUser(t, author.ID)
+	other := insertTestUser(t, "u_crt_self_o", "crtSelfO")
+	defer cleanupUser(t, other.ID)
+	viewer := insertTestUser(t, "u_crt_self_v", "crtSelfV")
+	defer cleanupUser(t, viewer.ID)
+
+	selfTarget, otherTarget := "n_crt_self_ts", "n_crt_self_to"
+	require.NoError(t, testDB.Create(&model.Note{ID: selfTarget, UserID: author.ID, Visibility: model.NoteVisibilityPublic}).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, selfTarget)
+	require.NoError(t, testDB.Create(&model.Note{ID: otherTarget, UserID: other.ID, Visibility: model.NoteVisibilityPublic}).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, otherTarget)
+	defer testDB.Exec(`DELETE FROM "note" WHERE "userId" = ?`, author.ID)
+
+	// 他者宛が古く (a)、自己返信が新しい (b)。窓は自己返信込みで取るので、
+	// 自己返信が窓を埋めれば他者宛は集計に出ない = upstream と同じ窓。
+	notes := []*model.Note{{
+		ID: "n_crt_self_a000", UserID: author.ID,
+		ReplyID: &otherTarget, ReplyUserID: &other.ID, Visibility: model.NoteVisibilityPublic,
+	}}
+	for i := 0; i < 1000; i++ {
+		notes = append(notes, &model.Note{
+			ID: fmt.Sprintf("n_crt_self_b%04d", i), UserID: author.ID,
+			ReplyID: &selfTarget, ReplyUserID: &author.ID, Visibility: model.NoteVisibilityPublic,
+		})
+	}
+	require.NoError(t, testDB.CreateInBatches(notes, 500).Error)
+
+	rows, err := repo.CountReplyTargets(author.ID, viewer.ID, 10)
+	require.NoError(t, err)
+	assert.Empty(t, rows, "自己返信が窓を埋めたら他者宛は出ない (upstream と同じ窓)")
+}
+
+// #2995: この note を renote / reply したリモート user を引く。
+//
+// **ローカルの renote / reply は返さない** (連合配送の宛先を組み立てるための
+// クエリで、ローカル user には inbox が無い)。**重複も返さない** (同じ user が
+// renote と reply の両方をしている、複数回 reply している)。
+func TestNote_ListRenoteOrReplyRemoteUserIDs(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	local := insertTestUser(t, "u_rr_local", "rrlocal")
+	remoteA := insertTestUser(t, "u_rr_a", "rra")
+	remoteB := insertTestUser(t, "u_rr_b", "rrb")
+	host := "remote.example"
+	for _, id := range []string{remoteA.ID, remoteB.ID} {
+		require.NoError(t, testDB.Exec(`UPDATE "user" SET host = ? WHERE id = ?`, host, id).Error)
+	}
+	t.Cleanup(func() {
+		testDB.Exec(`DELETE FROM "note" WHERE id LIKE 'rr_%'`)
+		cleanupUser(t, local.ID)
+		cleanupUser(t, remoteA.ID)
+		cleanupUser(t, remoteB.ID)
+	})
+
+	target := &model.Note{ID: "rr_target", UserID: local.ID, Visibility: model.NoteVisibilityFollowers}
+	require.NoError(t, repo.Create(target))
+
+	seed := func(id, userID string, userHost *string, renote, reply bool) {
+		n := &model.Note{ID: id, UserID: userID, UserHost: userHost, Visibility: model.NoteVisibilityPublic}
+		if renote {
+			n.RenoteID = &target.ID
+		}
+		if reply {
+			n.ReplyID = &target.ID
+		}
+		require.NoError(t, repo.Create(n))
+	}
+	seed("rr_remote_renote", remoteA.ID, &host, true, false)
+	// 同じ user が reply もしている (重複しないこと)。
+	seed("rr_remote_reply", remoteA.ID, &host, false, true)
+	seed("rr_remote_b_reply", remoteB.ID, &host, false, true)
+	// ローカルの renote は対象外。
+	seed("rr_local_renote", local.ID, nil, true, false)
+	// 無関係な note も対象外。
+	seed("rr_unrelated", remoteB.ID, &host, false, false)
+
+	ids, err := repo.ListRenoteOrReplyRemoteUserIDs(target.ID)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{remoteA.ID, remoteB.ID}, ids)
+
+	// 引き当てが無ければ空。
+	none, err := repo.ListRenoteOrReplyRemoteUserIDs("rr_unrelated")
+	require.NoError(t, err)
+	assert.Empty(t, none)
+	empty, err := repo.ListRenoteOrReplyRemoteUserIDs("")
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+}
+
+// **凍結した利用者の featured ノートを返さないこと。**
+//
+// `users/show` が凍結ユーザーを `NO_SUCH_USER` で隠すのに、同じ利用者のノートが
+// 本文つきで返るのは経路ごとに結果が食い違う形。upstream
+// `users/featured-notes.ts` は `generateSuspendedUserQueryForNote` を掛けている。
+func TestNoteRepository_ListFeaturedByUser_ExcludesSuspendedAuthor(t *testing.T) {
+	repo := NewNoteRepository(testDB)
+	author := insertTestUser(t, "feat_susp_u", "featsuspu")
+	defer cleanupUser(t, author.ID)
+
+	note := &model.Note{ID: "feat_susp_n1", UserID: author.ID, Visibility: "public", RenoteCount: 5}
+	require.NoError(t, testDB.Create(note).Error)
+	defer testDB.Exec(`DELETE FROM "note" WHERE id = ?`, note.ID)
+
+	// 凍結前は返る (対照)。
+	got, err := repo.ListFeaturedByUser(author.ID, "", "", 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "凍結前は返ること")
+
+	require.NoError(t, testDB.Exec(`UPDATE "user" SET "isSuspended" = true WHERE id = ?`, author.ID).Error)
+
+	got, err = repo.ListFeaturedByUser(author.ID, "", "", 10)
+	require.NoError(t, err)
+	require.Empty(t, got, "凍結後は返さないこと")
 }

@@ -19,6 +19,7 @@ import (
 	corenote "github.com/shiroha-a/mk/internal/core/note"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
@@ -46,7 +47,14 @@ func newDraftHandler() *Handler {
 
 // --- Mock DraftRepo ---
 
-var errDraftMock = assert.AnError
+// **not-found を模す。** 汎用 error だと #2792 の「DB 障害は 500」に引っかかる。
+// repository は GORM の error をそのまま返すので、テストもそれに揃える。
+var errDraftMock = repository.ErrNotFound
+
+// errBoom is a generic failure for write paths. **not-found とは分けること** —
+// 同じ値を使い回すと、将来 write path に `IsNotFound` の分岐が入ったときに
+// これらのテストが黙って別の枝を通る (#2792)。
+var errBoom = errors.New("db down")
 
 type mockDraftRepo struct {
 	drafts    map[string]*model.NoteDraft
@@ -518,7 +526,7 @@ func TestDraftsCreate_InvalidJSON(t *testing.T) {
 
 func TestDraftsCreate_Error(t *testing.T) {
 	h, repo := newDraftHandlerWithRepo()
-	repo.createErr = errDraftMock
+	repo.createErr = errBoom
 	rec := postDraft(h.DraftsCreate, `{"text":"x"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -877,10 +885,9 @@ func TestPollsRecommendation(t *testing.T) {
 
 // scheduledEnqueueStub captures EnqueuePostScheduledNote calls for assertion.
 type scheduledEnqueueStub struct {
-	calls    []queue.PostScheduledNotePayload
-	cleared  []string
-	err      error
-	disabled bool // true で SupportsScheduledNote が false を返す (= asynq driver の simulate 用)
+	calls   []queue.PostScheduledNotePayload
+	cleared []string
+	err     error
 }
 
 func (s *scheduledEnqueueStub) EnqueuePostScheduledNote(p queue.PostScheduledNotePayload, _ ...driver.EnqueueOption) error {
@@ -894,13 +901,6 @@ func (s *scheduledEnqueueStub) EnqueuePostScheduledNote(p queue.PostScheduledNot
 func (s *scheduledEnqueueStub) ClearScheduledNote(draftID string) error {
 	s.cleared = append(s.cleared, draftID)
 	return nil
-}
-
-// SupportsScheduledNote: default true (= mkq driver と同 capability)。
-// `disabled=true` を set すると false を返し asynq driver の挙動を simulate
-// する (= handler 側 capability gate test 用)。
-func (s *scheduledEnqueueStub) SupportsScheduledNote() bool {
-	return !s.disabled
 }
 
 func futureMs(d time.Duration) int64 {
@@ -967,17 +967,19 @@ func TestDraftsCreate_ScheduledAtWithoutActuallyScheduled(t *testing.T) {
 	assert.Empty(t, enq.calls, "isActuallyScheduled=false なら enqueue されない")
 }
 
-// driver capability が false (= asynq driver) のときは scheduled note 作成を
-// TOO_MANY_SCHEDULED_NOTES で reject する (#1045 Phase 2-C)。
-func TestDraftsCreate_AsynqDriverDisablesScheduled(t *testing.T) {
+// **予約投稿は driver の都合で無効化されない (#2985)。** 以前は asynq driver で
+// clearSchedule が確実に効かないため `TOO_MANY_SCHEDULED_NOTES` で門前払いして
+// いた。その分岐を消したので、上限とは無関係に 400 を返していないことを固定
+// する (回帰すると、利用者には「予約上限に達した」と嘘の理由が出る)。
+func TestDraftsCreate_ScheduledNotRejectedAsQuota(t *testing.T) {
 	h, _ := newDraftHandlerWithRepo()
-	enq := &scheduledEnqueueStub{disabled: true}
+	enq := &scheduledEnqueueStub{}
 	h.SetScheduledNoteEnqueuer(enq)
 	body := fmt.Sprintf(`{"text":"hi","scheduledAt":%d,"isActuallyScheduled":true}`, futureMs(time.Hour))
 	rec := postDraft(h.DraftsCreate, body, &model.User{ID: "u1"})
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "TOO_MANY_SCHEDULED_NOTES")
-	assert.Empty(t, enq.calls, "capability false なら enqueue されない")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "TOO_MANY_SCHEDULED_NOTES")
+	assert.Len(t, enq.calls, 1, "enqueue まで到達する")
 }
 
 // --- #1045 Phase 2-C: DraftsUpdate / DraftsDelete scheduled note 経路 ---
@@ -1032,16 +1034,18 @@ func TestDraftsUpdate_NonScheduledChangeDoesNotTouchQueue(t *testing.T) {
 	assert.Empty(t, enq.calls)
 }
 
-// asynq driver では update での scheduled 切替も reject (= capability gate)。
-func TestDraftsUpdate_AsynqDriverDisablesScheduled(t *testing.T) {
+// update 経由の scheduled 切替も同じ (#2985)。こちらは create とは別の
+// エラー id を持っていたので、分岐が片方だけ残る形を塞ぐために両方見る。
+func TestDraftsUpdate_ScheduledNotRejectedAsQuota(t *testing.T) {
 	h, repo := newDraftHandlerWithRepo()
-	enq := &scheduledEnqueueStub{disabled: true}
+	enq := &scheduledEnqueueStub{}
 	h.SetScheduledNoteEnqueuer(enq)
 	repo.drafts["d1"] = &model.NoteDraft{ID: "d1", UserID: "u1"}
 	body := fmt.Sprintf(`{"draftId":"d1","scheduledAt":%d,"isActuallyScheduled":true}`, futureMs(time.Hour))
 	rec := postDraft(h.DraftsUpdate, body, &model.User{ID: "u1"})
-	assert.Equal(t, http.StatusBadRequest, rec.Code)
-	assert.Contains(t, rec.Body.String(), "TOO_MANY_SCHEDULED_NOTES")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "TOO_MANY_SCHEDULED_NOTES")
+	assert.Len(t, enq.calls, 1, "enqueue まで到達する")
 }
 
 // Delete 経由でも旧 delayed task を clear する (= unschedule された draft の
@@ -1111,7 +1115,9 @@ func newThreadMuteHandler() (*Handler, *testutil.MockNoteRepository, *testutil.M
 	return &Handler{idGen: idGen, noteRepo: noteRepo, threadMutingRepo: tmRepo}, noteRepo, tmRepo
 }
 
-func TestThreadMutingCreate_PersistsAndIdempotent(t *testing.T) {
+// upstream 1853898d71: 2 回目は 400 ALREADY_MUTING。#1538 までの mk-go は 204 を
+// 返す冪等実装で、同じ入力に対する wire 上のレスポンスが upstream と分岐していた。
+func TestThreadMutingCreate_PersistsAndRejectsDuplicate(t *testing.T) {
 	h, noteRepo, tmRepo := newThreadMuteHandler()
 	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "author"}
 	user := &model.User{ID: "viewer"}
@@ -1122,8 +1128,10 @@ func TestThreadMutingCreate_PersistsAndIdempotent(t *testing.T) {
 	assert.True(t, ex, "thread muting row must be persisted")
 
 	rec2 := postDraft(h.ThreadMutingCreate, `{"noteId":"n1"}`, user)
-	assert.Equal(t, http.StatusNoContent, rec2.Code)
-	assert.Len(t, tmRepo.Mutings, 1, "create must be idempotent (no duplicate row)")
+	assert.Equal(t, http.StatusBadRequest, rec2.Code, "重複は upstream と同じ 400")
+	assert.Contains(t, rec2.Body.String(), "ALREADY_MUTING")
+	assert.Contains(t, rec2.Body.String(), "c146e22d-1141-4b31-b28d-176371014d18")
+	assert.Len(t, tmRepo.Mutings, 1, "重複行は作らない")
 }
 
 func TestThreadMutingCreate_UsesThreadID(t *testing.T) {
@@ -1176,4 +1184,29 @@ func TestThreadMuting_NilRepoFailsClosed(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 	rec = postDraft(h.ThreadMutingDelete, `{"noteId":"n1"}`, &model.User{ID: "viewer"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// failingThreadMutingRepo は Exists だけを DB 障害にする。
+type failingThreadMutingRepo struct {
+	*testutil.MockNoteThreadMutingRepository
+	err error
+}
+
+func (r *failingThreadMutingRepo) Exists(string, string) (bool, error) { return false, r.err }
+
+// **DB 障害を「既にミュート済み」にも成功にも丸めない** (#2792)。Exists の error を
+// 捨てると、接続断が 400 ALREADY_MUTING か 204 に化けて監視で 5xx が立たない。
+func TestThreadMutingCreate_ExistsDBFailureIsNot4xx(t *testing.T) {
+	idGen, _ := id.NewGenerator("aidx")
+	noteRepo := testutil.NewMockNoteRepository()
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "author"}
+	h := &Handler{idGen: idGen, noteRepo: noteRepo, threadMutingRepo: &failingThreadMutingRepo{
+		MockNoteThreadMutingRepository: testutil.NewMockNoteThreadMutingRepository(),
+		err:                            errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"),
+	}}
+	rec := postDraft(h.ThreadMutingCreate, `{"noteId":"n1"}`, &model.User{ID: "viewer"})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code, "DB 障害が 4xx に化けている (#2792)")
+	// body も見る。status だけだと Create 失敗側 (kind:client) と取り違えても通る。
+	assert.Contains(t, rec.Body.String(), "INTERNAL_ERROR")
+	assert.Contains(t, rec.Body.String(), `"kind":"server"`)
 }

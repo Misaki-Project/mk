@@ -2,12 +2,14 @@ package i
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/core/move"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -44,9 +46,22 @@ func (h *Handler) Move(c echo.Context) error {
 	}
 	// root ユーザーは移行不可 (upstream move.ts: rootUserId === me.id)。
 	// meta.rootUserId と user.isRoot の両方を見る (role_service.isRootUser と同 doctrine)。
+	// **判定できないときは通さない (#2792 / #3037)。**
+	//
+	// 本番の root は `isRoot = false` (列を足した migration より後に作られて
+	// いない) なので **meta が唯一の判定材料**。読めない窓で `me.IsRoot` に
+	// 落とすと、root が `NOT_ROOT_FORBIDDEN` を素通りして `movedToUri` を
+	// 立てられる (以後の書き込みが全部 403 になり、連合先にも `Move` が配送
+	// される不可逆操作)。同じ不変条件を守る `i/delete-account` と
+	// `targetIsRoot` は #3037 でこの形に直っており、ここだけ残っていた。
 	isRoot := me.IsRoot
 	if h.metaRepo != nil {
-		if m, err := h.metaRepo.Fetch(); err == nil && m.RootUserID != nil && *m.RootUserID == me.ID {
+		m, err := h.metaRepo.Fetch()
+		if err != nil {
+			slog.Error("i/move: cannot determine whether the caller is root", "userId", me.ID, "err", err)
+			return apierr.JSONInternalError(c)
+		}
+		if m != nil && m.RootUserID != nil && *m.RootUserID == me.ID {
 			isRoot = true
 		}
 	}
@@ -58,7 +73,11 @@ func (h *Handler) Move(c echo.Context) error {
 	}
 	// password は任意。指定された場合のみ照合する (#1546)。
 	if req.Password != "" {
-		profile := h.userService.GetProfile(me.ID)
+		profile, perr := h.userService.GetProfileErr(me.ID)
+		// **DB 障害を「パスワード未設定」にしない** (#2799)。
+		if perr != nil && !repository.IsNotFound(perr) {
+			return apierr.JSONInternalError(c)
+		}
 		if profile == nil || profile.Password == nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error(
 				"ACCESS_DENIED", "No password set.",

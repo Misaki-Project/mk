@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -958,10 +961,10 @@ func resolveAliceAndSetFeatured(t *testing.T, p *federation.Processor, repo *tes
 
 func TestProcess_Add(t *testing.T) {
 	p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
-	_ = resolveAliceAndSetFeatured(t, p, repo)
+	aliceID := resolveAliceAndSetFeatured(t, p, repo)
 
 	noteURI := "https://remote.example/notes/n1"
-	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "alice", URI: &noteURI}
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: aliceID, URI: &noteURI}
 
 	body := []byte(`{
 		"type": "Add",
@@ -970,7 +973,141 @@ func TestProcess_Add(t *testing.T) {
 		"target": "https://remote.example/users/alice/collections/featured"
 	}`)
 	require.NoError(t, p.Process(body))
-	assert.True(t, len(piningRepo.Pinings) > 0)
+	require.Len(t, piningRepo.Pinings, 1)
+	for _, pin := range piningRepo.Pinings {
+		assert.Equal(t, aliceID, pin.UserID)
+		assert.Equal(t, "n1", pin.NoteID)
+	}
+}
+
+// **`Add` でピン留めできるのは自分の投稿だけ。** 見ないと、署名さえ通る
+// リモート actor が他人のノートを自分のプロフィールに並べられる。ローカルの
+// 非公開ノートも `ResolveNote` は可視性を見ずに引くので、`users/show` の
+// `pinnedNoteIds` 経由でその ID が未認証の相手へ出る。
+//
+// pull 側 (`resolveFeaturedNotes`) には同じ規則が既にあり、push 側のここだけが
+// 取り残されていた。
+func TestProcess_Add_RejectsOtherUsersNote(t *testing.T) {
+	p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
+	_ = resolveAliceAndSetFeatured(t, p, repo)
+
+	// 著者は alice ではない。URI は alice のホストなので、host 一致だけでは
+	// 弾けないことに注意。
+	noteURI := "https://remote.example/notes/victim"
+	noteRepo.Notes["victim"] = &model.Note{ID: "victim", UserID: "someone-else", URI: &noteURI}
+
+	body := []byte(`{
+		"type": "Add",
+		"actor": "https://remote.example/users/alice",
+		"object": "https://remote.example/notes/victim",
+		"target": "https://remote.example/users/alice/collections/featured"
+	}`)
+	require.NoError(t, p.Process(body))
+	assert.Empty(t, piningRepo.Pinings, "他人のノートがピン留めされた")
+}
+
+// **件数の上限。** `Add` は署名さえ通れば何度でも送れるので、上限が無いと
+// `user_note_pining` を無制限に増やせる。`internal/api/users/handler.go` の
+// 設計メモ (#1489) は `pinnedNoteIds` を絞らない理由として「pinning は
+// per-user 上限が厳しい」と書いており、その前提がここで壊れる。
+//
+// **上限に当たったら捨てずに入れ替える。** upstream は `Remove(A)` と
+// `Add(B)` を別々の deliver job で配るので、こちらの inbox が並列に処理すると
+// `Add(B)` が先に着くことがある。そこで捨てると B は次の actor 更新まで
+// 現れない (既定 TTL 24 時間)。
+//
+// **「上限未満なら通る」まで見る。** それが無いと、常に弾く実装でもテストが
+// 通ってしまう (変異検証で実測)。
+func TestProcess_Add_EvictsTheOldestAtThePinLimit(t *testing.T) {
+	p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
+	aliceID := resolveAliceAndSetFeatured(t, p, repo)
+
+	add := func(n string) {
+		t.Helper()
+		uri := "https://remote.example/notes/" + n
+		noteRepo.Notes[n] = &model.Note{ID: n, UserID: aliceID, URI: &uri}
+		body := []byte(`{
+			"type": "Add",
+			"actor": "https://remote.example/users/alice",
+			"object": "` + uri + `",
+			"target": "https://remote.example/users/alice/collections/featured"
+		}`)
+		require.NoError(t, p.Process(body))
+	}
+	pinnedNotes := func() []string {
+		var out []string
+		for _, pin := range piningRepo.Pinings {
+			out = append(out, pin.NoteID)
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	for i := range federation.FeaturedPinLimit {
+		add(fmt.Sprintf("n%d", i))
+		require.Len(t, piningRepo.Pinings, i+1, "上限に達する前のピンが弾かれた")
+	}
+
+	add("overflow")
+	assert.Len(t, piningRepo.Pinings, federation.FeaturedPinLimit, "上限を超えてピン留めできた")
+	assert.Contains(t, pinnedNotes(), "overflow", "上限に当たった Add を捨てている")
+	assert.NotContains(t, pinnedNotes(), "n0", "最も古いピンが外れていない")
+}
+
+// **同じノートの再送は何も動かさない。** 上限判定より前に重複を弾かないと、
+// 「既にあるものを入れるために別のピンを外す」ことになる。
+func TestProcess_Add_DuplicateAtTheLimitIsANoOp(t *testing.T) {
+	p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
+	aliceID := resolveAliceAndSetFeatured(t, p, repo)
+
+	add := func(n string) {
+		t.Helper()
+		uri := "https://remote.example/notes/" + n
+		noteRepo.Notes[n] = &model.Note{ID: n, UserID: aliceID, URI: &uri}
+		require.NoError(t, p.Process([]byte(`{
+			"type": "Add",
+			"actor": "https://remote.example/users/alice",
+			"object": "`+uri+`",
+			"target": "https://remote.example/users/alice/collections/featured"
+		}`)))
+	}
+	for i := range federation.FeaturedPinLimit {
+		add(fmt.Sprintf("n%d", i))
+	}
+	before := make(map[string]string, len(piningRepo.Pinings))
+	for id, pin := range piningRepo.Pinings {
+		before[id] = pin.NoteID
+	}
+
+	// 上限に達した状態で、既にピン留め済みのノートをもう一度送る。
+	add("n0")
+
+	after := make(map[string]string, len(piningRepo.Pinings))
+	for id, pin := range piningRepo.Pinings {
+		after[id] = pin.NoteID
+	}
+	assert.Equal(t, before, after, "重複した Add でピンが入れ替わっている")
+}
+
+// 数えられなかったときは error を返す。握り潰すと上限が効かないまま進むし、
+// nil で捨てると inbox job が「処理済み」として再試行しない。
+func TestProcess_Add_CountFailureIsRetryable(t *testing.T) {
+	p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
+	aliceID := resolveAliceAndSetFeatured(t, p, repo)
+
+	noteURI := "https://remote.example/notes/n1"
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: aliceID, URI: &noteURI}
+	piningRepo.CountErr = errors.New("boom")
+
+	body := []byte(`{
+		"type": "Add",
+		"actor": "https://remote.example/users/alice",
+		"object": "https://remote.example/notes/n1",
+		"target": "https://remote.example/users/alice/collections/featured"
+	}`)
+	err := p.Process(body)
+	require.Error(t, err)
+	assert.Empty(t, piningRepo.Pinings)
 }
 
 func TestProcess_Add_WrongTarget(t *testing.T) {
@@ -988,10 +1125,10 @@ func TestProcess_Add_WrongTarget(t *testing.T) {
 
 func TestProcess_Remove(t *testing.T) {
 	p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
-	_ = resolveAliceAndSetFeatured(t, p, repo)
+	aliceID := resolveAliceAndSetFeatured(t, p, repo)
 
 	noteURI := "https://remote.example/notes/n1"
-	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "alice", URI: &noteURI}
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: aliceID, URI: &noteURI}
 
 	// まずAddでピン留め
 	addBody := []byte(`{
@@ -1013,20 +1150,69 @@ func TestProcess_Remove(t *testing.T) {
 	require.NoError(t, p.Process(removeBody))
 }
 
+// ピン留めしていないノートの Remove はエラーにならない (not-found は ack)。
+//
+// **featured を設定しないと pin の lookup に到達しない。** `handleRemove` は
+// actor の featured と target が一致しなければそこで抜けるので、設定しないと
+// 「pin が無い」を試したつもりで分岐に一度も入らない (#3115 で実測)。
 func TestProcess_Remove_NotPinned(t *testing.T) {
-	p, _, noteRepo, _ := newProcessorWithPinning(t)
+	p, repo, noteRepo, _ := newProcessorWithPinning(t)
+	aliceID := resolveAliceAndSetFeatured(t, p, repo)
 	noteURI := "https://remote.example/notes/n1"
-	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "alice", URI: &noteURI}
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: aliceID, URI: &noteURI}
 
-	// ピン留めしていないノートのRemoveはエラーにならない
-	body := []byte(`{
-		"type": "Remove",
-		"actor": "https://remote.example/users/alice",
-		"object": "https://remote.example/notes/n1",
-		"target": "https://remote.example/users/alice/collections/featured"
-	}`)
-	require.NoError(t, p.Process(body))
+	require.NoError(t, p.Process([]byte(removeFeaturedBody)))
 }
+
+// **unpin 側も DB 障害は ack しない** (#3115)。
+//
+// ack すると pin が外れないまま残り、相手は再送しないので二度と直らない。
+// 直上の `Remove_NotPinned` (not-found = ack が正しい) と対にして読むこと。
+func TestProcess_Remove_LookupFailurePropagates(t *testing.T) {
+	// **featured を先に設定する。** `handleRemove` は actor の featured と
+	// target が一致しなければ**そこで抜ける**ので、設定しないと note の lookup に
+	// 一度も到達しない (この経路を試したつもりで何も試していない形になる)。
+	boom := errors.New("connection refused")
+	t.Run("note の lookup が落ちる", func(t *testing.T) {
+		p, repo, noteRepo, _ := newProcessorWithPinning(t)
+		resolveAliceAndSetFeatured(t, p, repo)
+		noteRepo.FindByURIErr = boom
+		require.ErrorIs(t, p.Process([]byte(removeFeaturedBody)), boom, "DB 障害を ack している")
+	})
+	t.Run("pin の lookup が落ちる", func(t *testing.T) {
+		p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
+		aliceID := resolveAliceAndSetFeatured(t, p, repo)
+		noteURI := "https://remote.example/notes/n1"
+		noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: aliceID, URI: &noteURI}
+		piningRepo.FindErr = boom
+		require.ErrorIs(t, p.Process([]byte(removeFeaturedBody)), boom, "DB 障害を ack している")
+	})
+	// **書き込みの失敗も伝播する。** lookup だけ retry に倒してここを捨てると、
+	// 「pin が外れないまま残る」という同じ結末が DELETE 側で残る。
+	t.Run("pin の削除が落ちる", func(t *testing.T) {
+		p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
+		aliceID := resolveAliceAndSetFeatured(t, p, repo)
+		noteURI := "https://remote.example/notes/n1"
+		noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: aliceID, URI: &noteURI}
+		piningRepo.Pinings["p1"] = &model.UserNotePining{ID: "p1", UserID: aliceID, NoteID: "n1"}
+		piningRepo.DeleteErr = boom
+		require.ErrorIs(t, p.Process([]byte(removeFeaturedBody)), boom, "削除の失敗を ack している")
+	})
+	// **not-found は ack のまま。** こちらを retry に倒すと、こちらが取り込んで
+	// いないノートの pin 解除という**ごく普通の Remove** が dead letter に積まれる。
+	t.Run("note が無いのは ack", func(t *testing.T) {
+		p, repo, _, _ := newProcessorWithPinning(t)
+		resolveAliceAndSetFeatured(t, p, repo)
+		require.NoError(t, p.Process([]byte(removeFeaturedBody)))
+	})
+}
+
+const removeFeaturedBody = `{
+	"type": "Remove",
+	"actor": "https://remote.example/users/alice",
+	"object": "https://remote.example/notes/n1",
+	"target": "https://remote.example/users/alice/collections/featured"
+}`
 
 func TestProcess_AddWithoutRepo(t *testing.T) {
 	p, _, _, _ := newProcessor(t, aliceActor)
@@ -1112,6 +1298,52 @@ func TestProcess_AcceptFollow_InnerActorEmbeddedObject(t *testing.T) {
 	assert.Empty(t, reqRepo.Requests, "承認された request は消えること")
 }
 
+// stubAcceptBlockingChecker reports the configured pair as blocked.
+type stubAcceptBlockingChecker struct{ blockerID, blockeeID string }
+
+func (s *stubAcceptBlockingChecker) IsBlocked(blockerID, blockeeID string) (bool, error) {
+	return blockerID == s.blockerID && blockeeID == s.blockeeID, nil
+}
+
+// AcceptRequest の多層防御 (#3111 レビュー) が ErrBlocked を返すケース:
+// local follower (bob) が remote followee (alice) を block した後、best-effort
+// な申請取り消しが失敗して申請が残ったまま alice からの Accept が届いた状況を
+// 再現する。retry しても結果は変わらないので ack (nil 返却) すること、
+// エラーのまま inbox job を落とさないことを見る (#534 の idempotency
+// invariant)。
+func TestProcess_AcceptFollow_BlockedSwallowsError(t *testing.T) {
+	repo := testutil.NewMockUserRepository()
+	noteRepo := testutil.NewMockNoteRepository()
+	followingRepo := testutil.NewMockFollowingRepository()
+	reqRepo := testutil.NewMockFollowRequestRepository()
+	urls := activitypub.NewURLBuilder("https://example.com")
+	idGen, _ := id.NewGenerator("aidx")
+	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+	followingSvc := corefollowing.NewService(repo, followingRepo, reqRepo, idGen)
+	followingSvc.SetBlockingChecker(&stubAcceptBlockingChecker{blockerID: "bob", blockeeID: "alice1"})
+	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+
+	aliceURI := "https://remote.example/users/alice"
+	host := "remote.example"
+	repo.Users["alice1"] = &model.User{ID: "alice1", Username: "alice", UsernameLower: "alice", URI: &aliceURI, Host: &host}
+	repo.Users["bob"] = &model.User{ID: "bob", Username: "bob", UsernameLower: "bob"}
+	// block 時の取り消しが失敗した想定で申請を残したままにする。
+	reqRepo.Requests["r1"] = &model.FollowRequest{ID: "r1", FollowerID: "bob", FolloweeID: "alice1"}
+
+	acceptBody := []byte(`{
+		"type": "Accept",
+		"actor": "https://remote.example/users/alice",
+		"object": {
+			"type": "Follow",
+			"actor": "https://example.com/users/bob",
+			"object": "https://remote.example/users/alice"
+		}
+	}`)
+	require.NoError(t, p.Process(acceptBody), "block による拒否は ack すべきで error を返してはいけない")
+	assert.Empty(t, followingRepo.Followings, "block 中なので Following は成立しない")
+	assert.Len(t, reqRepo.Requests, 1, "承認しないだけで申請行は消さない")
+}
+
 func TestProcess_AcceptNonFollow(t *testing.T) {
 	p, _, _, _ := newProcessor(t, aliceActor)
 	// inner objectがFollowでない場合は無視
@@ -1152,10 +1384,286 @@ func TestProcess_AcceptUnknownFollower(t *testing.T) {
 	require.NoError(t, p.Process(body))
 }
 
+// **DB 障害は ack しない** (#3115)。
+//
+// ack すると相手は 2xx を受け取って**再送しない**ので、一時的な接続断だけで
+// Accept が恒久的に失われ、ローカル利用者のフォローリクエストは「リクエスト中」
+// のまま永久に残る。error を返せば inbox job が retry する。
+//
+// **直上の `AcceptUnknownFollower` と対にして読むこと。** あちらは not-found で
+// ack が正しく、この 2 本が揃って初めて「種別を見て分けている」ことになる
+// (片方だけだと、両方を同じ側へ倒す実装で緑になる)。
+func TestProcess_AcceptFollowerLookupFailurePropagates(t *testing.T) {
+	// **2 経路とも試す。** follower の URI が自ホストの `/users/{id}` なら
+	// `FindByID`、そうでなければ `FindByURI` を引く。**片方だけ guard する形**
+	// (#3025 が名指しした失敗形) は、1 経路しか試さないと素通りする。
+	// mock の hook も `FindErr` / `FindByURIErr` で分かれている。
+	cases := []struct {
+		name       string
+		followerID string
+		arm        func(*testutil.MockUserRepository, error)
+	}{
+		{
+			name:       "ローカル URI (FindByID)",
+			followerID: "https://example.com/users/ghost",
+			arm:        func(r *testutil.MockUserRepository, e error) { r.FindErr = e },
+		},
+		{
+			name:       "ローカルでない URI (FindByURI)",
+			followerID: "https://other.example/users/ghost",
+			arm:        func(r *testutil.MockUserRepository, e error) { r.FindByURIErr = e },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, repo, _, _ := newProcessor(t, aliceActor)
+			boom := errors.New("connection refused")
+			tc.arm(repo, boom)
+			body := []byte(`{
+				"type": "Accept",
+				"actor": "https://remote.example/users/alice",
+				"object": {
+					"type": "Follow",
+					"actor": "` + tc.followerID + `",
+					"object": "https://remote.example/users/alice"
+				}
+			}`)
+			require.ErrorIs(t, p.Process(body), boom,
+				"DB 障害を ack している (job が成功扱いになり retry されないので Accept が失われる)")
+		})
+	}
+}
+
+// Reject も同じ (#3115)。**Accept と Reject は同じ決定の裏表**なので、片方だけ
+// 直すと「承認は拾えるが拒否は落ちる」という非対称が残る。
+//
+// **Accept と経路が違う。** あちらは `resolver.ExtractLocalUserID` (URL builder 由来)
+// で分岐するが、Reject は `resolveTargetUser` = `Processor.localBaseURL` で分岐する。
+// `SetLocalBaseURL` を呼ばないと**常に `FindByURI` 側**へ落ちるので、`FindErr`
+// だけを立てたテストは分岐に到達せず緑のまま通る (実測)。両方を試す。
+func TestProcess_RejectFollowerLookupFailurePropagates(t *testing.T) {
+	cases := []struct {
+		name         string
+		localBaseURL string
+		arm          func(*testutil.MockUserRepository, error)
+	}{
+		{
+			name:         "localBaseURL あり (FindByID)",
+			localBaseURL: "https://example.com",
+			arm:          func(r *testutil.MockUserRepository, e error) { r.FindErr = e },
+		},
+		{
+			name: "localBaseURL なし (FindByURI)",
+			arm:  func(r *testutil.MockUserRepository, e error) { r.FindByURIErr = e },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, repo, _, _ := newProcessor(t, aliceActor)
+			if tc.localBaseURL != "" {
+				p.SetLocalBaseURL(tc.localBaseURL)
+			}
+			// **actor の解決を先に済ませておく。** `FindByURIErr` を立てると
+			// `ResolveActor` も落ちてしまい、その手前で return されて
+			// follower の lookup に到達しない。
+			dummyURI := "https://example.com/users/dummy"
+			repo.Users["dummy"] = &model.User{ID: "dummy", Username: "dummy", URI: &dummyURI}
+			require.NoError(t, p.Process([]byte(`{"type":"Follow","actor":"https://remote.example/users/alice","object":"https://example.com/users/dummy"}`)))
+			boom := errors.New("connection refused")
+			tc.arm(repo, boom)
+			body := []byte(`{
+				"type": "Reject",
+				"actor": "https://remote.example/users/alice",
+				"object": {
+					"type": "Follow",
+					"actor": "https://example.com/users/ghost",
+					"object": "https://remote.example/users/alice"
+				}
+			}`)
+			require.ErrorIs(t, p.Process(body), boom, "DB 障害を ack している")
+		})
+	}
+}
+
+// **lookup の失敗を ack しない** (#3116)。
+//
+// #3115 が Accept / Reject / unpin で確立した原則を、残りの経路へ広げたもの。
+// ack すると job が成功扱いになって queue が retry しないので、一時的な接続断
+// だけで activity が恒久的に失われる。**not-found は ack のまま**で、両方向を
+// 対にして固定する (片方だけだと、両方を同じ側へ倒す実装で緑になる)。
+func TestProcess_LookupFailuresPropagate(t *testing.T) {
+	boom := errors.New("connection refused")
+
+	// 凍結済み actor の判定。**素通しにすると moderation の fail-open** —
+	// DB 障害のあいだ凍結済み actor の activity がそのまま処理される。
+	t.Run("凍結判定が引けない", func(t *testing.T) {
+		p, repo, _, _ := newProcessor(t, aliceActor)
+		repo.FindByURIErr = boom
+		body := []byte(`{"type":"Delete","actor":"https://remote.example/users/alice","object":"https://remote.example/notes/x"}`)
+		require.ErrorIs(t, p.Process(body), boom, "凍結判定を素通りしている")
+	})
+
+	// Announce の重複判定。**「重複でない」に倒すと二重 renote になる。**
+	// 対象はローカル note にして、`ResolveNote` が fetch せず DB から引ける
+	// 形にする (そうしないと dedup の手前で返ってしまう)。
+	t.Run("Announce の重複判定が引けない", func(t *testing.T) {
+		env := newFullProcessor(t, aliceActor)
+		env.noteRepo.Notes["n1"] = &model.Note{
+			ID: "n1", UserID: "bob", Visibility: model.NoteVisibilityPublic,
+		}
+		env.userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
+		env.noteRepo.FindByURIErr = boom
+		body := []byte(`{"id":"https://remote.example/announces/a1","type":"Announce",` +
+			`"actor":"https://remote.example/users/alice","object":"https://example.com/notes/n1"}`)
+		require.ErrorIs(t, env.processor.Process(body), boom, "重複判定を素通りしている")
+	})
+
+	// Delete の note lookup。**ack すると削除されたはずのノートが残る。**
+	t.Run("Delete の note が引けない", func(t *testing.T) {
+		p, repo, _, noteRepo := newProcessor(t, aliceActor)
+		// actor は引けて、note だけ落ちる状況を作る。
+		uri := "https://remote.example/users/alice"
+		repo.Users["alice"] = &model.User{ID: "alice", Username: "alice", URI: &uri}
+		noteRepo.FindByURIErr = boom
+		body := []byte(`{"type":"Delete","actor":"https://remote.example/users/alice","object":{"type":"Tombstone","id":"https://remote.example/notes/n1"}}`)
+		require.ErrorIs(t, p.Process(body), boom, "削除を取りこぼしている")
+	})
+
+	// Update(Person)。**ack するとプロフィールの更新が消える。**
+	//
+	// **凍結判定と同じ `FindByURI` を使う経路**なので、URI 別に落とす。
+	// `FindByURIErr` を立てると手前の凍結判定で返ってしまい、**目的の分岐を
+	// 一度も通らないまま緑になる** (実測)。
+	t.Run("Update(Person) の user が引けない", func(t *testing.T) {
+		p, repo, _, _ := newProcessor(t, aliceActor)
+		const actor = "https://remote.example/users/alice"
+		// 凍結判定は「まだ取り込んでいない」で通し、handleUpdate の lookup だけ落とす。
+		callCount := 0
+		repo.FindByURIHook = func(uri string) error {
+			if uri != actor {
+				return nil
+			}
+			callCount++
+			if callCount == 1 {
+				return nil // 凍結判定 (= not-found で素通し)
+			}
+			return boom // handleUpdate の lookup
+		}
+		body := []byte(`{"type":"Update","actor":"` + actor + `","object":{"type":"Person","id":"` + actor + `"}}`)
+		require.ErrorIs(t, p.Process(body), boom, "プロフィール更新を取りこぼしている")
+	})
+
+	// Delete(Actor)。**ack するとリモートのアカウント削除を取りこぼす。**
+	t.Run("Delete(Actor) の user が引けない", func(t *testing.T) {
+		p, repo, _, _ := newProcessor(t, aliceActor)
+		const actor = "https://remote.example/users/alice"
+		callCount := 0
+		repo.FindByURIHook = func(uri string) error {
+			if uri != actor {
+				return nil
+			}
+			callCount++
+			if callCount == 1 {
+				return nil // 凍結判定
+			}
+			return boom // isActorDelete の存在確認
+		}
+		body := []byte(`{"type":"Delete","actor":"` + actor + `","object":"` + actor + `"}`)
+		require.ErrorIs(t, p.Process(body), boom, "アカウント削除を取りこぼしている")
+	})
+
+	// Update(Note)。**同じ handler の中で最も多い Update 型** — ack すると
+	// リモートのノート編集 (text / cw / 添付) が恒久的に落ちる。
+	t.Run("Update(Note) の note が引けない", func(t *testing.T) {
+		p, repo, _, noteRepo := newProcessor(t, aliceActor)
+		host := "remote.example"
+		uri := "https://remote.example/users/alice"
+		repo.Users["alice"] = &model.User{ID: "alice", Username: "alice", URI: &uri, Host: &host}
+		noteRepo.FindByURIErr = boom
+		body := []byte(`{"type":"Update","actor":"` + uri + `","object":{"id":"https://remote.example/notes/n1",` +
+			`"type":"Note","attributedTo":"` + uri + `","content":"edited"}}`)
+		require.ErrorIs(t, p.Process(body), boom, "ノート編集を取りこぼしている")
+	})
+
+	// Undo(Accept)。**#3115 が直した Accept / Reject の裏返し** — ack すると
+	// accept を撤回された相手をフォローし続ける。
+	t.Run("Undo(Accept) の follower が引けない", func(t *testing.T) {
+		p, repo, _, _ := newProcessor(t, aliceActor)
+		const actor = "https://remote.example/users/alice"
+		// **follower はローカル利用者**なので `ExtractLocalUserID` → `FindByID`
+		// を通る (`FindByURI` ではない)。凍結判定は `FindByURI` なので干渉しない。
+		repo.FindErr = boom
+		body := []byte(`{"type":"Undo","actor":"` + actor + `","object":{"type":"Accept","actor":"` + actor + `",` +
+			`"object":{"type":"Follow","actor":"https://example.com/users/bob","object":"` + actor + `"}}}`)
+		require.ErrorIs(t, p.Process(body), boom, "フォロー解除を取りこぼしている")
+	})
+
+	// **not-found は ack のまま。** 居ない follower の Undo(Accept) を retry に
+	// 倒すと、ごく普通の activity が dead letter に積まれる。
+	t.Run("Undo(Accept) の follower が居ないのは ack", func(t *testing.T) {
+		p, _, _, _ := newProcessor(t, aliceActor)
+		const actor = "https://remote.example/users/alice"
+		body := []byte(`{"type":"Undo","actor":"` + actor + `","object":{"type":"Accept","actor":"` + actor + `",` +
+			`"object":{"type":"Follow","actor":"https://example.com/users/ghost","object":"` + actor + `"}}}`)
+		require.NoError(t, p.Process(body), "not-found を retry に倒している")
+	})
+
+	// pin の重複判定。**「まだ無い」に倒すと、既にあるものを入れるために
+	// 別のピンを外すことになる。**
+	t.Run("pin の重複判定が引けない", func(t *testing.T) {
+		p, repo, noteRepo, piningRepo := newProcessorWithPinning(t)
+		aliceID := resolveAliceAndSetFeatured(t, p, repo)
+		noteURI := "https://remote.example/notes/n1"
+		noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: aliceID, URI: &noteURI}
+		piningRepo.FindErr = boom
+		body := []byte(`{"type":"Add","actor":"https://remote.example/users/alice",` +
+			`"object":"https://remote.example/notes/n1",` +
+			`"target":"https://remote.example/users/alice/collections/featured"}`)
+		require.ErrorIs(t, p.Process(body), boom, "重複判定を素通りしている")
+	})
+}
+
+// **ingest の lookup 失敗も ack しない** (#3121)。
+//
+// ここが厄介なのは、**ack すると URI が DB に入る**こと — retry は dedup に
+// ヒットするので、落ちた紐付け (返信先 / 投票) は**二度と直らない**。
+func TestProcess_IngestLookupFailuresPropagate(t *testing.T) {
+	boom := errors.New("connection refused")
+
+	// dedup。**「まだ無い」に倒すと再 fetch して INSERT へ進む。**
+	t.Run("dedup の lookup が引けない", func(t *testing.T) {
+		p, _, _, noteRepo := newProcessor(t, aliceActor)
+		noteRepo.FindByURIErr = boom
+		body := []byte(`{"type":"Create","actor":"https://remote.example/users/alice",` +
+			`"object":{"id":"https://remote.example/notes/n1","type":"Note",` +
+			`"attributedTo":"https://remote.example/users/alice","content":"hi"}}`)
+		require.ErrorIs(t, p.Process(body), boom, "dedup を素通りしている")
+		assert.Empty(t, noteRepo.Notes, "引けないまま INSERT へ進んでいる")
+	})
+
+	// 返信先。**ack すると ReplyID=nil のまま確定し、スレッド接続が失われる。**
+	t.Run("返信先の lookup が引けない", func(t *testing.T) {
+		env := newFullProcessor(t, aliceActor)
+		env.noteRepo.Notes["t1"] = &model.Note{ID: "t1", UserID: "bob", Visibility: model.NoteVisibilityPublic}
+		env.userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
+		// dedup は not-found で通し、返信先の FindByID だけ落とす。
+		env.noteRepo.FindErr = boom
+		body := []byte(`{"type":"Create","actor":"https://remote.example/users/alice",` +
+			`"object":{"id":"https://remote.example/notes/r1","type":"Note",` +
+			`"attributedTo":"https://remote.example/users/alice","content":"re",` +
+			`"inReplyTo":"https://example.com/notes/t1"}}`)
+		require.ErrorIs(t, env.processor.Process(body), boom, "返信先の解決を素通りしている")
+		// **harm も固定する。** error を返しつつ保存もする実装では、
+		// `note.uri` が DB に入るので retry が dedup にヒットして直らない。
+		_, ferr := env.noteRepo.FindByURI("https://remote.example/notes/r1")
+		assert.True(t, repository.IsNotFound(ferr), "返信先が空のまま note を確定させている")
+	})
+}
+
 // --- Question/Poll ---
 
 func TestProcess_CreateQuestion(t *testing.T) {
-	p, repo, _, noteRepo := newProcessor(t, aliceActor)
+	_, repo, _, noteRepo := newProcessor(t, aliceActor)
 	// resolverにpollRepoを注入するためresolverへのアクセスが必要
 	// newProcessorで作成されたresolverにSetPollRepoできないため、
 	// processor経由でresolverを取得する方法がない。代わりにfull setup。
@@ -1166,7 +1674,7 @@ func TestProcess_CreateQuestion(t *testing.T) {
 	resolver := federation.NewResolver(repo, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen2)
 	resolver.SetPollRepo(pollRepo)
 	followingSvc := corefollowing.NewService(repo, followingRepo, testutil.NewMockFollowRequestRepository(), idGen2)
-	p = federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
+	p := federation.NewProcessor(resolver, followingSvc, nil, nil, repo, noteRepo)
 
 	body := []byte(`{
 		"type": "Create",
@@ -1259,11 +1767,25 @@ func TestProcess_FlagWithoutRepo(t *testing.T) {
 	assert.ErrorIs(t, p.Process(body), federation.ErrUnsupportedActivity)
 }
 
-// fakeRelayMarker records MarkAccepted/MarkRejected calls for assertion.
+// fakeRelayMarker records MarkAccepted/MarkRejected calls for assertion and
+// serves the relay rows that the ownership check looks up.
 type fakeRelayMarker struct {
+	relays   map[string]*model.Relay
 	accepted []string
 	rejected []string
+	lookups  []string
 	err      error
+	findErr  error
+}
+
+// newFakeRelayMarker returns a marker holding a single relay row whose inbox
+// is inbox (empty inbox = no row at all, so FindByID fails).
+func newFakeRelayMarker(id, inbox string) *fakeRelayMarker {
+	m := &fakeRelayMarker{relays: map[string]*model.Relay{}}
+	if inbox != "" {
+		m.relays[id] = &model.Relay{ID: id, Inbox: inbox, Status: "requesting"}
+	}
+	return m
 }
 
 func (f *fakeRelayMarker) MarkAccepted(_ context.Context, id string) error {
@@ -1276,21 +1798,42 @@ func (f *fakeRelayMarker) MarkRejected(_ context.Context, id string) error {
 	return f.err
 }
 
-func TestProcess_AcceptFollowRelay_MarksAccepted(t *testing.T) {
-	p, _, _, _ := newProcessor(t, aliceActor)
-	marker := &fakeRelayMarker{}
-	p.SetRelayMarker(marker)
+func (f *fakeRelayMarker) FindByID(_ context.Context, id string) (*model.Relay, error) {
+	f.lookups = append(f.lookups, id)
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	rel, ok := f.relays[id]
+	if !ok {
+		return nil, errors.New("no such relay")
+	}
+	return rel, nil
+}
 
-	body := []byte(`{
-		"type": "Accept",
-		"actor": "https://remote.example/users/alice",
+// relayAcceptBody builds an Accept(Follow) whose inner id is activityID,
+// signed by actor.
+func relayAcceptBody(kind, actor, activityID string) []byte {
+	return []byte(`{
+		"type": "` + kind + `",
+		"actor": "` + actor + `",
 		"object": {
-			"id": "https://example.com/activities/follow-relay/rel123",
+			"id": "` + activityID + `",
 			"type": "Follow",
 			"actor": "https://example.com/users/relay.actor",
 			"object": "https://www.w3.org/ns/activitystreams#Public"
 		}
 	}`)
+}
+
+func TestProcess_AcceptFollowRelay_MarksAccepted(t *testing.T) {
+	p, _, _, _ := newProcessor(t, aliceActor)
+	p.SetLocalBaseURL("https://example.com")
+	marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
+	p.SetRelayMarker(marker)
+
+	// 送信元は relay 自身 (inbox と同じ host)。
+	body := relayAcceptBody("Accept", "https://relay.example/actor",
+		"https://example.com/activities/follow-relay/rel123")
 	require.NoError(t, p.Process(body))
 	assert.Equal(t, []string{"rel123"}, marker.accepted)
 	assert.Empty(t, marker.rejected)
@@ -1298,19 +1841,154 @@ func TestProcess_AcceptFollowRelay_MarksAccepted(t *testing.T) {
 
 func TestProcess_RejectFollowRelay_MarksRejected(t *testing.T) {
 	p, _, _, _ := newProcessor(t, aliceActor)
-	marker := &fakeRelayMarker{}
+	p.SetLocalBaseURL("https://example.com")
+	marker := newFakeRelayMarker("rel456", "https://relay.example/inbox")
 	p.SetRelayMarker(marker)
 
-	body := []byte(`{
-		"type": "Reject",
-		"actor": "https://remote.example/users/alice",
-		"object": {
-			"id": "https://example.com/activities/follow-relay/rel456",
-			"type": "Follow"
-		}
-	}`)
+	body := relayAcceptBody("Reject", "https://relay.example/actor",
+		"https://example.com/activities/follow-relay/rel456")
 	require.NoError(t, p.Process(body))
 	assert.Equal(t, []string{"rel456"}, marker.rejected)
+	assert.Empty(t, marker.accepted)
+}
+
+// TestProcess_FollowRelay_HostNormalizedMatch は host 比較が punycode / 大小文字を
+// 揃えてから行われることを固定する (素の文字列比較へ退行すると落ちる)。
+func TestProcess_FollowRelay_HostNormalizedMatch(t *testing.T) {
+	p, _, _, _ := newProcessor(t, aliceActor)
+	p.SetLocalBaseURL("https://example.com")
+	marker := newFakeRelayMarker("rel1", "https://xn--eckve.example/inbox")
+	p.SetRelayMarker(marker)
+
+	body := relayAcceptBody("Accept", "https://パイ.Example/actor",
+		"https://example.com/activities/follow-relay/rel1")
+	require.NoError(t, p.Process(body))
+	assert.Equal(t, []string{"rel1"}, marker.accepted)
+}
+
+// TestProcess_AcceptFollowRelay_ForeignActorDropped は「署名が通る任意の actor が
+// relay を accepted に倒せる」欠陥 (upstream ApInboxService.ts:250 と同型) を固定する。
+// accepted に倒されると DeliverToAccepted が未承認の inbox へ全公開ノートを流し始める。
+func TestProcess_AcceptFollowRelay_ForeignActorDropped(t *testing.T) {
+	for _, kind := range []string{"Accept", "Reject"} {
+		t.Run(kind, func(t *testing.T) {
+			p, _, _, _ := newProcessor(t, aliceActor)
+			p.SetLocalBaseURL("https://example.com")
+			marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
+			p.SetRelayMarker(marker)
+
+			// relay とは無関係な remote actor。
+			body := relayAcceptBody(kind, "https://remote.example/users/alice",
+				"https://example.com/activities/follow-relay/rel123")
+			// drop は ack 扱い (retry させない)。
+			require.NoError(t, p.Process(body))
+			assert.Empty(t, marker.accepted)
+			assert.Empty(t, marker.rejected)
+			// 行の lookup 自体は行われている (= 検証を通って落ちた)。
+			assert.Equal(t, []string{"rel123"}, marker.lookups)
+		})
+	}
+}
+
+// TestProcess_AcceptFollowRelay_ForeignActivityIDIgnored は inner.id の host を
+// 見ていなかった欠陥を固定する。他ホストの follow-relay URI は relay 行を
+// 一切触らせない (通常の Accept(Follow) 経路へ落ちる)。
+func TestProcess_AcceptFollowRelay_ForeignActivityIDIgnored(t *testing.T) {
+	for _, activityID := range []string{
+		"https://evil.test/activities/follow-relay/rel123",
+		// prefix を伸ばした紛らわしい host も自ホストではない。
+		"https://example.com.evil.test/activities/follow-relay/rel123",
+		// 自ホスト配下でも path が違えば follow-relay URI ではない。
+		"https://example.com/activities/follow-relay/rel123/extra",
+	} {
+		t.Run(activityID, func(t *testing.T) {
+			p, _, _, _ := newProcessor(t, aliceActor)
+			p.SetLocalBaseURL("https://example.com")
+			marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
+			p.SetRelayMarker(marker)
+
+			body := relayAcceptBody("Accept", "https://remote.example/users/alice", activityID)
+			require.NoError(t, p.Process(body))
+			assert.Empty(t, marker.accepted)
+			assert.Empty(t, marker.rejected)
+			// relay 行を引きにすら行かない。
+			assert.Empty(t, marker.lookups)
+		})
+	}
+}
+
+// TestProcess_AcceptFollowRelay_UnparsableHostDropped は host を取り出せない URI
+// (壊れた actor / scheme 無しの inbox / inbox 未設定の行) を fail-closed で
+// 落とすことを固定する。
+func TestProcess_AcceptFollowRelay_UnparsableHostDropped(t *testing.T) {
+	cases := map[string]struct{ actor, inbox string }{
+		"malformed actor":  {actor: "not-a-uri", inbox: "https://relay.example/inbox"},
+		"schemeless inbox": {actor: "https://relay.example/actor", inbox: "relay.example/inbox"},
+		"empty inbox":      {actor: "https://relay.example/actor", inbox: ""},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			p, _, _, _ := newProcessor(t, aliceActor)
+			p.SetLocalBaseURL("https://example.com")
+			// inbox が空の行も「存在はする」状態として作る。
+			marker := &fakeRelayMarker{relays: map[string]*model.Relay{
+				"rel123": {ID: "rel123", Inbox: tc.inbox, Status: "requesting"},
+			}}
+			p.SetRelayMarker(marker)
+
+			body := relayAcceptBody("Accept", tc.actor,
+				"https://example.com/activities/follow-relay/rel123")
+			require.NoError(t, p.Process(body))
+			assert.Empty(t, marker.accepted)
+		})
+	}
+}
+
+// TestProcess_AcceptFollowRelay_UnknownRelayDropped は存在しない relay id を
+// 指す Accept が status を触らないことを固定する。
+func TestProcess_AcceptFollowRelay_UnknownRelayDropped(t *testing.T) {
+	p, _, _, _ := newProcessor(t, aliceActor)
+	p.SetLocalBaseURL("https://example.com")
+	marker := newFakeRelayMarker("rel123", "")
+	p.SetRelayMarker(marker)
+
+	body := relayAcceptBody("Accept", "https://relay.example/actor",
+		"https://example.com/activities/follow-relay/rel123")
+	require.NoError(t, p.Process(body))
+	assert.Empty(t, marker.accepted)
+	assert.Equal(t, []string{"rel123"}, marker.lookups)
+}
+
+// TestProcess_AcceptFollowRelay_LookupErrorDropped は relay 行の取得が失敗した
+// ときに status を書き換えないこと (fail-closed) を固定する。
+func TestProcess_AcceptFollowRelay_LookupErrorDropped(t *testing.T) {
+	p, _, _, _ := newProcessor(t, aliceActor)
+	p.SetLocalBaseURL("https://example.com")
+	marker := newFakeRelayMarker("rel123", "https://relay.example/inbox")
+	marker.findErr = errors.New("db down")
+	p.SetRelayMarker(marker)
+
+	body := relayAcceptBody("Accept", "https://relay.example/actor",
+		"https://example.com/activities/follow-relay/rel123")
+	require.NoError(t, p.Process(body))
+	assert.Empty(t, marker.accepted)
+}
+
+// TestProcess_AcceptFollowRelay_NoLocalBaseURLDropped は localBaseURL が
+// 未配線のときに fail-closed になることを固定する (自ホスト判定ができない以上、
+// どの follow-relay URI も信用できない)。
+func TestProcess_AcceptFollowRelay_NoLocalBaseURLDropped(t *testing.T) {
+	p, _, _, _ := newProcessor(t, aliceActor)
+	// inbox host と actor host は一致している = localBaseURL さえ配線されていれば
+	// 通るはずの activity。それでも触らせない。
+	marker := newFakeRelayMarker("rel123", "https://remote.example/inbox")
+	p.SetRelayMarker(marker)
+
+	body := relayAcceptBody("Accept", "https://remote.example/users/alice",
+		"https://example.com/activities/follow-relay/rel123")
+	require.NoError(t, p.Process(body))
+	assert.Empty(t, marker.accepted)
+	assert.Empty(t, marker.lookups)
 }
 
 func TestProcess_AcceptNonRelay_IgnoresMarker(t *testing.T) {
@@ -1339,20 +2017,23 @@ func TestProcess_AcceptNonRelay_IgnoresMarker(t *testing.T) {
 // --- Chat federation (Misskey:ChatMessage) ---
 
 type stubChatReceiver struct {
-	called    int
-	lastURI   string
-	lastFrom  *model.User
-	lastTo    string
-	lastText  string
+	called   int
+	lastURI  string
+	lastFrom *model.User
+	lastTo   string
+	lastText string
+	// lastMFM は相手が併記した MFM の原文 (`source` / `_misskey_content`)。
+	lastMFM   string
 	returnErr error
 }
 
-func (s *stubChatReceiver) CreateMessageViaAP(_ context.Context, uri string, fromUser *model.User, toUserID, text string) (*model.ChatMessage, error) {
+func (s *stubChatReceiver) CreateMessageViaAP(_ context.Context, uri string, fromUser *model.User, toUserID, text, mfmSource string) (*model.ChatMessage, error) {
 	s.called++
 	s.lastURI = uri
 	s.lastFrom = fromUser
 	s.lastTo = toUserID
 	s.lastText = text
+	s.lastMFM = mfmSource
 	if s.returnErr != nil {
 		return nil, s.returnErr
 	}

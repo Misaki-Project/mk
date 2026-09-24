@@ -170,6 +170,13 @@ const (
 	// UUID for users/show (third_party/misskey/.../endpoints/users/show.ts).
 	UUIDFailedToResolveRemoteUser = "ef7b9be4-9cba-4e6f-ab41-90ed171c7d3c"
 
+	// UUIDPasswordVerificationUnavailable は password 検証の枠を取れなかったとき
+	// (503)。**新規に発番する** — 既存の UUID を流用すると、ID で分岐する
+	// クライアントが別の状況と区別できなくなる。実際 #2849 の初版は
+	// UUIDRateLimitExceeded (429) を流用しており、同じ ID が 429 と 503 の
+	// 両方で返る状態になっていた。upstream に対応する概念が無いので mk-go 固有。
+	UUIDPasswordVerificationUnavailable = "539f92bc-95e2-45b2-8fe4-c4afe5b8a67d"
+
 	// UUIDInvalidToken は 2FA token 検証失敗 (i/2fa/{done,register-key,key-done})。
 	// upstream は plain `Error('authentication failed')` で UUID 無しなので
 	// mk-go 固有の安定 UUID を発番する (#673 Phase B / #698)。
@@ -196,6 +203,16 @@ const (
 	// code は upstream に合わせて `NO_SUCH_NOTE_DRAFT` を使う (#688 / #673
 	// Phase B)。
 	UUIDNoSuchNoteDraft = "49cd6b9d-848e-41ee-b0b9-adaca711a6b1"
+
+	// UUIDNoSuchNotePromoRead は upstream `promo/read.ts` の `noSuchNote` UUID。
+	//
+	// **汎用の UUIDNoSuchNote は upstream `notes/show` の id** を全 endpoint で
+	// 使い回したもの。upstream は `NO_SUCH_NOTE` を定義する 21 endpoint すべてに
+	// 別 id を割り当てるので、`promo/read` では endpoint 固有の値を返す (#2784)。
+	// error.id で分岐する drop-in クライアントが誤分類するため。
+	//
+	// **`promo/read` 専用。** 他 endpoint から使わないこと。
+	UUIDNoSuchNotePromoRead = "d785b897-fcd3-4fe9-8fc3-b85c26e6c932"
 )
 
 // InvalidParam returns a 400 INVALID_PARAM error response. The optional
@@ -553,6 +570,17 @@ func ContainsTooManyMentions() map[string]any {
 // upstream users/show は kind:'server' (= HTTP 500、status は JSON wrapper 側で付与)。
 func FailedToResolveRemoteUser() map[string]any {
 	return ErrorWithKind("FAILED_TO_RESOLVE_REMOTE_USER", "Failed to resolve remote user.", UUIDFailedToResolveRemoteUser, KindServer)
+}
+
+// PasswordVerificationUnavailable returns the 503 body used when the password
+// verifier could not take a slot.
+//
+// **kind は server。** 飽和はサーバー側の事情なので client に倒すと意味が逆に
+// なる (#2849)。呼び出し側は Retry-After も付けること。
+func PasswordVerificationUnavailable() map[string]any {
+	return ErrorWithKind("SERVICE_UNAVAILABLE",
+		"Password verification is temporarily unavailable. Please try again later.",
+		UUIDPasswordVerificationUnavailable, KindServer)
 }
 
 // RateLimitExceeded returns a 429 RATE_LIMIT_EXCEEDED error response.

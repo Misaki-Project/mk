@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -46,7 +47,9 @@ func (r *fakeRepo) FindByID(id string) (*model.ReversiGame, error) {
 		clone := *g
 		return &clone, nil
 	}
-	return nil, errors.New("not found")
+	// **repository の sentinel を返す。** 汎用 error だと #2799 の
+	// 「DB 障害は raw error のまま」に引っかかる。
+	return nil, repository.ErrNotFound
 }
 
 func (r *fakeRepo) Update(g *model.ReversiGame) error {
@@ -99,6 +102,26 @@ func (r *fakeRepo) MarkStarted(g *model.ReversiGame) (bool, error) {
 	stored.StartedAt = g.StartedAt
 	stored.CRC32 = g.CRC32
 	return true, nil
+}
+
+func (r *fakeRepo) FindPendingInvitation(inviteeID, inviterID string) (*model.ReversiGame, error) {
+	games, err := r.ListByUser(inviteeID, 0)
+	if err != nil {
+		return nil, err
+	}
+	var found *model.ReversiGame
+	for _, g := range games {
+		if g.IsStarted || g.IsEnded {
+			continue
+		}
+		if g.User1ID != inviterID || g.User2ID != inviteeID {
+			continue
+		}
+		if found == nil || g.ID > found.ID {
+			found = g
+		}
+	}
+	return found, nil
 }
 
 func (r *fakeRepo) ListByUser(userID string, limit int) ([]*model.ReversiGame, error) {
@@ -176,15 +199,6 @@ func (p *capturePublisher) types() []string {
 		out[i] = e.kind
 	}
 	return out
-}
-
-func (p *capturePublisher) latestBody() any {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.events) == 0 {
-		return nil
-	}
-	return p.events[len(p.events)-1].body
 }
 
 // --- helpers ---

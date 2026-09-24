@@ -3,6 +3,7 @@ package repository
 import (
 	"testing"
 
+	"github.com/shiroha-a/mk/internal/config"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,6 +125,78 @@ func TestMetaRepository_EnsureInitial_Creates(t *testing.T) {
 	assert.Equal(t, "m_ei_1", got.ID)
 }
 
+// 新規インスタンスでソースコードの案内が空にならないこと (#2700)。列 DEFAULT は
+// GORM の NULL 明示挿入に負けるので、EnsureInitial 側で入れているかを見る。
+func TestMetaRepository_EnsureInitial_SetsRepositoryURL(t *testing.T) {
+	repo := NewMetaRepository(testDB)
+
+	testDB.Exec(`DELETE FROM "meta"`)
+	require.NoError(t, repo.EnsureInitial("m_ei_repo"))
+	defer testDB.Exec(`DELETE FROM "meta" WHERE id = ?`, "m_ei_repo")
+
+	got, err := repo.Fetch()
+	require.NoError(t, err)
+	require.NotNil(t, got.RepositoryURL, "repositoryUrl が NULL のままだと /about-mkgo が案内を出せない")
+	assert.Equal(t, defaultRepositoryURL, *got.RepositoryURL)
+}
+
+// Fetch は行が消えたときにも EnsureInitial を通るので、そちらの経路でも
+// 既定値が入ること。
+func TestMetaRepository_Fetch_RecreatesWithRepositoryURL(t *testing.T) {
+	repo := NewMetaRepository(testDB)
+
+	testDB.Exec(`DELETE FROM "meta"`)
+	defer testDB.Exec(`DELETE FROM "meta"`)
+
+	got, err := repo.Fetch()
+	require.NoError(t, err)
+	require.NotNil(t, got.RepositoryURL)
+	assert.Equal(t, defaultRepositoryURL, *got.RepositoryURL)
+}
+
+// repository 層は config を import しない方針なので値を持ち直している。
+// 二重管理が drift しないようにここで固定する (#2700)。
+func TestDefaultRepositoryURLMatchesConfig(t *testing.T) {
+	assert.Equal(t, config.MkGoRepositoryURL, defaultRepositoryURL,
+		"nodeinfo の software.repository と meta.repositoryUrl の既定値がずれている")
+}
+
+// feedbackUrl 側も同じ理由で持ち直している (#2891)。
+func TestDefaultFeedbackURLMatchesConfig(t *testing.T) {
+	assert.Equal(t, config.MkGoFeedbackURL, defaultFeedbackURL,
+		"meta.feedbackUrl の既定値が config とずれている")
+}
+
+// 新規インスタンスで /about のフィードバック導線と nodeinfo の metadata が
+// 空にならないこと (#2891)。000029 の列 DEFAULT は GORM の NULL 明示挿入に
+// 負けるので、EnsureInitial 側で入れているかを見る。
+func TestMetaRepository_EnsureInitial_SetsFeedbackURL(t *testing.T) {
+	repo := NewMetaRepository(testDB)
+
+	testDB.Exec(`DELETE FROM "meta"`)
+	require.NoError(t, repo.EnsureInitial("m_ei_fb"))
+	defer testDB.Exec(`DELETE FROM "meta" WHERE id = ?`, "m_ei_fb")
+
+	got, err := repo.Fetch()
+	require.NoError(t, err)
+	require.NotNil(t, got.FeedbackURL, "feedbackUrl が NULL のままだとフィードバック導線が消える")
+	assert.Equal(t, defaultFeedbackURL, *got.FeedbackURL)
+}
+
+// Fetch は行が消えたときにも EnsureInitial を通るので、そちらの経路でも
+// 両方の既定値が入ること (#2700 の repositoryUrl 側と対称)。
+func TestMetaRepository_Fetch_RecreatesWithFeedbackURL(t *testing.T) {
+	repo := NewMetaRepository(testDB)
+
+	testDB.Exec(`DELETE FROM "meta"`)
+	defer testDB.Exec(`DELETE FROM "meta"`)
+
+	got, err := repo.Fetch()
+	require.NoError(t, err)
+	require.NotNil(t, got.FeedbackURL)
+	assert.Equal(t, defaultFeedbackURL, *got.FeedbackURL)
+}
+
 func TestMetaRepository_EnsureInitial_NoopWhenExists(t *testing.T) {
 	repo := NewMetaRepository(testDB)
 
@@ -138,4 +211,30 @@ func TestMetaRepository_EnsureInitial_NoopWhenExists(t *testing.T) {
 	got, err := repo.Fetch()
 	require.NoError(t, err)
 	assert.Equal(t, "m_ei_2", got.ID)
+}
+
+// #3015: minimumUsernameLength が実 DB の列として往復すること。
+//
+// **mock では検出できない。** `MockMetaRepository.Update` は key で switch する
+// ので、列名の綴り違いや migration 漏れがあっても緑のまま通る。GORM の
+// `Updates(map)` は key をそのまま列名に使うので、ここだけが「本当にその列が
+// あるか」を見る。
+func TestMetaRepository_Update_MinimumUsernameLength(t *testing.T) {
+	repo := NewMetaRepository(testDB)
+
+	meta := &model.Meta{ID: "m_u_mul"}
+	require.NoError(t, testDB.Create(meta).Error)
+	defer testDB.Exec(`DELETE FROM "meta" WHERE id = ?`, meta.ID)
+
+	// **読み戻しは id 指定で行う。** `repo.Fetch` は `db.First()` = id 最小の
+	// 1 行なので、他のテストが残した行があると別の行を見てしまう。
+	var stored model.Meta
+	require.NoError(t, testDB.Where("id = ?", meta.ID).First(&stored).Error)
+	// migration の DEFAULT が効いていること。既存インスタンスは列が増えても
+	// 挙動が変わらない。
+	assert.Equal(t, 1, stored.MinimumUsernameLength, "列の既定が 1 でない")
+
+	require.NoError(t, repo.Update(map[string]any{"minimumUsernameLength": 5}))
+	require.NoError(t, testDB.Where("id = ?", meta.ID).First(&stored).Error)
+	assert.Equal(t, 5, stored.MinimumUsernameLength)
 }

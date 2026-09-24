@@ -14,10 +14,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
 	apiadmin "github.com/shiroha-a/mk/internal/api/admin"
+	coredrive "github.com/shiroha-a/mk/internal/core/drive"
 	corerole "github.com/shiroha-a/mk/internal/core/role"
 	"github.com/shiroha-a/mk/internal/pluginstore"
 	"github.com/shiroha-a/mk/internal/queue"
@@ -87,6 +89,10 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 			),
 			api:    &pluginAPI{echo: s.echo, userRepo: s.userRepo, host: requestHostFor(s.config.URL)},
 			config: pluginConfig(settings),
+			// **共通の outbound 設定を通す (#3037)。** プラグインが自分で
+			// `&http.Client{}` を作ると SSRF ガードも運営者の proxy 設定も
+			// 効かず、そのプラグインだけがサーバーの素の IP で外へ出る。
+			httpClient: s.outboundClient(pluginHTTPTimeout),
 		}
 
 		// ストレージはロールに関係なく渡す。Routes からも Jobs からも使うため。
@@ -110,8 +116,29 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 
 		// peer 経路。**宣言していないプラグインにも非 nil を渡す** (呼ぶと
 		// エラーになる実装)。nil を返すと nil チェック漏れが panic になる。
-		peer := &pluginPeer{name: def.Name, peered: def.Peered, deps: s.peerDeps, logger: pctx.logger}
+		peerLimit, _ := peerBodyLimit(def, settings)
+		// **ジョブを宣言していないプラグインには積ませない。** 専用キューを
+		// 作らない (plugin_queue_names.go) ので、積めても誰も処理しない。
+		// 呼んだ時点でエラーにして、黙って溜まる形にしない。
+		pctx.queue = &pluginQueue{name: def.Name, client: s.queueClient, hasJobs: def.Jobs != nil}
+
+		peer := &pluginPeer{
+			name:    def.Name,
+			peered:  def.Peered,
+			deps:    s.peerDeps,
+			logger:  pctx.logger,
+			maxBody: peerLimit,
+		}
 		pctx.peer = peer
+
+		// **ロールに関係なく呼ぶ (#2819)。** 送信の再送はキューに載るので、
+		// 実際に POST するのは queue ロールのプロセスになる。OnReply を
+		// Routes の中で登録していると、ロールを分割した構成で応答が届かない。
+		if def.Peer != nil {
+			if err := def.Peer(pctx, peer); err != nil {
+				return fmt.Errorf("plugin %q: peer の登録に失敗しました: %w", def.Name, err)
+			}
+		}
 
 		if def.EffectivePolicies != nil {
 			if s.roleService == nil {
@@ -139,20 +166,49 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 		def := p.def
 		pctx := p.ctx
 		peer := p.peer
-		if def.Routes != nil && s.role.RunsServer() {
-			group := api.Group(pluginRoutePrefix + def.Name)
-			r := &pluginRouter{group: group, roles: s.pluginRoles}
-			if err := def.Routes(pctx, r); err != nil {
-				return fmt.Errorf("plugin %q: ルート登録に失敗しました: %w", def.Name, err)
-			}
-			if err := r.err; err != nil {
-				return fmt.Errorf("plugin %q: ルート登録に失敗しました: %w", def.Name, err)
+		// **peer の受け口を Routes の有無に依存させない (#2822)。** nodeinfo の
+		// 広告は Routes を見ないので、`Peered: true` + `Routes: nil` は宣言だけ
+		// して受け取れないインスタンスになる。相手からは catchall の 200 + {} が
+		// 返り、「プラグインが空の応答を返した」と区別が付かない。
+		//
+		// **group を作るのは 1 箇所に保つ。** `api.Group(` の数は
+		// `TestAPICompatDoc_MatchesRouter` が固定している (サブグループ配下の
+		// 登録は生成物との照合から見えないため)。
+		needsRoutes := def.Routes != nil
+		needsPeer := def.Peered && s.peerDeps != nil
+		if s.role.RunsServer() && (needsRoutes || needsPeer) {
+			// **第三者アプリのトークンを入れない (#3037)。** プラグインの
+			// ルートには upstream の `kind` にあたる宣言が無く、本体は
+			// `RequireScope` を配線できない。gate を置かないと
+			// `read:account` だけの token で到達でき、プラグインが
+			// `req.IsModerator()` で守っていても scope は効かない
+			// (`AsUser` は対象利用者の native token を載せるので、そこから
+			// 任意の endpoint へ抜けられる)。upstream が
+			// 「`kind` 無し + 資格情報要」で app token を一律拒否するのと
+			// 同じ側に倒す。
+			group := api.Group(pluginRoutePrefix+def.Name, middleware.RejectAppToken())
+			if needsRoutes {
+				r := &pluginRouter{group: group, roles: s.pluginRoles}
+				if err := def.Routes(pctx, r); err != nil {
+					return fmt.Errorf("plugin %q: ルート登録に失敗しました: %w", def.Name, err)
+				}
+				if err := r.err; err != nil {
+					return fmt.Errorf("plugin %q: ルート登録に失敗しました: %w", def.Name, err)
+				}
 			}
 			// 予約パスは **プラグインの登録より後**に張る。先に張ると
 			// プラグインが同じパスを登録できてしまい、受け口を奪える。
-			if def.Peered && s.peerDeps != nil {
+			if needsPeer {
 				group.POST(peerPath, peer.echoHandler())
 			}
+		}
+		// peer の送信を処理するのは queue ロール (#2819)。**Peered だけで
+		// 登録する** — Jobs を持たないプラグインでも送信はするため。
+		if def.Peered && s.peerDeps != nil && s.role.RunsQueue() {
+			if s.queueServer == nil {
+				return fmt.Errorf("plugin %q: peer の処理を登録できません (queue server が未配線です)", def.Name)
+			}
+			s.queueServer.Handle(queue.PluginPeerTaskType(def.Name), peer.peerJobHandler())
 		}
 		if def.Jobs != nil && s.role.RunsQueue() {
 			j := &pluginJobs{name: def.Name, server: s.queueServer, scheduler: s.queueScheduler}
@@ -167,9 +223,31 @@ func (s *Server) setupPlugins(api *echo.Group, plugins []plugin.Definition, open
 		// schema も出す。プラグインのデータがどこにあるかを、運営者が
 		// ログだけで辿れるようにする (消したあとの残存データの説明に要る)。
 		schema, _ := pluginstore.SchemaName(def.Name)
+		// **登録漏れを知らせる (#2819)。** peer の登録を Routes の中に置いたまま
+		// ロールを分割すると、そのロールでは Handle も OnReply も無いまま動く。
+		// 症状は「応答が来ない」「相手に 501」で、どちらもこちら側には出ない。
+		if def.Peered {
+			if s.role.RunsServer() && peer.handlerFn() == nil {
+				// **このロールでは Routes も既に走っている**ので、ここに
+				// 来るのは「どこにも Handle を登録していない」場合だけ。
+				// 相手には 501 が返る。
+				slog.Warn("plugin peer: 受信ハンドラが登録されていません",
+					"name", def.Name, "role", s.role,
+					"hint", "Peer.Handle をどこかで呼ぶこと (推奨は Definition.Peer)")
+			}
+			if s.role.RunsQueue() && peer.replyFn() == nil {
+				// 送信の POST は queue ロールで走るので、OnReply を Routes の
+				// 中で登録しているとここで無い状態になる。応答が届かない。
+				slog.Warn("plugin peer: このロールに応答ハンドラが登録されていません",
+					"name", def.Name, "role", s.role,
+					"hint", "Peer.OnReply を Definition.Peer の中で呼ぶこと (Routes の中だと queue ロールで登録されない)")
+			}
+		}
+
 		slog.Info("plugin loaded",
 			"name", def.Name, "version", def.Version,
 			"routes", def.Routes != nil && s.role.RunsServer(),
+			"peer", needsPeer,
 			"jobs", def.Jobs != nil && s.role.RunsQueue(),
 			"migrations", len(def.Migrations),
 			"schema", schema)
@@ -205,7 +283,7 @@ func serverPluginInfos(plugins []plugin.Definition, settings map[string]map[stri
 		// -config-dump と同じく値は既定で全部マスクする方針に合わせる。
 		keys := make([]string, 0, len(s))
 		for k := range s {
-			if k == enabledKey {
+			if isReservedPluginKey(k) {
 				continue
 			}
 			keys = append(keys, k)
@@ -287,14 +365,16 @@ func requestHostFor(rawURL string) string {
 // --- Context ---
 
 type pluginContext struct {
-	name    string
-	logger  *slog.Logger
-	api     plugin.API
-	storage plugin.Storage
-	config  plugin.Config
-	peer    plugin.Peer
-	goGate  *pluginGoGate
-	goStart func(func())
+	name       string
+	logger     *slog.Logger
+	api        plugin.API
+	storage    plugin.Storage
+	config     plugin.Config
+	peer       plugin.Peer
+	queue      plugin.Queue
+	httpClient *http.Client
+	goGate     *pluginGoGate
+	goStart    func(func())
 }
 
 func (c *pluginContext) Name() string            { return c.name }
@@ -303,10 +383,101 @@ func (c *pluginContext) API() plugin.API         { return c.api }
 func (c *pluginContext) Storage() plugin.Storage { return c.storage }
 func (c *pluginContext) Config() plugin.Config   { return c.config }
 
+// HTTP returns the outbound client shared with the rest of mk-go.
+//
+// **未配線でも nil を返さない (#3037)。** nil を返すと、プラグイン側の
+// `ctx.HTTP().Do(...)` がそのまま nil 参照 panic になる。素の client は
+// SSRF ガードも proxy 設定も持たないので、代わりに**必ず失敗する**
+// transport を返す — 「黙って無防備に外へ出る」より「動かない」ほうが
+// 気付ける。
+func (c *pluginContext) HTTP() *http.Client {
+	if c.httpClient == nil {
+		return &http.Client{Transport: unwiredPluginTransport{}}
+	}
+	return c.httpClient
+}
+
+// unwiredPluginTransport fails every request with an explanatory error.
+type unwiredPluginTransport struct{}
+
+func (unwiredPluginTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("plugin: HTTP client が未配線です (mk-go の不具合です)")
+}
+
 // Peer は **常に非 nil** を返す。Peered を立てていないプラグインには、
 // 呼ぶとエラーになる実装を渡す — nil を返すと、プラグイン側の nil チェック
 // 漏れがそのまま panic になる。
 func (c *pluginContext) Peer() plugin.Peer { return c.peer }
+
+// Queue も **常に非 nil**。queue client が未配線のときは呼ぶとエラーになる
+// 実装を渡す (Peer と同じ理由)。
+func (c *pluginContext) Queue() plugin.Queue { return c.queue }
+
+// pluginHTTPTimeout bounds one request made through ctx.HTTP().
+//
+// **プラグインの主な用途はリモートからの取り寄せ**なので、AP の配送
+// (10 秒) より長めに取る。足りないものは
+// `http.NewRequestWithContext` で per-request に伸ばせる。
+const pluginHTTPTimeout = 30 * time.Second
+
+// pluginRetryBackoffBase is the exponential backoff base applied whenever a
+// plugin asks for retries.
+//
+// **プラグインの主な用途はリモートからの取り寄せ** (#2818 の動機) なので、
+// 相手が落ちているときに連打しない間隔にする。deliver / inbox の
+// httpRelatedBackoff (1 分起点、8 時間上限) ほど長くはしない — あちらは連合の
+// 配送で、こちらは利用者の画面に出る取得。
+const pluginRetryBackoffBase = 10 * time.Second
+
+// pluginQueue implements plugin.Queue for one plugin.
+type pluginQueue struct {
+	name    string
+	client  *queue.Client
+	hasJobs bool
+}
+
+// Enqueue adds a job to this plugin's queue.
+//
+// **ロールを問わず使える。** worker を持たない web 専用プロセスからでも積める
+// (処理するのは queue ロールのプロセス)。ハンドラの登録は Jobs callback 側で、
+// そちらは RunsQueue() のときしか走らない。
+func (q *pluginQueue) Enqueue(ctx context.Context, name string, payload any, opts ...plugin.EnqueueOption) error {
+	if !q.hasJobs {
+		return fmt.Errorf("plugin queue: Definition.Jobs を宣言していないため積めません")
+	}
+	if q.client == nil {
+		return fmt.Errorf("plugin queue: queue client が未配線です")
+	}
+	if name == "" {
+		return fmt.Errorf("plugin queue: ジョブ名が空です")
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("plugin queue: payload を JSON 化できません: %w", err)
+	}
+
+	var o plugin.EnqueueOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
+	var dopts []driver.EnqueueOption
+	if o.Delay > 0 {
+		dopts = append(dopts, driver.WithProcessIn(o.Delay))
+	}
+	if o.MaxAttempts > 1 {
+		// driver の MaxRetry は「初回を除く回数」。
+		dopts = append(dopts, driver.WithMaxRetry(o.MaxAttempts-1))
+		// **backoff を必ず付ける。** 未設定の mkq は遅延 0 で再投入するので、
+		// 落ちている取得先を連打したうえ delayed bucket にも滞在しない
+		// (driver/option.go の BackoffType が名指ししている罠)。公開面に
+		// ノブが無い以上、プラグイン側では回避できない。
+		dopts = append(dopts, driver.WithBackoff(driver.BackoffExponential, pluginRetryBackoffBase))
+	}
+	if o.DedupTTL > 0 {
+		dopts = append(dopts, driver.WithUnique(o.DedupTTL))
+	}
+	return q.client.EnqueuePlugin(ctx, q.name, name, body, dopts...)
+}
 
 type pluginGoGate struct {
 	mu      sync.Mutex
@@ -381,7 +552,7 @@ const enabledKey = "enabled"
 // bool 以外が書かれていた場合も有効として扱う。設定の書き間違いで機能が黙って
 // 消える方が、無効化が効かないより厄介なため。
 func pluginEnabled(settings map[string]any) bool {
-	v, ok := settings[enabledKey]
+	v, ok := pluginSetting(settings, enabledKey)
 	if !ok {
 		return true
 	}
@@ -392,11 +563,33 @@ func pluginEnabled(settings map[string]any) bool {
 	return b
 }
 
-// pluginConfig wraps the plugin's settings, minus the reserved key.
+// pluginSetting looks a reserved key up without caring about case.
+//
+// **viper が小文字化する。** 設定ファイルに camelCase で書いた `peerMaxBody` は
+// `peermaxbody` で届くので、完全一致で引くと予約キーが素通りする (実測)。
+// `enabled` が動いていたのは元から小文字だったからで、規則ではない。
+func pluginSetting(settings map[string]any, key string) (any, bool) {
+	if v, ok := settings[key]; ok {
+		return v, true
+	}
+	for k, v := range settings {
+		if strings.EqualFold(k, key) {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// isReservedPluginKey reports whether k is consumed by mk-go itself.
+func isReservedPluginKey(k string) bool {
+	return strings.EqualFold(k, enabledKey) || strings.EqualFold(k, peerMaxBodyKey)
+}
+
+// pluginConfig wraps the plugin's settings, minus the reserved keys.
 func pluginConfig(settings map[string]any) plugin.Config {
 	rest := make(map[string]any, len(settings))
 	for k, v := range settings {
-		if k == enabledKey {
+		if isReservedPluginKey(k) {
 			continue
 		}
 		rest[k] = v
@@ -563,15 +756,37 @@ func wrapPluginHandler(h plugin.Handler, roles middleware.RoleChecker) echo.Hand
 
 // writePluginBlob writes a raw plugin response.
 //
-// **nosniff を必ず付ける。** プラグインが外部から取得したものをそのまま流す
-// 用途 (画像プロキシ) を想定しているので、ブラウザの MIME 推測で意図しない
-// 解釈をされる余地を残さない。
+// **`nosniff` だけでは足りない (#3037)。** あれはブラウザの MIME 推測を止める
+// だけで、Content-Type が**実際に** `text/html` や `image/svg+xml` のときには
+// 何も止めない。プラグインが取得元の Content-Type をそのまま流すと
+// (`plugin.Blob` の doc が「主な用途は画像のプロキシ」と書いている用途その
+// もの)、**同一オリジンの XSS** になる。Misskey のフロントは `account` を
+// localStorage に置くので、これはアカウント乗っ取りと同じ。
+//
+// **mk-go は自分のファイル配信 (`filesHandler`) で同じ脅威を 3 重に塞いで
+// いる**のに、こちらはそのどれも持っていなかった。同じ 3 つを付ける:
+//
+//   - `BrowserSafeContentType` で allowlist 外の型を
+//     `application/octet-stream` に矯正する (upstream
+//     `FileServerUtils.getSafeContentType` と同じ規則)
+//   - `Content-Security-Policy` で script / object の実行を封じる
+//     (値は `filesHandler` と同じ)
+//   - `Content-Disposition: inline`
+//
+// **allowlist は image / audio / video だけ。** JSON を返したいプラグインは
+// `Blob` ではなく素の値を返せばよい (本体が JSON 化する)。`text/plain` 等は
+// octet-stream に落ちるので、ブラウザでは表示ではなくダウンロードになる。
+// denylist にしないのは、危険な型を数え上げる形が必ず漏れるため。
 func writePluginBlob(c echo.Context, b plugin.Blob) error {
 	ct := b.ContentType
 	if ct == "" {
 		ct = echo.MIMEOctetStream
 	}
+	ct = coredrive.BrowserSafeContentType(ct)
 	c.Response().Header().Set("X-Content-Type-Options", "nosniff")
+	c.Response().Header().Set("Content-Security-Policy",
+		"default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'")
+	c.Response().Header().Set("Content-Disposition", "inline")
 	if b.CacheControl != "" {
 		// /api 配下には既定の Cache-Control が付くので上書きする。
 		c.Response().Header().Set("Cache-Control", b.CacheControl)
@@ -653,7 +868,9 @@ type pluginCaller struct {
 // mk-go 側を変えても自動的に追従する。
 //
 // レート制限も同じように適用される。プラグインが高頻度で呼ぶと、その利用者の
-// 制限に掛かる。
+// 制限に掛かる。**ただし `Anonymous()` (= 利用者を伴わない呼び出し) は別** —
+// プロセス内呼び出しの印が付いているので IP バケットに落ちず、実質的に
+// 無制限になる。プラグイン側で自前の上限を持つこと。
 func (c *pluginCaller) Call(ctx context.Context, endpoint string, params any) (json.RawMessage, error) {
 	if err := validateEndpoint(endpoint); err != nil {
 		return nil, err
@@ -675,6 +892,10 @@ func (c *pluginCaller) Call(ctx context.Context, endpoint string, params any) (j
 	req.Host = c.api.host
 	// RemoteAddr を空にすると、IP を見る middleware が解釈に困る。
 	req.RemoteAddr = "127.0.0.1:0"
+	// **ただしこの IP は実在しない。** そのままだと利用者の `user_ip` に
+	// `127.0.0.1` が入って関連アカウント検索の材料が汚れ、レート制限の
+	// IP バケットも全利用者で共有される。印を付けて両方から外す。
+	req = middleware.MarkInternalCall(req)
 
 	if c.userID != "" {
 		token, err := c.nativeToken()
@@ -753,8 +974,11 @@ type pluginJobs struct {
 }
 
 // taskType namespaces a plugin job so it cannot collide with mk-go's own types.
+//
+// **enqueue 側と同じものを使う** (queue.PluginTaskType)。別々に組み立てると、
+// 片方を変えたときにジョブが「処理者なし」で捨てられる。
 func (j *pluginJobs) taskType(name string) string {
-	return "plugin:" + j.name + ":" + name
+	return queue.PluginTaskType(j.name, name)
 }
 
 func (j *pluginJobs) Handle(name string, h plugin.JobHandler) {
@@ -787,7 +1011,7 @@ func (j *pluginJobs) Schedule(cron string, name string, payload any) {
 		j.err = fmt.Errorf("ジョブ %q のペイロードを JSON 化できません: %w", name, err)
 		return
 	}
-	if err := j.scheduler.RegisterPluginJob(cron, j.taskType(name), body); err != nil {
+	if err := j.scheduler.RegisterPluginJob(cron, j.name, name, body); err != nil {
 		j.err = fmt.Errorf("ジョブ %q をスケジュールできません: %w", name, err)
 	}
 }

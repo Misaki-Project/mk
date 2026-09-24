@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	corerole "github.com/shiroha-a/mk/internal/core/role"
+	"github.com/shiroha-a/mk/internal/core/signup"
+	"github.com/shiroha-a/mk/internal/misc/id"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -212,7 +216,10 @@ func TestDriveShowFile_ByFileID(t *testing.T) {
 func TestDriveShowFile_IncludesRequestIPAndHeaders(t *testing.T) {
 	h, _, _, roleRepo, assignRepo := newTestHandlerWithAssign(t)
 	// adminUser に moderator role を assign する。
-	roleRepo.Roles["r_mod"] = &model.Role{ID: "r_mod", Name: "Mod", IsModerator: true}
+	// **`canSearchIpHistory` も付ける。** IP は policy を持つ相手にだけ返す
+	// (#3114 と同じ条件)。
+	roleRepo.Roles["r_mod"] = &model.Role{ID: "r_mod", Name: "Mod", IsModerator: true,
+		Policies: datatypes.JSON([]byte(`{"canSearchIpHistory":{"useDefault":false,"priority":1,"value":true}}`))}
 	assignRepo.Assignments["admin1:r_mod"] = &model.RoleAssignment{
 		ID: "ra_mod", UserID: "admin1", RoleID: "r_mod",
 	}
@@ -248,7 +255,9 @@ func TestDriveShowFile_IncludesRequestIPAndHeaders(t *testing.T) {
 func TestDriveShowFile_HidesRequestHeadersFromModeratorOwner(t *testing.T) {
 	h, _, _, roleRepo, assignRepo := newTestHandlerWithAssign(t)
 	// admin1 viewer + admin2 owner、両方 moderator role を持つ。
-	roleRepo.Roles["r_mod"] = &model.Role{ID: "r_mod", Name: "Mod", IsModerator: true}
+	// viewer 側には `canSearchIpHistory` も付ける (IP はそれが要る)。
+	roleRepo.Roles["r_mod"] = &model.Role{ID: "r_mod", Name: "Mod", IsModerator: true,
+		Policies: datatypes.JSON([]byte(`{"canSearchIpHistory":{"useDefault":false,"priority":1,"value":true}}`))}
 	assignRepo.Assignments["admin1:r_mod"] = &model.RoleAssignment{
 		ID: "ra1", UserID: "admin1", RoleID: "r_mod",
 	}
@@ -274,8 +283,49 @@ func TestDriveShowFile_HidesRequestHeadersFromModeratorOwner(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-	assert.Equal(t, "203.0.113.99", resp["requestIp"], "requestIp は moderator viewer に常に出す")
+	assert.Equal(t, "203.0.113.99", resp["requestIp"], "policy を持つ viewer には requestIp を出す")
 	assert.Nil(t, resp["requestHeaders"], "owner が moderator のときは requestHeaders を null で hide")
+}
+
+// **ロールを引けない窓では隠す側に倒す (#3037 レビュー 3 周目)。**
+//
+// `IsModerator` は判定できないときに false を返すので、素で使うと
+// `assignmentRepo.ListByUser` が一時的に失敗する窓で**他のモデレーターの
+// `requestHeaders` が出る**。2 周目でここを fail-closed にしたが、テストが
+// 無く `ownerIsModerator := true` を `false` に戻す変異が素通りしていた。
+func TestDriveShowFile_HidesRequestHeadersWhenRoleLookupFails(t *testing.T) {
+	userRepo := testutil.NewMockUserRepository()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x"}
+	roleRepo := testutil.NewMockRoleRepository()
+	roleRepo.Roles["r_mod"] = &model.Role{ID: "r_mod", Name: "Mod", IsModerator: true}
+	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
+	require.NoError(t, assignRepo.Create(&model.RoleAssignment{ID: "ra1", UserID: "admin1", RoleID: "r_mod"}))
+	idGen, err := id.NewGenerator("aidx")
+	require.NoError(t, err)
+	flaky := &failingAssignmentRepo{MockRoleAssignmentRepository: assignRepo}
+	roleSvc := corerole.NewService(roleRepo, flaky, metaRepo, idGen)
+	h := apiadmin.NewHandler(signup.NewService(userRepo, metaRepo, idGen), roleSvc, metaRepo, userRepo, idGen)
+
+	repo := testutil.NewMockDriveFileRepository()
+	owner := "admin2"
+	ip := "203.0.113.99"
+	require.NoError(t, repo.Create(&model.DriveFile{
+		ID:             "d_flaky",
+		UserID:         &owner,
+		Name:           "mod-file.png",
+		Type:           "image/png",
+		RequestIP:      &ip,
+		RequestHeaders: datatypes.JSON([]byte(`{"secret":"shh"}`)),
+	}))
+	h.SetDriveFileRepo(repo)
+
+	rec := doPost(h.DriveShowFile, `{"fileId":"d_flaky"}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Nil(t, resp["requestHeaders"],
+		"ロールを引けない窓で他のモデレーターの requestHeaders が出ている")
 }
 
 func TestDriveCleanup_InvokesDeleteOrphans(t *testing.T) {
@@ -494,6 +544,16 @@ type fakeEmojiImageFetcher struct {
 	}
 	returnDF  *model.DriveFile
 	returnErr error
+
+	// #2966 (承認時に system 所有へ複製する経路。#2999 で admin/emoji/add、
+	// #3014 で admin/emoji/update も通る)
+	copyCalls     []*model.DriveFile
+	copyNames     []string
+	copySensitive []bool
+	copyDF        *model.DriveFile
+	copyErr       error
+	deletedIDs    []string
+	deleteErr     error
 }
 
 func (f *fakeEmojiImageFetcher) FetchAndStore(_ context.Context, url string, user *model.User, name string) (*model.DriveFile, error) {
@@ -506,6 +566,21 @@ func (f *fakeEmojiImageFetcher) FetchAndStore(_ context.Context, url string, use
 		return nil, f.returnErr
 	}
 	return f.returnDF, nil
+}
+
+func (f *fakeEmojiImageFetcher) CopyToSystemFile(_ context.Context, src *model.DriveFile, name string, sensitive bool) (*model.DriveFile, error) {
+	f.copyCalls = append(f.copyCalls, src)
+	f.copyNames = append(f.copyNames, name)
+	f.copySensitive = append(f.copySensitive, sensitive)
+	if f.copyErr != nil {
+		return nil, f.copyErr
+	}
+	return f.copyDF, nil
+}
+
+func (f *fakeEmojiImageFetcher) DeleteSystemFile(_ context.Context, fileID string) error {
+	f.deletedIDs = append(f.deletedIDs, fileID)
+	return f.deleteErr
 }
 
 // TestEmojiCopy_StoresInDrive verifies that a wired fetcher is invoked and
@@ -557,6 +632,11 @@ func TestEmojiCopy_StoresInDrive(t *testing.T) {
 	require.NotNil(t, copied.Type)
 	// Webpublic type is preferred when present (matches Misskey TS behaviour).
 	assert.Equal(t, "image/webp", *copied.Type)
+	// **成功したら消さない** (#2998)。後始末を `defer` へ動かすような変更で、
+	// 取り込んだ画像が作成直後に消えて「絵文字はピッカーに出るのに画像は 404」に
+	// なる。承認経路にも同じ形を足した
+	// (`TestCreateFromRemoteApplicationKeepsFileOnSuccess`)。
+	require.Empty(t, fetcher.deletedIDs, "成功した copy で drive ファイルを消さないこと")
 }
 
 // TestEmojiCopy_StoresInDrive_NoWebpublic falls back to df.URL / df.Type
@@ -1763,4 +1843,341 @@ func TestDriveCleanup_WithoutLocalDeleterUsesPrimary(t *testing.T) {
 	rec := doPost(h.DriveCleanup, `{}`, adminUser)
 	require.Equal(t, http.StatusNoContent, rec.Code)
 	assert.ElementsMatch(t, []string{"ak"}, primary.deleted)
+}
+
+// **リネーム時に name の pattern を掛ける。これは upstream より厳しい。**
+//
+// upstream の paramDef は `anyOf[{id 必須}, {name 必須 + pattern}]` なので、
+// **`id` を渡すと `^[a-zA-Z0-9_]+$` は検査されない** — frontend の通常の
+// 呼び方がそれにあたる。結果として `:foo bar:` のような名前が保存でき、
+// AP で broadcast される。
+func TestEmojiUpdate_RejectsInvalidName(t *testing.T) {
+	for _, name := range []string{"foo bar", "foo:bar", "foo<x>", "", "絵文字", "a/b"} {
+		t.Run(name, func(t *testing.T) {
+			h, emojiRepo := setupEmojiHandler(t, &model.Emoji{ID: "e1", Name: "smile"})
+			body, err := json.Marshal(map[string]any{"id": "e1", "name": name})
+			require.NoError(t, err)
+
+			rec := doPost(h.EmojiUpdate, string(body), adminUser)
+			assert.Equalf(t, http.StatusBadRequest, rec.Code,
+				"name=%q が通った。AP で broadcast される", name)
+			assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+
+			// 保存もされていないこと。
+			got, ferr := emojiRepo.FindByID("e1")
+			require.NoError(t, ferr)
+			assert.Equal(t, "smile", got.Name, "不正な名前が保存されている")
+		})
+	}
+}
+
+// 正当な名前は通る (pattern を厳しくしすぎていないか)。
+func TestEmojiUpdate_AcceptsValidName(t *testing.T) {
+	for _, name := range []string{"smile2", "foo_bar", "A", "a1_B2"} {
+		t.Run(name, func(t *testing.T) {
+			h, emojiRepo := setupEmojiHandler(t, &model.Emoji{ID: "e1", Name: "smile"})
+			body, err := json.Marshal(map[string]any{"id": "e1", "name": name})
+			require.NoError(t, err)
+
+			rec := doPost(h.EmojiUpdate, string(body), adminUser)
+			require.Equalf(t, http.StatusNoContent, rec.Code, "name=%q が落ちた: %s", name, rec.Body.String())
+			got, ferr := emojiRepo.FindByID("e1")
+			require.NoError(t, ferr)
+			assert.Equal(t, name, got.Name)
+		})
+	}
+}
+
+// **名前を変えない更新は、既存の名前が非準拠でも通ること。**
+//
+// frontend は名前を編集していなくても `name` を必ず送る
+// (`custom-emojis-manager.local.list.vue` は `name: item.name`)。ここで
+// pattern を掛けると、**既に非準拠な名前で保存されている絵文字のカテゴリや
+// ライセンスが編集できなくなる**。そういう行は **TS から引き継いだ DB に残りうる**
+// (upstream の `update` は `id` 経路で pattern を掛けない)。`EmojiCopy` は #2998 で
+// 塞いだので、mk-go が新しく作る経路はもう無い。
+func TestEmojiUpdate_KeepsNonConformingNameEditable(t *testing.T) {
+	h, emojiRepo := setupEmojiHandler(t, &model.Emoji{ID: "e1", Name: "foo-bar.baz", Category: func() *string { v := "old"; return &v }()})
+
+	body, err := json.Marshal(map[string]any{"id": "e1", "name": "foo-bar.baz", "category": "new"})
+	require.NoError(t, err)
+	rec := doPost(h.EmojiUpdate, string(body), adminUser)
+	require.Equalf(t, http.StatusNoContent, rec.Code,
+		"非準拠な名前を保ったままの更新が落ちた。カテゴリすら直せなくなる: %s", rec.Body.String())
+
+	got, ferr := emojiRepo.FindByID("e1")
+	require.NoError(t, ferr)
+	assert.Equal(t, "foo-bar.baz", got.Name)
+	require.NotNil(t, got.Category)
+	assert.Equal(t, "new", *got.Category)
+}
+
+// 逆に、非準拠な名前へ**変える**のは拒む。
+func TestEmojiUpdate_RejectsRenameToInvalid(t *testing.T) {
+	h, emojiRepo := setupEmojiHandler(t, &model.Emoji{ID: "e1", Name: "foo-bar.baz"})
+
+	body, err := json.Marshal(map[string]any{"id": "e1", "name": "still bad"})
+	require.NoError(t, err)
+	rec := doPost(h.EmojiUpdate, string(body), adminUser)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	got, ferr := emojiRepo.FindByID("e1")
+	require.NoError(t, ferr)
+	assert.Equal(t, "foo-bar.baz", got.Name, "拒んだのに保存されている")
+}
+
+// **制約外の名前をそのままコピーしない** (#2998)。
+//
+// リモート絵文字の `name` は相手サーバーが決める値で、upstream の
+// `admin/emoji/add` が強制する `^[a-zA-Z0-9_]+$` を満たすとは限らない。そのまま
+// コピーすると **MFM の `:name:` から参照できないローカル絵文字**ができ、同じ名前を
+// `add` で作ろうとすると 400 で弾かれるので経路によって結果が変わる。ケースは本番の
+// 実測にあった 3 つの形 (記号のみ / `@host` 付き / ハイフン) をそのまま並べてある。
+//
+// **画像を取りに行く前に弾く。** 後から弾くと、その都度リモートへ 1 往復して
+// drive ファイルを作っては消すことになる。
+func TestEmojiCopy_RejectsInvalidRemoteName(t *testing.T) {
+	for _, name := range []string{"+_+", "ablobcatnodmeltcry@3.5mbps.net", "mikan_8-2"} {
+		t.Run(name, func(t *testing.T) {
+			remoteHost := "remote.example"
+			h, repo := setupEmojiHandler(t, &model.Emoji{
+				ID: "src1", Name: name, Host: &remoteHost,
+				OriginalURL: "https://remote.example/emoji/x.png",
+			})
+			fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
+				ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
+			}}
+			h.SetEmojiImageFetcher(fetcher)
+
+			rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+			assert.Empty(t, fetcher.calls, "弾くなら画像を取りに行かないこと")
+			_, err := repo.FindByNameAndHost(name, nil)
+			assert.Error(t, err, "ローカル絵文字が作られていないこと")
+		})
+	}
+}
+
+// **`name` を上書きすれば制約外の絵文字も取り込める** (#2998)。
+//
+// 弾くだけだと取り込む手段が無くなる (`admin/emoji/add` は URL からの取得をしない)
+// ので、`category` などと同じ additive なパラメータで人が決められるようにしてある。
+// **drive ファイル名も新しい名前になること**まで見る — 元の名前のままだと、drive を
+// 開いたときに絵文字と対応が取れない。
+func TestEmojiCopy_NameOverrideAllowsInvalidRemoteName(t *testing.T) {
+	remoteHost := "remote.example"
+	h, repo := setupEmojiHandler(t, &model.Emoji{
+		ID: "src1", Name: "+_+", Host: &remoteHost,
+		OriginalURL: "https://remote.example/emoji/x.png",
+	})
+	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
+		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
+	}}
+	h.SetEmojiImageFetcher(fetcher)
+
+	rec := doPost(h.EmojiCopy, `{"emojiId":"src1","name":"plus_eyes"}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	copied := findEmojiByID(t, repo, body["id"].(string))
+	assert.Equal(t, "plus_eyes", copied.Name)
+	require.Len(t, fetcher.calls, 1)
+	assert.Equal(t, "plus_eyes", fetcher.calls[0].Name, "drive ファイル名も上書き後の名前にすること")
+}
+
+// **上書きした名前も検証する** (#2998)。src 側が正当でも、上書きが制約外なら弾く。
+func TestEmojiCopy_RejectsInvalidNameOverride(t *testing.T) {
+	remoteHost := "remote.example"
+	h, _ := setupEmojiHandler(t, &model.Emoji{
+		ID: "src1", Name: "valid_name", Host: &remoteHost,
+		OriginalURL: "https://remote.example/emoji/x.png",
+	})
+	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
+		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
+	}}
+	h.SetEmojiImageFetcher(fetcher)
+
+	rec := doPost(h.EmojiCopy, `{"emojiId":"src1","name":"bad-name"}`, adminUser)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Empty(t, fetcher.calls)
+}
+
+// **重複チェックは上書き後の名前で行う** (#2998)。
+//
+// src の名前で見ていると、上書き先が既存のローカル絵文字と衝突しても通ってしまう。
+// **一意制約は救ってくれない** — `IDX_emoji_name_host` は `(name, host)` で、ローカルは
+// `host IS NULL`。PostgreSQL の既定 (NULLS DISTINCT) では NULL 同士が重複と見なされない
+// ので、`:name:` が 2 行できて MFM の解決もピッカーも二重になる (upstream が
+// `checkDuplicate` をアプリ側に持っているのはこのため)。
+func TestEmojiCopy_DuplicateCheckUsesOverriddenName(t *testing.T) {
+	remoteHost := "remote.example"
+	h, _ := setupEmojiHandler(t,
+		&model.Emoji{ID: "src1", Name: "free", Host: &remoteHost, OriginalURL: "https://remote.example/e.png"},
+		&model.Emoji{ID: "local1", Name: "taken"},
+	)
+	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
+		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
+	}}
+	h.SetEmojiImageFetcher(fetcher)
+
+	rec := doPost(h.EmojiCopy, `{"emojiId":"src1","name":"taken"}`, adminUser)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "DUPLICATE_NAME")
+	assert.Empty(t, fetcher.calls, "重複が分かっているなら画像を取りに行かないこと")
+}
+
+// **`Create` が失敗したら取り込んだ drive ファイルを片付ける** (#2998)。
+//
+// 残すと誰からも参照されない孤児になる。`DriveFileRepository.DeleteOrphans` の
+// 対象ではあるが自動では走らないので、掃除するまで実体ストレージを食い続ける。
+// 承認経路 (`emoji_application.go`) は #2966 で同じ形にしてある。
+func TestEmojiCopy_CleansUpDriveFileWhenCreateFails(t *testing.T) {
+	remoteHost := "remote.example"
+	h, repo := setupEmojiHandler(t, &model.Emoji{
+		ID: "src1", Name: "ok_name", Host: &remoteHost,
+		OriginalURL: "https://remote.example/emoji/x.png",
+	})
+	h.SetEmojiRepo(&failingCreateEmojiRepo{MockEmojiRepository: repo})
+	fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
+		ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
+	}}
+	h.SetEmojiImageFetcher(fetcher)
+
+	rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Equal(t, []string{"df1"}, fetcher.deletedIDs, "取り込んだ drive ファイルを消すこと")
+}
+
+// **取り込んだものの MIME を見る** (#2998)。
+//
+// 承認経路は #2966 で既に見ているので、こちらだけ無検査だと**承認で弾かれるものが
+// copy なら通る**という迂回路になる。相手が `originalUrl` に非画像を置いたときの形。
+// **弾いたものを片付けること**まで見る — その時点で誰からも参照されない孤児になる。
+func TestEmojiCopy_RejectsUnsupportedFileType(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mime string
+	}{
+		{"非画像", "application/zip"},
+		// upstream の `FILE_TYPE_IMAGE.includes("")` は false。drive 側が type を
+		// 埋められなかった行をそのまま絵文字にしない。
+		{"空の MIME", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remoteHost := "remote.example"
+			h, repo := setupEmojiHandler(t, &model.Emoji{
+				ID: "src1", Name: "not_an_image", Host: &remoteHost,
+				OriginalURL: "https://remote.example/emoji/x.bin",
+			})
+			fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
+				ID: "df1", URL: "https://local.example/files/x.bin", Type: tc.mime,
+			}}
+			h.SetEmojiImageFetcher(fetcher)
+
+			rec := doPost(h.EmojiCopy, `{"emojiId":"src1"}`, adminUser)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), "UNSUPPORTED_FILE_TYPE")
+			assert.Equal(t, []string{"df1"}, fetcher.deletedIDs, "弾いたものを片付けること")
+			_, err := repo.FindByNameAndHost("not_an_image", nil)
+			assert.Error(t, err, "ローカル絵文字が作られていないこと")
+		})
+	}
+}
+
+// **名前の長さも見る** (#2998)。
+//
+// `^[a-zA-Z0-9_]+$` は文字種しか縛らないので、`emoji.name` varchar(128) を
+// 超える名前が素通りすると `Create` が SQLSTATE 22001 で落ちる。**弾くのは
+// リモートへ問い合わせる前**でないと、1 往復して drive ファイルを作った後に
+// 500 を返すことになる。空文字は `+` 量化子が弾く。
+func TestEmojiCopy_RejectsNameOverrideByLength(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		override string
+	}{
+		{"空文字", ""},
+		{"128 文字ちょうどは通る", strings.Repeat("a", 128)},
+		{"129 文字は弾く", strings.Repeat("a", 129)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remoteHost := "remote.example"
+			h, _ := setupEmojiHandler(t, &model.Emoji{
+				ID: "src1", Name: "src_name", Host: &remoteHost,
+				OriginalURL: "https://remote.example/emoji/x.png",
+			})
+			fetcher := &fakeEmojiImageFetcher{returnDF: &model.DriveFile{
+				ID: "df1", URL: "https://local.example/files/x.png", Type: "image/png",
+			}}
+			h.SetEmojiImageFetcher(fetcher)
+
+			body, err := json.Marshal(map[string]any{"emojiId": "src1", "name": tc.override})
+			require.NoError(t, err)
+			rec := doPost(h.EmojiCopy, string(body), adminUser)
+			if len(tc.override) == 128 {
+				require.Equal(t, http.StatusOK, rec.Code)
+				return
+			}
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Empty(t, fetcher.calls, "弾くなら画像を取りに行かないこと")
+		})
+	}
+}
+
+// **`admin/emoji/add` も名前の長さで 5xx を立てない** (#2998)。
+//
+// upstream の paramDef に `maxLength` は無いので、128 文字を超える名前は
+// `emoji.name` varchar(128) に入らず SQLSTATE 22001 が生のまま 500 になる。
+// `copy` と申請経路が 400 で弾く以上、**同じ入力が endpoint 次第で 400 と 500 に
+// 分かれる**のは筋が通らない。
+func TestEmojiAdd_RejectsOverlongName(t *testing.T) {
+	h, _ := setupEmojiHandler(t)
+	body, err := json.Marshal(map[string]any{"name": strings.Repeat("a", 129), "url": "https://local.example/x.png"})
+	require.NoError(t, err)
+	rec := doPost(h.EmojiAdd, string(body), adminUser)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+
+	ok, err := json.Marshal(map[string]any{"name": strings.Repeat("a", 128), "url": "https://local.example/x.png"})
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, doPost(h.EmojiAdd, string(ok), adminUser).Code, "128 文字ちょうどは通ること")
+}
+
+// **素のモデレーターには IP を返さないこと。**
+//
+// #3114 が `admin/show-user` の signin IP に入れたのと同じ条件。同じ種類の
+// 情報 (ローカル利用者の接続元 IP) を素のモデレーター権限だけで全件返す口が
+// ここに残ると、policy が門として成立しない。`admin/drive/files` に userId を
+// 渡してファイル ID を列挙すれば、アップロード元 IP の履歴がそのまま取れる。
+func TestDriveShowFile_RequestIPRequiresPolicy(t *testing.T) {
+	h, _, _, roleRepo, assignRepo := newTestHandlerWithAssign(t)
+	// policy を持たない素のモデレーター。
+	roleRepo.Roles["r_mod"] = &model.Role{ID: "r_mod", Name: "Mod", IsModerator: true}
+	assignRepo.Assignments["mod9:r_mod"] = &model.RoleAssignment{
+		ID: "ra_plain", UserID: "mod9", RoleID: "r_mod",
+	}
+
+	repo := testutil.NewMockDriveFileRepository()
+	owner := "u_owner"
+	ip := "203.0.113.7"
+	headers := datatypes.JSON([]byte(`{"x-real-ip":"203.0.113.7"}`))
+	require.NoError(t, repo.Create(&model.DriveFile{
+		ID:             "d_policy",
+		UserID:         &owner,
+		Name:           "f.png",
+		Type:           "image/png",
+		RequestIP:      &ip,
+		RequestHeaders: headers,
+	}))
+	h.SetDriveFileRepo(repo)
+
+	rec := doPost(h.DriveShowFile, `{"fileId":"d_policy"}`, &model.User{ID: "mod9"})
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Nil(t, resp["requestIp"],
+		"policy を持たないモデレーターには requestIp を返さないこと")
+	assert.Nil(t, resp["requestHeaders"],
+		"**ヘッダにも接続元 IP が載る** (本番の nginx は x-real-ip を必ず付ける) ので同じ条件で伏せること")
 }

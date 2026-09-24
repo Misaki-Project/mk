@@ -26,7 +26,102 @@ var (
 	ErrAlreadyAssigned = errors.New("role already assigned")
 	// ErrNotAssigned is returned when the user does not have the role.
 	ErrNotAssigned = errors.New("role not assigned")
+	// ErrSelfGrantableprivilege is returned when a conditional role would hand
+	// out administrator / moderator on a condition the user can satisfy alone.
+	//
+	// **管理画面は条件を並べるだけ (#3037)。** `isCat` にチェックを入れた
+	// 管理者ロールを作るのは操作としてはごく簡単だが、そのロールは
+	// **「猫と名乗る」だけで誰でも取れる**。作った側は「条件を満たす人に
+	// 配る」つもりで、「誰でも自分で満たせる条件」だとは気付きにくい。
+	//
+	// **upstream は弾かない** (`RoleService` は target と condFormula の
+	// 組み合わせを検査しない) が、そちらには合わせない。
+	ErrSelfGrantablePrivilege = errors.New("conditional role cannot grant administrator or moderator on a self-satisfiable condition")
 )
+
+// checkConditionalPrivilege rejects a conditional role that grants
+// administrator / moderator on a condition the user controls.
+//
+// **攻撃者が条件を満たすアカウントを用意できないときだけ通す。** 実質的に
+// 残るのは `roleAssignedTo` で手動ロールを参照する形だけで、そこは
+// `RoleGrantsPrivilegeIndirectly` が「誰が配れるか」を別に見る。
+//
+// **アカウントの年齢は barrier に数えない (#3045)。** 攻撃者はいくらでも
+// 待てるので「1 年以上前に作られたローカル利用者は全員モデレーター」は
+// 運営者の判断ではなく「登録して 1 年待った人は全員モデレーター」になる。
+// 詳細は `condLeafAgeBased`。
+func checkConditionalPrivilege(target model.RoleTarget, condFormula, policies []byte, isModerator, isAdministrator bool) error {
+	if target != model.RoleTargetConditional {
+		return nil
+	}
+	if !isModerator && !isAdministrator && !grantsPrivilegedPolicy(policies) {
+		return nil
+	}
+	if len(condFormula) == 0 {
+		return nil
+	}
+	var f CondFormula
+	if err := json.Unmarshal(condFormula, &f); err != nil {
+		// **読めない式は判定できない。** ここで通すと、壊れた JSON を送る
+		// だけで検査を迂回できる。
+		return ErrSelfGrantablePrivilege
+	}
+	if CondDependsOnUserControlledValue(f) {
+		return ErrSelfGrantablePrivilege
+	}
+	return nil
+}
+
+// RoleGrantsPrivilegeIndirectly reports whether assigning roleID hands the
+// member administrator / moderator / a privileged policy through some
+// conditional role that keys off `roleAssignedTo`.
+//
+// **`checkConditionalPrivilege` と `requireCanEditRoleMembers` の隙間を塞ぐ
+// (#3037 レビュー 2 周目)。** 前者は「利用者本人が条件を満たせるか」、後者は
+// 「そのロール自身が管理者ロールか」しか見ない。だから
+//
+//	staff            = 手動 / 権限なし / canEditMembersByModerator: true
+//	conditional-boss = 条件つき / isAdministrator: true
+//	                   condFormula: {"type":"roleAssignedTo","roleId":"staff"}
+//
+// という 2 つを作ると、**モデレーターが `staff` を自分に付けるだけで管理者に
+// なれる**。`roleAssignedTo` は「誰かが配る必要がある」ので自己付与判定は
+// 通るし、`staff` 自身は管理者ロールではないので付け外しの判定も通る。
+//
+// 判定できないときは true を返す (fail-closed)。ロールを列挙できない窓で
+// 付け外しを通すと、まさにこの昇格が成立する。
+func (s *Service) RoleGrantsPrivilegeIndirectly(roleID string) (bool, error) {
+	if roleID == "" {
+		return false, nil
+	}
+	roles, err := s.listRolesCached()
+	if err != nil {
+		return true, err
+	}
+	for _, r := range roles {
+		if r == nil || r.Target != model.RoleTargetConditional {
+			continue
+		}
+		if !r.IsAdministrator && !r.IsModerator && !grantsPrivilegedPolicy(r.Policies) {
+			continue
+		}
+		if len(r.CondFormula) == 0 {
+			continue
+		}
+		var f CondFormula
+		if err := json.Unmarshal(r.CondFormula, &f); err != nil {
+			// **読めない式は判定できない。** 特権を配る条件つきロールなので
+			// 拒否側へ倒す (`checkConditionalPrivilege` と同じ扱い)。
+			return true, nil
+		}
+		for _, referenced := range CondReferencedRoleIDs(f) {
+			if referenced == roleID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
 
 // Policy key constants. requiredRolePolicy gate 経路 (HasRolePolicy / 各 endpoint
 // での policy 文字列参照) で typo を防ぐため定数化する。新規 policy-gated
@@ -69,13 +164,58 @@ const (
 	PolicyChunkedUploadMaxConcurrentSessions = "chunkedUploadMaxConcurrentSessions"
 	PolicyChunkedUploadMaxPendingMb          = "chunkedUploadMaxPendingMb"
 
+	// カスタム絵文字申請の期間上限 (#2958、mk-go 独自)。**0 は無制限**。
+	// ローリング期間 (過去 24 時間 / 7 日 / 30 日) で数える。
+	//
+	// 既存の短時間レート制限は連打防止として残す — あちらは「1 時間に何回
+	// 叩けるか」で、こちらは「長期間にわたって審査キューへ何件積めるか」を
+	// 見るので守備範囲が違う。
+	PolicyEmojiApplicationMaxPerDay   = "emojiApplicationMaxPerDay"
+	PolicyEmojiApplicationMaxPerWeek  = "emojiApplicationMaxPerWeek"
+	PolicyEmojiApplicationMaxPerMonth = "emojiApplicationMaxPerMonth"
+
+	// 同時に審査待ちにできる件数 (#2977、mk-go 独自)。**0 は無制限**。
+	//
+	// **上の期間上限とは数え方が逆で、絞っているものも違う。** こちらは
+	// pending だけを数えるので**却下・取り下げ・承認で枠が戻る**。期間上限が
+	// 絞るのは「出せる総量」、こちらが絞るのは「モデレーターが見る一覧の長さ」。
+	PolicyEmojiApplicationMaxPending = "emojiApplicationMaxPending"
+
+	// PolicyOptOutNotificationTypes は mk-go 独自 (#2898)。ロール単位で
+	// 受け取らない通知タイプを列挙する。**集約は intersection** —
+	// aggregatePolicyValues の []string 既定 (set union) と逆向きなので、
+	// key 名で分岐している。
+	PolicyOptOutNotificationTypes = "optOutNotificationTypes"
+
 	// 以下は #1025 で admin 系 endpoint の gate に使う policy key。upstream
 	// Misskey TS は ApiCallService.ts で requiredRolePolicy のみで gate し
 	// (requireModerator/Admin flag は admin/emoji や avatar-decorations に
 	// 付いていない)、admin role 持ちのみ自動 bypass する semantics。mk-go も
 	// middleware.RequireRolePolicy 経由で同 挙動に揃える。
-	PolicyCanManageCustomEmojis      = "canManageCustomEmojis"
+	PolicyCanManageCustomEmojis = "canManageCustomEmojis"
+
+	// PolicyCanRequestCustomEmojis gates who may *request* a custom emoji
+	// (#2934 / #2935). canManageCustomEmojis を持つ人は申請ではなく直接
+	// 登録できるので、この policy は「登録はできないが頼める人」を表す。
+	PolicyCanRequestCustomEmojis     = "canRequestCustomEmojis"
 	PolicyCanManageAvatarDecorations = "canManageAvatarDecorations"
+
+	// PolicyCanUseEmojiAsAvatarDecoration gates whether a user may overlay a
+	// local custom emoji on their own avatar (#2975). mk-go 独自で upstream に
+	// 対応キーは無い。**個数はこの policy では見ない** — 既存の
+	// avatarDecorationLimit に合算する。
+	PolicyCanUseEmojiAsAvatarDecoration = "canUseEmojiAsAvatarDecoration"
+
+	// PolicyCanSearchIPHistory gates who may look up which local accounts were
+	// seen from a given IP (#3104). mk-go 独自で upstream に対応キーは無い。
+	//
+	// **既定は false = 管理者のみ。** upstream の `admin/get-user-ips` は
+	// `requireAdmin: true` で、同じ「利用者 ↔ IP の対応」を扱う。既定で
+	// モデレーターへ開くと、同じ機密情報に既存より緩い経路を新設することになる
+	// (`perm-check` は upstream にある endpoint しか見ないので検出されない)。
+	// route は `RequireModerator` と併用するので、policy を有効にしても
+	// モデレーター未満には開かない。
+	PolicyCanSearchIPHistory = "canSearchIpHistory"
 
 	// 以下は #1026 で timeline endpoint の gate に使う policy key。匿名アクセス
 	// 可な経路 (local-timeline / global-timeline) と認証必須経路 (hybrid-
@@ -162,6 +302,12 @@ type Service struct {
 	// 当該 userID を、Delete (role 削除) で全 entry を invalidate する。
 	// admin/roles/update が roleRepo を直接叩く経路は TTL でしかカバー
 	// できないが、roleCacheTTL = 5 min で staleness は bounded (#300 3-5)。
+	// invalidationHook は**ローカルの**変更でキャッシュを落とした後に呼ぶ。
+	// 複数ワーカー構成 (`MK_ONLY_SERVER` / `MK_ONLY_QUEUE`) では、これを繋がない
+	// と剥奪を受け付けなかった側のノードで最大 roleCacheTTL のあいだ古いロールが
+	// 通り続ける。配線は router.go (`internal:rolesUpdated`)。
+	invalidationHook func()
+
 	userRoleCacheMu  sync.RWMutex
 	userRoleCache    map[string]*roleCacheEntry
 	userRoleEpoch    map[string]uint64
@@ -508,9 +654,33 @@ func (s *Service) evaluateConditionalRoles(userID string, assigned []*model.Role
 //
 // userRepo 未配線でも (1) のみで動作するので既存テスト互換性は保たれる。
 func (s *Service) isRootUser(userID string) bool {
-	if meta, err := s.metaRepo.Fetch(); err == nil && meta.RootUserID != nil && *meta.RootUserID == userID {
-		return true
+	// **`rootUserId` が設定されていれば、それが唯一の答え (#3037)。**
+	//
+	// 以前は「どちらかが一致すれば root」だったので、`user.isRoot` が立った
+	// 利用者を**降ろす手段がどこにも無かった** — mk-go には `isRoot` を書く
+	// 経路 (初回セットアップ) しか無く、admin API にも `false` に戻す口は
+	// 無い。DB を直接触るしかないうえ、管理画面にも出ないので「元の運営者が
+	// 永久に管理者のまま」という状態に気付けない。
+	//
+	// `rootUserId` を設定した時点で運営者は「root はこの利用者だ」と明示的に
+	// 宣言しているので、そこに書かれていない `isRoot` は過去の遺物として
+	// 無視してよい。
+	//
+	// **ただし `rootUserId` は `admin/update-meta` の保護列なので API からは
+	// 書けない (#3037 レビューで実測)。** 現状の書き込みは初回セットアップの
+	// 1 箇所だけで、引き継ぎには DB を直接触るしかない。この変更が与えるのは
+	// 「`rootUserId` を書き換えられる手段を用意すれば剥奪も効く」という土台で
+	// あって、剥奪の手段そのものではない。
+	//
+	// **未設定 (TS から引き継いだ DB) のときだけ `isRoot` に落ちる** ので、
+	// #785 の drop-in 互換はそのまま。
+	meta, err := s.metaRepo.Fetch()
+	if err == nil && meta != nil && meta.RootUserID != nil && *meta.RootUserID != "" {
+		return *meta.RootUserID == userID
 	}
+	// **meta を読めないときは従来どおり `isRoot` を見る。** 「設定されて
+	// いるか」が分からない状態で無視すると、DB の瞬断のあいだ本物の root が
+	// 管理画面から締め出される。
 	if s.userRepo != nil {
 		u, err := s.userRepo.FindByID(userID)
 		switch {
@@ -528,6 +698,34 @@ func (s *Service) isRootUser(userID string) bool {
 		}
 	}
 	return false
+}
+
+// RolePrivileges reports the user's administrator / moderator status, and an
+// error when it cannot be determined.
+//
+// **`IsAdministrator` / `IsModerator` は判定できないときに false を返す
+// (#3037 レビュー)。** 「権限を持っているか」を知りたい大半の呼び出し側では
+// それでよい (持っていない側に倒れる) が、**「相手が特権を持っていないことを
+// 確かめてから触る」**判定では逆になる — `assignmentRepo.ListByUser` が一時的に
+// 失敗する窓で、モデレーターが他の管理者のパスワードを発行できてしまう。
+// そちらの用途はこの関数を使って error を 500 に倒すこと。
+func (s *Service) RolePrivileges(userID string) (isAdministrator, isModerator bool, err error) {
+	if s.isRootUser(userID) {
+		return true, true, nil
+	}
+	roles, err := s.GetUserRoles(userID)
+	if err != nil {
+		return false, false, err
+	}
+	for _, r := range roles {
+		if r.IsAdministrator {
+			isAdministrator = true
+		}
+		if r.IsModerator || r.IsAdministrator {
+			isModerator = true
+		}
+	}
+	return isAdministrator, isModerator, nil
 }
 
 // IsAdministrator checks if the user has any administrator role or is root.
@@ -599,6 +797,13 @@ func (s *Service) IsModerator(userID string) bool {
 // upstream RoleService.getModerators(includeAdmins, includeRoot,
 // excludeExpire). Used by the checkModeratorsActivity cron (#1563). Returns
 // nil when userRepo is not wired (drop-in optional, #785).
+//
+// **条件つきロールのモデレーターは含まれない (#3037 レビュー 2 周目)。**
+// 列挙するのは assignment 行だけなので、`GetUserRoles` 側ではモデレーターに
+// なる利用者がここには出ない。**upstream も同じ** (`getModeratorIds` /
+// `getAdministratorIds` が `roleAssignmentsRepository` だけを見る) ので
+// parity として維持する。影響は通報の通知先とモデレーター不在の警告で、
+// 権限の判定そのものには使われていない。
 func (s *Service) GetModerators() ([]*model.User, error) {
 	if s.userRepo == nil {
 		return nil, nil
@@ -636,6 +841,85 @@ func (s *Service) GetModerators() ([]*model.User, error) {
 		ids = append(ids, id)
 	}
 	return s.userRepo.FindManyByIDs(ids)
+}
+
+// GetUsersWithPolicy returns the users who may perform an action gated by
+// policyKey — the same set `HasRolePolicy` answers true for (#2987).
+//
+// 中身は root / 管理者 + **そのキーを true にする割り当て型ロールのメンバー**。
+// `GetModerators` と同じ形で、ロールを走査して assignment を引く。
+//
+// **conditional role は列挙しない。** あちらは assignment を持たず、所属は
+// 条件式で毎回計算されるので、列挙するには全ユーザー走査が要る。`GetModerators`
+// も同じ制限を持つ (既存の割り切り) ので揃えてある。条件ロールでだけ権限を
+// 与えられている人には通知が届かない。
+//
+// **base policy が true でも全員へは広げない。** `meta.policies` でそのキーを
+// true にすると全利用者が `HasRolePolicy` を満たすが、それを宛先にすると
+// 申請 1 件ごとに全員へ通知が飛ぶ。ここが答えるのは「運営チーム」= root /
+// 管理者 + ロールで権限を与えられた人、に限る。
+func (s *Service) GetUsersWithPolicy(policyKey string) ([]*model.User, error) {
+	if s.userRepo == nil {
+		return nil, nil
+	}
+	roles, err := s.listRolesCached()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	idSet := make(map[string]struct{})
+	for _, r := range roles {
+		// 管理者ロールは policy を見ずに通る (HasRolePolicy が短絡する)。
+		// **モデレーターは短絡しない**ので、ここでも特別扱いしない。
+		if !r.IsAdministrator && !roleMentionsPolicy(r, policyKey) {
+			continue
+		}
+		assigns, err := s.assignmentRepo.ListByRole(r.ID, "", "", 100000)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range assigns {
+			if a.ExpiresAt == nil || a.ExpiresAt.After(now) {
+				idSet[a.UserID] = struct{}{}
+			}
+		}
+	}
+	// root は常に通る (IsAdministrator が内部で root を含む)。
+	if meta, err := s.metaRepo.Fetch(); err == nil && meta != nil && meta.RootUserID != nil && *meta.RootUserID != "" {
+		idSet[*meta.RootUserID] = struct{}{}
+	}
+	if len(idSet) == 0 {
+		return nil, nil
+	}
+	// **最終判定は HasRolePolicy に委ねる。** 上のループが集めるのは候補で、
+	// 「そのキーに言及するロールのメンバー」でしかない。ここで許可の有無を
+	// 自前で決めると `computePolicy` の cascade を再実装することになり、
+	// **実際に割れていた** — priority 2 で false にするロールがあると
+	// `computePolicy` はその群だけを集約するので priority 0 の許可は無視される
+	// のに、素朴な「explicit に true か」判定では許可扱いになっていた。
+	// 結果は「通知は届くのに審査 endpoint は 403」で、この機能が防ごうとした
+	// 状態そのもの。
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		if !s.HasRolePolicy(id, policyKey) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.userRepo.FindManyByIDs(ids)
+}
+
+// roleMentionsPolicy reports whether the role has an entry for policyKey at all.
+//
+// **値も priority も見ない。** ここは候補を集めるだけで、許可の有無は
+// `HasRolePolicy` が決める。`useDefault` の entry も候補には入れる —
+// 「高優先度でベース値を使う」宣言なので、cascade の結果を変えうる。
+func roleMentionsPolicy(r *model.Role, policyKey string) bool {
+	_, ok := parseRolePolicies(r.Policies)[policyKey]
+	return ok
 }
 
 // HasRolePolicy reports whether `userID` is allowed to perform an action gated
@@ -917,6 +1201,15 @@ func isFiniteAndInRange(v, lo, hi float64) bool {
 type policyEntry struct {
 	priority int
 	value    any
+	// explicit reports whether a role (or provider) actually set a value for
+	// this key, as opposed to falling back to the base default.
+	//
+	// **intersection で集約する policy にだけ意味がある (#2898)。** 未設定の
+	// ロールには base (opt-out なら空の一覧) が積まれるので、素直に
+	// intersection を取ると 1 つでも未設定のロールがあれば必ず空になり、
+	// 設定したロールの値が消える。GetUserRoles は conditional role も含むので、
+	// 管理者が割り当てていない自動マッチのロール 1 つで効かなくなっていた。
+	explicit bool
 }
 
 // computePolicy resolves the effective value for a single policy key by
@@ -942,7 +1235,7 @@ func computePolicy(key string, baseVal any, roleOverrides []map[string]rolePolic
 		if p.UseDefault {
 			collected = append(collected, policyEntry{priority: p.Priority, value: baseVal})
 		} else {
-			collected = append(collected, policyEntry{priority: p.Priority, value: p.Value})
+			collected = append(collected, policyEntry{priority: p.Priority, value: p.Value, explicit: true})
 		}
 	}
 	// provider contribution は同じ priority cascade に参加させる
@@ -951,29 +1244,66 @@ func computePolicy(key string, baseVal any, roleOverrides []map[string]rolePolic
 	// upstream: priority 2 → 1 → 0 の順で「該当 priority に少なくとも 1 件
 	// あればそのグループだけ aggregate」。fallback の priority 0 は全 role
 	// を対象とする (= entry が無い role の priority=0 default も含めて集約)。
+	//
+	// **intersection の policy は明示設定した entry だけを集約する (#2898)。**
+	// 詳細は policyEntry.explicit のコメント。
+	onlyExplicit := aggregatesByIntersection(key)
 	for _, prio := range []int{2, 1} {
-		group := filterByPriority(collected, prio)
-		if len(group) > 0 {
-			return aggregatePolicyValues(key, baseVal, group)
+		// **グループの有無は explicit を見ずに判定する (#2898)。** 絞った結果で
+		// 判定すると `useDefault=true, priority=2` (= このロールは高優先度で
+		// ベース値を使う) だけの層で group が空になり、cascade が priority 0 まで
+		// 滑り落ちる。intersection の policy でだけ upstream の cascade
+		// (「priority 2 に 1 件でもあればそのグループだけ集約」) が崩れる。
+		if !hasPriority(collected, prio) {
+			continue
 		}
+		return aggregatePolicyValues(key, baseVal, filterByPriority(collected, prio, onlyExplicit))
 	}
 	// priority=0 fallback: 全 entry を対象に集約する (= 各 role が default
 	// fallback でも、複数 role の数値 max / bool OR が反映される)。
 	values := make([]any, 0, len(collected))
 	for _, e := range collected {
+		if onlyExplicit && !e.explicit {
+			continue
+		}
 		values = append(values, e.value)
 	}
 	return aggregatePolicyValues(key, baseVal, values)
 }
 
-func filterByPriority(entries []policyEntry, prio int) []any {
-	out := make([]any, 0, len(entries))
+// hasPriority reports whether any entry declares the given priority,
+// regardless of whether it set an explicit value.
+func hasPriority(entries []policyEntry, prio int) bool {
 	for _, e := range entries {
 		if e.priority == prio {
-			out = append(out, e.value)
+			return true
 		}
 	}
+	return false
+}
+
+func filterByPriority(entries []policyEntry, prio int, onlyExplicit bool) []any {
+	out := make([]any, 0, len(entries))
+	for _, e := range entries {
+		if e.priority != prio {
+			continue
+		}
+		if onlyExplicit && !e.explicit {
+			continue
+		}
+		out = append(out, e.value)
+	}
 	return out
+}
+
+// aggregatesByIntersection reports whether a policy key is merged by set
+// intersection instead of the default aggregator for its type.
+//
+// **1 箇所で判定する (#2898)。** computePolicy (どの entry を集約に渡すか) と
+// aggregatePolicyValues (どう畳むか) の両方が同じ答えを必要とするので、
+// 別々に key 名を書くと片方だけ直す形の穴ができる。
+func aggregatesByIntersection(key string) bool {
+	return key == PolicyOptOutNotificationTypes
 }
 
 // aggregatePolicyValues applies the per-key aggregator (bool OR / numeric
@@ -1004,6 +1334,13 @@ func aggregatePolicyValues(key string, baseVal any, values []any) any {
 		}
 		return baseVal
 	case []string:
+		if aggregatesByIntersection(key) {
+			// **union ではなく intersection (#2898)。** これは「受け取らない」
+			// 一覧なので、union にすると複数ロールに属するほど通知が減る =
+			// 厳しい方に倒れる。upstream の policy は緩い方に倒す (bool は OR、
+			// 数値は max) ので、全ロールが切っている型だけを切る。
+			return aggregateStringSetIntersection(values, baseVal)
+		}
 		// upstream RoleService.calc('uploadableFileTypes', set union) と等価。
 		// 全 role の値を flatten + trim + 空文字 skip した set union を deterministic
 		// に sort して返す。各 entry は []string (DefaultPolicies) または []any
@@ -1034,6 +1371,53 @@ func aggregateStringSetUnion(values []any, baseVal any) any {
 	}
 	out := make([]string, 0, len(set))
 	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// aggregateStringSetIntersection merges the supplied candidate values by set
+// intersection, returning a deterministic []string.
+//
+// **optOutNotificationTypes 専用 (#2898)。** 「受け取らない」一覧なので、
+// set union だと複数ロールに属するほど通知が減る = 厳しい方に倒れる。
+// 全ロールが切っている型だけを切ることで、upstream の policy 集約 (bool は OR、
+// 数値は max) と同じ「緩い方に倒す」向きに揃う。
+//
+// **型不一致の候補は無視する。** normalizeStringSlice は型不一致に nil を、
+// 「slice だが 0 件」に非 nil の空 slice を返す。前者を intersection に
+// 参加させると結果が必ず空になり、不正な値を持つ role が 1 つあるだけで
+// 他 role の設定が消える。後者は「何も切らない」の明示なので参加させる
+// (結果は空 = 何も切らない)。
+//
+// 有効な候補が 1 つも無ければ baseVal をそのまま返す (union と同じ fail-soft)。
+func aggregateStringSetIntersection(values []any, baseVal any) any {
+	var acc map[string]struct{}
+	for _, v := range values {
+		norm := normalizeStringSlice(v)
+		if norm == nil {
+			continue
+		}
+		cur := make(map[string]struct{}, len(norm))
+		for _, s := range norm {
+			cur[s] = struct{}{}
+		}
+		if acc == nil {
+			acc = cur
+			continue
+		}
+		for k := range acc {
+			if _, ok := cur[k]; !ok {
+				delete(acc, k)
+			}
+		}
+	}
+	if acc == nil {
+		return baseVal
+	}
+	out := make([]string, 0, len(acc))
+	for s := range acc {
 		out = append(out, s)
 	}
 	sort.Strings(out)
@@ -1308,6 +1692,11 @@ func (s *Service) Create(name, description string, opts CreateOptions) (*model.R
 	if len(opts.Policies) > 0 {
 		role.Policies = opts.Policies
 	}
+	// **`policies` を入れたあとに判定する。** 手前に置くと `role.Policies` が
+	// まだ空なので、policy 経由の自己付与を素通りさせる (#3037 レビュー)。
+	if err := checkConditionalPrivilege(target, role.CondFormula, role.Policies, opts.IsModerator, opts.IsAdministrator); err != nil {
+		return nil, err
+	}
 	if err := s.roleRepo.Create(role); err != nil {
 		return nil, err
 	}
@@ -1420,11 +1809,20 @@ func (s *Service) CountAssignedUsers(roleID string) int {
 // reads it back to render before/after diffs. We mirror that flow so
 // the moderation log can include both snapshots.
 func (s *Service) UpdateFields(id string, fields map[string]any) (*model.Role, error) {
-	if _, err := s.findRoleByID(id); err != nil {
+	current, err := s.findRoleByID(id)
+	if err != nil {
 		return nil, err
 	}
 	if len(fields) == 0 {
+		// **読み直す。** 既存テストが「更新後の姿を返す」契約として
+		// 2 回目の lookup を固定している (readback の失敗を潰さないため)。
 		return s.findRoleByID(id)
+	}
+	// **更新後の姿で判定する (#3037)。** 「条件つきに変える」「管理者を
+	// 立てる」「条件を差し替える」のどれか 1 つだけを送っても自己付与可能な
+	// 組み合わせは作れるので、既存の値に重ねてから見る。
+	if err := checkConditionalPrivilege(mergedRoleShape(current, fields)); err != nil {
+		return nil, err
 	}
 	if err := s.roleRepo.UpdateFields(id, fields); err != nil {
 		return nil, err
@@ -1439,6 +1837,109 @@ func (s *Service) UpdateFields(id string, fields map[string]any) (*model.Role, e
 	// flush する保守的選択を取る。
 	s.invalidateRolePolicyCaches(id)
 	return s.findRoleByID(id)
+}
+
+// privilegedPolicyKeys are the role policies that gate `/admin/*` endpoints.
+//
+// **`isAdministrator` / `isModerator` だけでは足りない (#3037 レビュー)。**
+// これらの policy は `RequireRolePolicy` だけで admin の endpoint を開ける
+// (`admin/emoji/*` は 20 route、`admin/avatar-decorations/*` は 4 route で、
+// どちらも `RequireModerator` を併用していない)。つまり
+// `{"target":"conditional","condFormula":{"type":"isCat"},
+//
+//	"policies":{"canManageCustomEmojis":{"value":true}}}`
+//
+// は「猫と名乗るだけでインスタンス全体の絵文字を消せるロール」になる。
+// **管理者フラグを塞いだことで「システムが守ってくれる」と読まれるぶん、
+// こちらが無警告で通るのはより悪い。**
+//
+// 一覧は `internal/entitycompat` の gate が router と突き合わせるので、
+// admin を policy だけで開ける endpoint を足したらここも増える。
+var privilegedPolicyKeys = map[string]struct{}{
+	"canManageCustomEmojis":      {},
+	"canManageAvatarDecorations": {},
+}
+
+// grantsPrivilegedPolicy reports whether the role's `policies` hand out one of
+// privilegedPolicyKeys with a true value.
+//
+// **`useDefault` の entry と false は数えない。** 既定へ戻す / 明示的に
+// 与えない設定まで弾くと、正当なロールが作れなくなる。
+func grantsPrivilegedPolicy(policies []byte) bool {
+	if len(policies) == 0 {
+		return false
+	}
+	var entries map[string]json.RawMessage
+	if err := json.Unmarshal(policies, &entries); err != nil {
+		// **読めない policies は判定できない。** 条件つき + 読めない、の
+		// 組み合わせは拒否側へ倒す (condFormula と同じ扱い)。
+		return true
+	}
+	for key, raw := range entries {
+		if _, ok := privilegedPolicyKeys[key]; !ok {
+			continue
+		}
+		var o rolePolicyOverride
+		if err := json.Unmarshal(raw, &o); err != nil {
+			return true
+		}
+		if o.UseDefault {
+			continue
+		}
+		if v, ok := o.Value.(bool); ok && v {
+			return true
+		}
+	}
+	return false
+}
+
+// mergedRoleShape overlays the update fields onto the stored role and returns
+// the four values checkConditionalPrivilege needs.
+//
+// **型は admin handler が入れる形に合わせる。** `target` は文字列、
+// `condFormula` は `datatypes.JSON` (= []byte)、フラグは bool。
+//
+// **想定外の型は既存の値を残す。これは fail-closed ではない
+// (#3037 レビュー 2 周目で訂正)。** 新しく来た値を捨てて古い値で判定する
+// ので、**判定は古い値で通り、書き込みだけ新しい値で行われる**。現状の
+// 呼び出し側は admin handler 1 つだけで型も合っている (`fields["policies"]`
+// には `json.Marshal` の `[]byte` が入る) ので実害は無いが、呼び出しを
+// 増やすときはここで落とすかどうかを考えること。
+func mergedRoleShape(current *model.Role, fields map[string]any) (model.RoleTarget, []byte, []byte, bool, bool) {
+	target := current.Target
+	switch v := fields["target"].(type) {
+	case model.RoleTarget:
+		target = v
+	case string:
+		target = model.RoleTarget(v)
+	}
+	cond := []byte(current.CondFormula)
+	switch v := fields["condFormula"].(type) {
+	case datatypes.JSON:
+		cond = v
+	case []byte:
+		cond = v
+	case string:
+		cond = []byte(v)
+	}
+	isModerator := current.IsModerator
+	if v, ok := fields["isModerator"].(bool); ok {
+		isModerator = v
+	}
+	isAdministrator := current.IsAdministrator
+	if v, ok := fields["isAdministrator"].(bool); ok {
+		isAdministrator = v
+	}
+	policies := []byte(current.Policies)
+	switch v := fields["policies"].(type) {
+	case datatypes.JSON:
+		policies = v
+	case []byte:
+		policies = v
+	case string:
+		policies = []byte(v)
+	}
+	return target, cond, policies, isModerator, isAdministrator
 }
 
 // Delete removes a role.
@@ -1502,9 +2003,11 @@ func clonePolicyValue(value any) any {
 func cloneMutablePolicyValue(value any) (any, bool) {
 	switch value := value.(type) {
 	case []string:
-		return append([]string(nil), value...), true
+		// 空 slice を nil に潰さない (#2898)。JSON で `null` になり、
+		// 配列を期待する frontend が壊れる。
+		return append(make([]string, 0, len(value)), value...), true
 	case []any:
-		return append([]any(nil), value...), true
+		return append(make([]any, 0, len(value)), value...), true
 	default:
 		return value, false
 	}
@@ -1544,4 +2047,18 @@ func (s *Service) FindRole(roleID string) (*model.Role, error) {
 // 済むよう、判定をここで公開する。
 func (s *Service) IsAlreadyAssigned(err error) bool {
 	return errors.Is(err, ErrAlreadyAssigned)
+}
+
+// OptOutNotificationTypes returns the notification types userID has opted out
+// of through role policy (#2898).
+//
+// 実体は optOutNotificationTypes policy の集約結果。値が無い / 型が違うときは
+// nil (= 何も切らない) を返す。core/notification.PolicyResolver を満たす。
+func (s *Service) OptOutNotificationTypes(userID string) []string {
+	policies := s.GetUserPolicies(userID)
+	v, ok := policies[PolicyOptOutNotificationTypes]
+	if !ok {
+		return nil
+	}
+	return normalizeStringSlice(v)
 }

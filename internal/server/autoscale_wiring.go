@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -59,10 +58,12 @@ type autoscaleRunner struct {
 // Returns nil runner and nil error when no queues are managed (= the
 // caller skips ticker startup entirely; opt-in default-off).
 //
-// Driver compatibility: callers should check driver.Resize against
-// driver.ErrResizeNotSupported before invoking this — asynq backend
-// cannot honour Resize so wiring auto-scale against it is a config
-// error (returned as an error from this function).
+// **呼ぶのは queueServer.Start の後。** 前に呼ぶと pool がまだ無いので
+// 初期 Resize が毎回 `unknown queue` で失敗し、warn ログを出しながら
+// controller だけが回る (#2985)。以前はここで driver.ErrResizeNotSupported を
+// 見て起動エラーにしていたが、**その形では検出できない** — mkq driver が
+// あれを返すのは `Driver.Server()` を一度も呼んでいないときだけで、
+// production は `newServer` が構築時に呼ぶので到達しない (実測)。
 func startAutoScale(
 	ctx context.Context,
 	cfg *config.Config,
@@ -79,15 +80,6 @@ func startAutoScale(
 		slog.Info("server: autoscale enabled but every queue has an explicit concurrency knob, no controllers started",
 			"skipped", skipped)
 		return nil, nil
-	}
-
-	// asynq などの Resize 非対応 driver で auto-scale を有効化されたら
-	// startup で reject (= silent degrade だと operator が 「何故 scale
-	// しないのか」で困る)。test 用に noop drive を許可する経路は無い。
-	if err := drv.Resize(queues[0], drv.WorkerCount(queues[0])); err != nil &&
-		errors.Is(err, driver.ErrResizeNotSupported) {
-		return nil, fmt.Errorf(
-			"server: jobQueueAutoScale=true requires a driver that supports Resize; current driver returned ErrResizeNotSupported (%w)", err)
 	}
 
 	// 変数名は Go 1.21+ builtin min / max を shadow しないよう
@@ -358,16 +350,19 @@ func autoScaledQueues(cfg *config.Config) (managed, skipped []string) {
 	return managed, skipped
 }
 
-// readQueueDepth returns the Inspector-reported Pending count for the
-// queue, or 0 on error (= treat unobservable depth as idle so the
-// controller does not aggressively scale up on a Redis hiccup).
+// readQueueDepth returns how many jobs workers could dequeue from the
+// queue right now (the pending count, or 0 while paused), or 0 on error
+// (= treat unobservable depth as idle so the controller does not
+// aggressively scale up on a Redis hiccup).
 func readQueueDepth(drv driver.Driver, qname string) int {
 	// **集計 API を使わない。** ここは 1Hz x 管理キュー数で回るので、
 	// GetQueueInfo (全カウント + repeat ZCARD + delayed 全件の ZRANGE +
 	// N x HGETALL + paused 判定) を毎秒引くとアイドル時の Redis コマンドの
-	// 大半をこれが占める。実測で毎秒 90 前後 (#2605)。使うのは Pending
-	// 1 個だけなので、キューあたり 1 コマンドで足りる。
-	n, err := drv.Inspector().PendingCount(qname)
+	// 大半をこれが占める。実測で毎秒 90 前後 (#2605)。使うのは深さ 1 個
+	// だけなので、キューあたり 1 往復 (wait の長さと pause フラグの 2 コマンド)
+	// で足りる。**pause 中は 0** — BullMQ 6 では pause してもジョブが wait に
+	// 残るので、そのまま読むと取れないキューの worker を増やす (#3166)。
+	n, err := drv.Inspector().DispatchableCount(qname)
 	if err != nil {
 		return 0
 	}

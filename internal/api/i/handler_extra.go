@@ -3,6 +3,7 @@ package i
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -20,9 +21,16 @@ import (
 	"github.com/shiroha-a/mk/internal/misc/password"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/queue"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// verifierRetryAfterSeconds は 503 の Retry-After (#2849)。rate limit は handler
+// より前の middleware が数えるので 503 でも 1 消費される (返金の口が無い)。
+// 素直に従ったクライアントが枠を使い切ると 1 時間ログインできなくなるので、
+// 窓 (1h) を上限回数 (10) で割った値にしてある。
+const verifierRetryAfterSeconds = "360"
 
 // ChangePassword handles POST /api/i/change-password.
 func (h *Handler) ChangePassword(c echo.Context) error {
@@ -36,7 +44,11 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "currentPassword and newPassword are required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 
-	profile := h.userService.GetProfile(u.ID)
+	profile, perr := h.userService.GetProfileErr(u.ID)
+	// **DB 障害を「パスワード未設定」にしない** (#2799)。
+	if perr != nil && !repository.IsNotFound(perr) {
+		return apierr.JSONInternalError(c)
+	}
 	if profile == nil || profile.Password == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "No password set.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 	}
@@ -44,16 +56,49 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 	// 2FA gate: upstream Misskey TS (change-password.ts) は twoFactorEnabled
 	// なら token 必須 + twoFactorAuthenticate で検証する。mk-go では旧来
 	// password だけで通っていたため password 漏洩 = 2FA bypass で password
-	// 変更可能だった (drop-in regression)。verify2FAToken 経由なので RFC
+	// 変更可能だった (drop-in regression)。check2FAToken 経由なので RFC
 	// 6238 §5.2 の replay 保護も自動で効く。
-	if profile.TwoFactorEnabled && !h.verify2FAToken(c.Request().Context(), profile, req.Token) {
-		return c.JSON(http.StatusForbidden, apierr.InvalidToken())
+	//
+	// **順序は upstream のまま (token → password)。** 入れ替えると
+	// wrong-password + wrong-token の error code が drift する
+	// (INCORRECT_PASSWORD vs INVALID_TOKEN)。同じ罠を handler_2fa.go が 3 箇所で
+	// 明示的に禁じている。
+	//
+	// **消費は password が通ってから確定させる** (#2852)。検証と同時に焼くと、
+	// 現パスワードを打ち間違えるたびにバックアップコードが 1 枚減り、503
+	// (検証枠が取れない) でもサーバー都合で焼ける。
+	var use twoFAUse
+	if profile.TwoFactorEnabled {
+		var ok bool
+		if use, ok = h.check2FAToken(c.Request().Context(), profile, req.Token); !ok {
+			return c.JSON(http.StatusForbidden, apierr.InvalidToken())
+		}
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			use.Rollback()
+		}
+	}()
 
-	// upstream Misskey TS は raw `throw new Error('authentication failed')` を
-	// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため 401
-	// に揃える (旧 mk-go は 403 を返していた)。
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(req.CurrentPassword)); err != nil {
+	scheme, outcome := password.Verify(c.Request().Context(), *profile.Password, req.CurrentPassword)
+	if outcome == password.OutcomeUnavailable {
+		// 枠を取れなかっただけで現パスワードは正しいかもしれない。**400 に
+		// 潰さない** (#2849)。
+		slog.Warn("change-password: password verification unavailable",
+			"userId", u.ID, "scheme", scheme.String())
+		c.Response().Header().Set("Retry-After", verifierRetryAfterSeconds)
+		return c.JSON(http.StatusServiceUnavailable, apierr.PasswordVerificationUnavailable())
+	}
+	if outcome == password.OutcomeUnsupported {
+		// **profile だけ出す。** salt / digest は診断に不要。
+		slog.Warn("change-password: unsupported password hash",
+			"userId", u.ID, "profile", password.ProfileForLog(*profile.Password))
+	}
+	if !outcome.OK() {
+		// upstream Misskey TS は raw `throw new Error('authentication failed')` を
+		// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため
+		// 400 INCORRECT_PASSWORD に揃える。
 		return c.JSON(http.StatusBadRequest, apierr.Error("INCORRECT_PASSWORD", "Incorrect password.", "932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
@@ -71,6 +116,10 @@ func (h *Handler) ChangePassword(c echo.Context) error {
 	if err := h.userService.UpdateProfileFields(u.ID, map[string]any{"password": hashStr}); err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
+	// **password を書き換えられてから確定する。** 先に確定すると、書き込みに
+	// 失敗したときに何も変わっていないのに 2FA だけ焼ける。
+	_ = use.Commit()
+	committed = true
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -85,7 +134,11 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "password is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 
-	profile := h.userService.GetProfile(u.ID)
+	profile, perr := h.userService.GetProfileErr(u.ID)
+	// **DB 障害を「パスワード未設定」にしない** (#2799)。
+	if perr != nil && !repository.IsNotFound(perr) {
+		return apierr.JSONInternalError(c)
+	}
 	if profile == nil || profile.Password == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "No password set.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 	}
@@ -93,10 +146,22 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 	// 2FA gate: upstream Misskey TS (delete-account.ts) は twoFactorEnabled
 	// なら token 必須。mk-go では旧来 password だけで通っていたため、
 	// password 漏洩 = 2FA bypass で account 削除可能だった (drop-in
-	// regression)。verify2FAToken 経由なので replay 保護も自動で効く。
-	if profile.TwoFactorEnabled && !h.verify2FAToken(c.Request().Context(), profile, req.Token) {
-		return c.JSON(http.StatusForbidden, apierr.InvalidToken())
+	// regression)。check2FAToken 経由なので replay 保護も自動で効く。
+	// **消費は password が通ってから確定させる** (#2852)。検証と同時に焼くと、
+	// password を打ち間違えるだけでバックアップコードが 1 枚減る。
+	var use twoFAUse
+	if profile.TwoFactorEnabled {
+		var ok bool
+		if use, ok = h.check2FAToken(c.Request().Context(), profile, req.Token); !ok {
+			return c.JSON(http.StatusForbidden, apierr.InvalidToken())
+		}
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			use.Rollback()
+		}
+	}()
 
 	// upstream Misskey TS は raw `throw new Error('incorrect password')` を
 	// framework が 401 に変換する (#885)。mk-go も drop-in 互換のため 401
@@ -108,7 +173,15 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 	// #2230: root / system アカウントの自己削除は連合・instance を壊すため拒否する
 	// (admin/delete-account の isProtectedAccount と同じ guard、upstream DeleteAccountService の
 	// rootUserId / system account ガード相当)。cascade を走らせる前に弾く。
-	if isProtectedSelfDelete(u) {
+	protected, perr := h.isProtectedSelfDelete(u)
+	if perr != nil {
+		// **DB 障害を 4xx に丸めない (#2792)。** 「root かどうか判定できない」を
+		// `ACCESS_DENIED` で返すと、本人の退会が自分のせいに見えるうえ、
+		// 監視にも 4xx しか出ない。
+		slog.Error("i/delete-account: cannot determine root protection", "err", perr)
+		return apierr.JSONInternalError(c)
+	}
+	if protected {
 		return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Cannot delete a root or system account.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 	}
 
@@ -146,6 +219,9 @@ func (h *Handler) DeleteAccount(c echo.Context) error {
 			slog.Warn("i/delete-account: enqueue cascade failed", "userId", u.ID, "err", err)
 		}
 	}
+	// **削除フラグが立ってから確定する** (#2852)。
+	_ = use.Commit()
+	committed = true
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -177,14 +253,48 @@ func (h *Handler) SetAccountDeletionFederationHook(hook AccountDeletionFederatio
 // system account that must never be deleted (#2230). Mirrors admin's
 // isProtectedAccount: IsRoot, or a local (host==nil) account whose username
 // contains '.' (systemaccount uses `<kind>.actor`).
-func isProtectedSelfDelete(u *model.User) bool {
+func (h *Handler) isProtectedSelfDelete(u *model.User) (bool, error) {
 	if u == nil {
-		return false
+		return false, nil
+	}
+	// **root の権威ソースは `meta.rootUserId`。** `user.isRoot` は upstream が
+	// system_account 移行で DROP 済みの残存列で、mk-go は drop-in のために
+	// 持っているだけ。`admin/accounts.go` の `isProtectedAccount` は meta を
+	// 先に見ており、**自己削除の経路だけが見ていなかった**。
+	//
+	// 実害がある。列が追加された migration より前に作られた root は
+	// `isRoot = false` のままなので (本番の root がまさにそれ)、meta を見ないと
+	// **ガードが発火しない**。通ると `user` 行が物理削除され、`meta` に FK が
+	// 無い構成では `rootUserId` が消えた ID を指したまま残るので **root が永久に
+	// 不在**になる。`update-meta` は `rootUserId` を protected として落とすため、
+	// API 経由で指名し直す手段が無い。
+	//
+	// TS 由来の DB では upstream migration の `ON DELETE SET NULL` が効いて
+	// `rootUserId` が NULL になり、今度は `admin/accounts/create` の初回
+	// セットアップ窓が開く側に倒れる。
+	//
+	// **meta が読めなければ error を返す。** DB 障害を「root ではない」と
+	// 解釈して不可逆な削除を通すわけにいかないが、「root だ」と解釈して
+	// `ACCESS_DENIED` を返すのも違う — どちらも事実ではない。呼び出し側が
+	// 500 に倒す (#2792)。
+	//
+	// **`admin/accounts.go` の `isProtectedAccount` とは倒れる向きが違う。**
+	// あちらは fail-open で、同じ原因 (meta が読めない) で片方は守りすぎ、
+	// 片方は守り損ねる。こちらは不可逆な削除なので、判定できないことを
+	// 呼び出し側へ伝える形にしてある。
+	if h.metaRepo != nil {
+		meta, err := h.metaRepo.Fetch()
+		if err != nil {
+			return false, fmt.Errorf("fetch meta: %w", err)
+		}
+		if meta != nil && meta.RootUserID != nil && *meta.RootUserID == u.ID {
+			return true, nil
+		}
 	}
 	if u.IsRoot {
-		return true
+		return true, nil
 	}
-	return u.Host == nil && strings.Contains(u.Username, ".")
+	return u.Host == nil && strings.Contains(u.Username, "."), nil
 }
 
 // Favorites handles POST /api/i/favorites.
@@ -225,7 +335,10 @@ func (h *Handler) Favorites(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -282,7 +395,11 @@ func (h *Handler) RegenerateToken(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "password is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 
-	profile := h.userService.GetProfile(u.ID)
+	profile, perr := h.userService.GetProfileErr(u.ID)
+	// **DB 障害を「パスワード未設定」にしない** (#2799)。
+	if perr != nil && !repository.IsNotFound(perr) {
+		return apierr.JSONInternalError(c)
+	}
 	if profile == nil || profile.Password == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "No password set.", "1fb7cb09-d46a-4fff-b8df-057708cce513"))
 	}

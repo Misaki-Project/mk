@@ -5,8 +5,10 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // PromoCreate handles POST /api/admin/promo/create.
@@ -34,11 +36,15 @@ func (h *Handler) PromoCreate(c echo.Context) error {
 	}
 	// 対象 note の存在確認 → 公開範囲確認 → 既に promote 済みでないか確認
 	note, err := h.noteFinder.FindByID(req.NoteID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を「そんなノートは無い」にしない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "ee449fbe-af2a-453b-9cae-cf2fe7c895fc"))
 	}
 	// 公開範囲が public 以外の note は promote できない (#1466)。upstream
-	// Misskey TS の `admin/promo/create.ts` (pinned 2026.5.4) には visibility
+	// Misskey TS の `admin/promo/create.ts` (pinned 2026.7.0) には visibility
 	// check 自体が存在しないため、本実装は mk-go 独自の forward defense
 	// (= 意図的な divergence) として加える。実害観点では upstream / mk-go
 	// どちらも promo を表示する endpoint が未実装で latent な穴に留まるが、

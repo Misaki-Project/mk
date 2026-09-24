@@ -159,6 +159,11 @@ func (s *stubQueueInspector) ListScheduledTasks(q string, _, _ int) ([]*apiadmin
 func (s *stubQueueInspector) ListRetryTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
 	return s.retry[q], nil
 }
+
+// ListDelayedTasks は delayed バケット全体 = scheduled + retry を返す。
+func (s *stubQueueInspector) ListDelayedTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
+	return append(append([]*apiadmin.QueueTaskSummary{}, s.scheduled[q]...), s.retry[q]...), nil
+}
 func (s *stubQueueInspector) ListCompletedTasks(q string, _, _ int) ([]*apiadmin.QueueTaskSummary, error) {
 	return s.completed[q], nil
 }
@@ -197,9 +202,15 @@ func TestQueueClear_WithInspector(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	insp := &stubQueueInspector{}
 	h.SetQueueInspector(insp)
+	// **pending も個別に消す。** 一括削除 (`DeleteAllPendingTasks`) は job type を
+	// 見ないので、wait へ昇格した予約投稿やアカウント削除まで巻き込む。
+	insp.pending = map[string][]*apiadmin.QueueTaskSummary{
+		"deliver": {{ID: "p1", Type: queue.TaskTypeDeliver}},
+	}
 	rec := doPost(h.QueueClear, `{"queue":"deliver","state":"wait"}`, adminUser)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
-	assert.Equal(t, []string{"deliver"}, insp.deleteAllHits)
+	assert.Equal(t, []string{"p1"}, insp.deleted)
+	assert.Empty(t, insp.deleteAllHits, "一括削除は使わないこと")
 }
 
 func TestQueueClear_MissingParams(t *testing.T) {
@@ -308,7 +319,7 @@ func TestQueueShowJob_NotFoundWithInspector(t *testing.T) {
 
 func TestQueueRemoveJob_Success(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
-	// asynq DeleteTask は不明 id で nil を返す (idempotent) ため、existence
+	// driver の DeleteTask は不明 id で nil を返しうる (idempotent) ため、existence
 	// 確認用に GetTaskInfo を事前 hit する (#929 B)。stub の task map に
 	// 入れて GetTaskInfo を pass させる。
 	insp := &stubQueueInspector{
@@ -324,7 +335,7 @@ func TestQueueRemoveJob_Success(t *testing.T) {
 
 func TestQueueRemoveJob_NotFound(t *testing.T) {
 	// task map が空 = GetTaskInfo が "not found" を返すケース。idempotent な
-	// asynq DeleteTask に到達せず precheck で 404 (#929 B)。
+	// DeleteTask に到達せず precheck で 404 (#929 B)。
 	h, _, _, _ := newTestHandler(t)
 	insp := &stubQueueInspector{}
 	h.SetQueueInspector(insp)
@@ -449,7 +460,7 @@ func TestQueueQueueStats_WithInspector(t *testing.T) {
 
 func TestQueueQueueStats_NoMetrics_FallsBackToCumulative(t *testing.T) {
 	// driver が QueueMetrics を実装していても Data 空 / Count 0 を
-	// 返すケース (mkq で WithJobMetrics 無効, asynq の time-series 無し)
+	// 返すケース (mkq で WithJobMetrics 無効、または time-series 非対応 driver)
 	// では info.Completed / info.Failed の累積値を count にフォール
 	// バックさせ、data は空配列で安定 shape を維持する。
 	h, _, _, _ := newTestHandler(t)
@@ -597,7 +608,7 @@ func TestQueueInboxDelayed_AggregatesByHostFromSignature(t *testing.T) {
 }
 
 // pagedInspector is a QueueInspector stub that always returns full pages,
-// emulating an asynq inspector that has so many tasks the cursor never
+// emulating an inspector that has so many tasks the cursor never
 // reaches the end (or, worse, a misbehaving inspector that ignores empty
 // state). Used to verify the page cap defense in fetchAllDelayedTasks.
 //
@@ -695,6 +706,91 @@ func TestQueueJobs_SingleQueueCappedAtLimit(t *testing.T) {
 	assert.Len(t, rows, 2, "single-queue output must respect limit")
 }
 
+// pagingQueueInspector serves completed / failed / delayed with real
+// 1-indexed paging, newest first as the driver returns them.
+type pagingQueueInspector struct {
+	*stubQueueInspector
+	completed, failed, delayed []*apiadmin.QueueTaskSummary
+}
+
+func pageOf(rows []*apiadmin.QueueTaskSummary, page, size int) []*apiadmin.QueueTaskSummary {
+	start := (page - 1) * size
+	if start >= len(rows) {
+		return nil
+	}
+	// コピーして返す。呼び出し側がループ中に削除すると、別名のままでは要素がずれる。
+	return append([]*apiadmin.QueueTaskSummary(nil), rows[start:min(start+size, len(rows))]...)
+}
+
+func (p *pagingQueueInspector) ListCompletedTasks(_ string, page, size int) ([]*apiadmin.QueueTaskSummary, error) {
+	return pageOf(p.completed, page, size), nil
+}
+func (p *pagingQueueInspector) ListFailedTasks(_ string, page, size int) ([]*apiadmin.QueueTaskSummary, error) {
+	return pageOf(p.failed, page, size), nil
+}
+func (p *pagingQueueInspector) ListDelayedTasks(_ string, page, size int) ([]*apiadmin.QueueTaskSummary, error) {
+	return pageOf(p.delayed, page, size), nil
+}
+
+func summaries(prefix string, n int) []*apiadmin.QueueTaskSummary {
+	out := make([]*apiadmin.QueueTaskSummary, 0, n)
+	for i := range n {
+		out = append(out, &apiadmin.QueueTaskSummary{ID: prefix + strconv.Itoa(i), Queue: "deliver"})
+	}
+	return out
+}
+
+func jobIDs(t *testing.T, body []byte) []string {
+	t.Helper()
+	var rows []map[string]any
+	require.NoError(t, json.Unmarshal(body, &rows))
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, r["id"].(string))
+	}
+	return ids
+}
+
+// **limit 未指定なら upstream と同じ形で返す (#3167)。** upstream は
+// `getJobs(types, 0, 100)` = state ごとに新しい順で最大 101 件を、state の指定順に
+// 連結する。以前は既定の 30 件が合計に効き、「すべて」タブ (completed が先頭) が
+// 完了済みだけで埋まって失敗が 1 件も見えなかった。
+func TestQueueJobs_NoLimitReturnsPerStateLikeUpstream(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	h.SetQueueInspector(&pagingQueueInspector{
+		stubQueueInspector: &stubQueueInspector{},
+		completed:          summaries("c", 150),
+		failed:             summaries("f", 5),
+	})
+
+	rec := doPost(h.QueueJobs, `{"queue":"deliver","state":["completed","failed"]}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code)
+	ids := jobIDs(t, rec.Body.Bytes())
+
+	require.Len(t, ids, 101+5, "state ごとに最大 101 件 (合計では切らない)")
+	assert.Equal(t, "c0", ids[0], "driver が返した順 (新しい順) を保つ")
+	assert.Equal(t, "c100", ids[100], "101 件目まで取る (end を含む)")
+	assert.Equal(t, []string{"f0", "f1", "f2", "f3", "f4"}, ids[101:], "後ろの state も欠けない")
+}
+
+// delayed は Scheduled / Retry を後から混ぜず、バケット全体の並びをそのまま使う。
+func TestQueueJobs_DelayedUsesWholeBucket(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	stub := &stubQueueInspector{
+		scheduled: map[string][]*apiadmin.QueueTaskSummary{"deliver": {{ID: "s0"}}},
+		retry:     map[string][]*apiadmin.QueueTaskSummary{"deliver": {{ID: "r0"}}},
+	}
+	h.SetQueueInspector(&pagingQueueInspector{
+		stubQueueInspector: stub,
+		// retry で delayed に戻った job の方が発火予定が遅い、という並び。
+		delayed: []*apiadmin.QueueTaskSummary{{ID: "r0"}, {ID: "s0"}},
+	})
+
+	rec := doPost(h.QueueJobs, `{"queue":"deliver","state":["delayed"]}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, []string{"r0", "s0"}, jobIDs(t, rec.Body.Bytes()))
+}
+
 // --- thin nil-inspector smoke tests ---
 //
 // nil queueInspector 経路 (newTestHandler は wire しない) で expected status
@@ -782,7 +878,7 @@ func TestQueueStatsAdmin(t *testing.T) {
 
 // TestQueueStats_DelayedIncludesScheduledAndRetry guards #654: Misskey
 // frontend の WidgetJobQueue は Bull 用語の delayed をグラフ化するが、
-// asynq では Scheduled (未来実行予定) と Retry (失敗後再試行待ち) の
+// driver では Scheduled (未来実行予定) と Retry (失敗後再試行待ち) の
 // 2 つに分かれる。delayed = Scheduled + Retry を返さないと再試行待ちが
 // dashboard に出ないため、この合算が REST API でも維持されることを guard。
 func TestQueueStats_DelayedIncludesScheduledAndRetry(t *testing.T) {
@@ -811,7 +907,7 @@ func TestQueueStats_DelayedIncludesScheduledAndRetry(t *testing.T) {
 }
 
 // QueueJobs は mkq の finished-job 保持から completed / failed を一覧する (#1396)。
-// 旧実装は asynq 前提で completed/failed を nil 固定にしており、busy queue でも
+// 旧実装は completed/failed を nil 固定にしており、busy queue でも
 // All / Completed タブが空になっていた。
 func TestQueueJobs_ListsCompletedAndFailed(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
@@ -979,10 +1075,12 @@ func TestQueueClear_ByFailedState(t *testing.T) {
 	assert.Empty(t, insp.deleteAllHits, "failed 指定では pending を drain しない")
 }
 
-// state='*' は pending drain + 各 state を消す。
+// state='*' は全 state を消す。**pending も個別に消す** (一括削除は job type を
+// 見ないので、利用者の予定を巻き込む)。
 func TestQueueClear_AllStates(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	insp := &stubQueueInspector{
+		pending:   map[string][]*apiadmin.QueueTaskSummary{"deliver": {{ID: "p1", Type: queue.TaskTypeDeliver}}},
 		failed:    map[string][]*apiadmin.QueueTaskSummary{"deliver": {{ID: "f1"}}},
 		completed: map[string][]*apiadmin.QueueTaskSummary{"deliver": {{ID: "c1"}}},
 		scheduled: map[string][]*apiadmin.QueueTaskSummary{"deliver": {{ID: "s1"}}},
@@ -990,8 +1088,8 @@ func TestQueueClear_AllStates(t *testing.T) {
 	h.SetQueueInspector(insp)
 	rec := doPost(h.QueueClear, `{"queue":"deliver","state":"*"}`, adminUser)
 	require.Equal(t, http.StatusNoContent, rec.Code)
-	assert.Equal(t, []string{"deliver"}, insp.deleteAllHits)
-	assert.ElementsMatch(t, []string{"f1", "c1", "s1"}, insp.deleted)
+	assert.Empty(t, insp.deleteAllHits, "一括削除は使わないこと")
+	assert.ElementsMatch(t, []string{"p1", "f1", "c1", "s1"}, insp.deleted)
 }
 
 // queue-stats の metrics.completed/failed は meta オブジェクトを持つ。
@@ -1442,7 +1540,7 @@ func TestQueueShowJob_MaxRetryFromOpts(t *testing.T) {
 	h.SetQueueInspector(&stubQueueInspector{
 		task: map[string]*apiadmin.QueueTaskSummary{
 			"a": {ID: "a", Queue: "inbox", Type: "ap:inbox", State: "wait", Opts: json.RawMessage(`{"attempts":8}`)},
-			// asynq driver は MaxRetry を埋める。そちらを優先する。
+			// MaxRetry を埋める driver ではそちらを優先する。
 			"b": {ID: "b", Queue: "inbox", Type: "ap:inbox", State: "wait", MaxRetry: 3},
 		},
 	})
@@ -1557,4 +1655,118 @@ func TestQueueShowJob_AttemptsAt(t *testing.T) {
 	var got2 map[string]any
 	require.NoError(t, json.Unmarshal(rec2.Body.Bytes(), &got2))
 	assert.Equal(t, []any{}, got2["attemptsAt"])
+}
+
+// プラグイン専用のキュー (#2818) は名前が動的なので、静的な一覧では判定
+// できない。**接頭辞で通したうえで、実在するかは Inspector に確かめさせる。**
+func TestQueuePauseResume_PluginQueue(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	insp := &stubQueueInspector{queues: []string{"deliver", "plugin:demo"}}
+	h.SetQueueInspector(insp)
+
+	rec := doPost(h.QueuePause, `{"queue":"plugin:demo"}`, adminUser)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, []string{"plugin:demo"}, insp.pauseCalls, "静的な一覧に無くても通ること")
+
+	rec = doPost(h.QueueResume, `{"queue":"plugin:demo"}`, adminUser)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Equal(t, []string{"plugin:demo"}, insp.resumeCalls)
+
+	// 入れていないプラグインの名前は、接頭辞は通るが managed でないので
+	// no-op 204 (未運用 queue と同じ扱い)。
+	insp.pauseCalls = nil
+	rec = doPost(h.QueuePause, `{"queue":"plugin:notinstalled"}`, adminUser)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Empty(t, insp.pauseCalls)
+
+	// 接頭辞が無ければ従来どおり 400。
+	assert.Equal(t, http.StatusBadRequest, doPost(h.QueuePause, `{"queue":"demo"}`, adminUser).Code)
+}
+
+// **予約投稿とアカウント削除を促進 / 破棄しないこと。**
+//
+// deliver キューにはこの 2 つが同居している。促進すると全利用者の未公開の
+// 予約投稿が即時公開され (不可逆)、クリアすると二度と発火しない (失敗通知も
+// 出ない)。アカウント削除を消すと、削除フラグだけ立って中身が残るアカウントが
+// 生まれ、dedup キーのせいで 24 時間は再実行も効かない。
+func TestQueuePromoteJobs_SkipsUserScheduledWork(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	insp := &stubQueueInspector{
+		scheduled: map[string][]*apiadmin.QueueTaskSummary{
+			"deliver": {
+				{ID: "t_sched", Type: queue.TaskTypePostScheduledNote},
+				{ID: "t_del", Type: queue.TaskTypeDeleteAccount},
+				{ID: "t_deliver", Type: queue.TaskTypeDeliver},
+			},
+		},
+	}
+	h.SetQueueInspector(insp)
+
+	rec := doPost(h.QueuePromoteJobs, `{"queue":"deliver"}`, adminUser)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, []string{"t_deliver"}, insp.runCalls,
+		"配送ジョブだけを促進すること (利用者の予定は触らない)")
+}
+
+func TestQueueClear_SkipsUserScheduledWork(t *testing.T) {
+	h, _, _, _ := newTestHandler(t)
+	insp := &stubQueueInspector{
+		pending: map[string][]*apiadmin.QueueTaskSummary{
+			"deliver": {
+				{ID: "c_sched", Type: queue.TaskTypePostScheduledNote},
+				{ID: "c_deliver", Type: queue.TaskTypeDeliver},
+			},
+		},
+	}
+	h.SetQueueInspector(insp)
+
+	rec := doPost(h.QueueClear, `{"queue":"deliver","state":"wait"}`, adminUser)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	assert.NotContains(t, insp.deleted, "c_sched", "予約投稿は消さないこと")
+}
+
+// **終了済みのバケットでは保護を掛けないこと。**
+//
+// completed / failed は既に終わった記録なので、消せなくすると**終了済みの
+// 予約投稿 / アカウント削除が永久に残る** (掃除の目的そのものが果たせない)。
+// 保護が要るのは「これから動く」バケット (wait / delayed / retry) だけ。
+func TestQueueClear_ProtectionOnlyAppliesToPendingBuckets(t *testing.T) {
+	for _, tc := range []struct {
+		state   string
+		bucket  string
+		protect bool
+	}{
+		{"wait", "pending", true},
+		{"delayed", "scheduled", true},
+		{"failed", "failed", false},
+		{"completed", "completed", false},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			h, _, _, _ := newTestHandler(t)
+			insp := &stubQueueInspector{}
+			h.SetQueueInspector(insp)
+			rows := map[string][]*apiadmin.QueueTaskSummary{
+				"deliver": {{ID: "s1", Type: queue.TaskTypePostScheduledNote}},
+			}
+			switch tc.bucket {
+			case "pending":
+				insp.pending = rows
+			case "scheduled":
+				insp.scheduled = rows
+			case "failed":
+				insp.failed = rows
+			case "completed":
+				insp.completed = rows
+			}
+
+			rec := doPost(h.QueueClear, `{"queue":"deliver","state":"`+tc.state+`"}`, adminUser)
+			require.Equal(t, http.StatusNoContent, rec.Code)
+			if tc.protect {
+				assert.Empty(t, insp.deleted, "%s では予約投稿を守ること", tc.state)
+			} else {
+				assert.Equal(t, []string{"s1"}, insp.deleted,
+					"%s は終了済みの記録なので消せること", tc.state)
+			}
+		})
+	}
 }

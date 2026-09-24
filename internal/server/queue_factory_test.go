@@ -8,13 +8,30 @@ import (
 	"github.com/shiroha-a/mk/internal/config"
 	"github.com/shiroha-a/mk/internal/queue"
 	"github.com/shiroha-a/mk/internal/queue/driver"
-	"github.com/shiroha-a/mk/internal/queue/driver/asynqdriver"
 	"github.com/shiroha-a/mk/internal/queue/driver/mkqdriver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func intp(v int) *int { return &v }
+
+// buildQueueDriver は config 側の検証を通り抜けた driver 名でも mkq を
+// 黙って起動しない (#2985)。未知の名前は Redis へ触る前に落ちるので、
+// この 2 ケースは実接続を要らない。
+//
+// **config 側と二重に持つのは意図的。** `resolveJobQueueDriver` を通らない
+// 経路 (テストが *config.Config を直接組む等) でも、driver 名が実態と違えば
+// 起動しないことを固定する。
+func TestBuildQueueDriver_RejectsUnknownDriver(t *testing.T) {
+	for _, name := range []string{"asynq", "mkqq"} {
+		t.Run(name, func(t *testing.T) {
+			d, err := buildQueueDriver(context.Background(), &config.Config{JobQueueDriver: name}, nil)
+			require.Error(t, err)
+			assert.Nil(t, d)
+			assert.Contains(t, err.Error(), name)
+		})
+	}
+}
 
 // #495 / #534 / #2403: cfg の per-queue concurrency がそのまま queue 名 →
 // worker 数の map に積まれる。relationship は #2403 で専用 queue を持つように
@@ -74,7 +91,7 @@ func TestPerQueueRatesFromConfig(t *testing.T) {
 // は呼ばれない (PolicyMap が nil のままで PolicyFor がゼロ Policy を返す
 // fast-path が維持される)。
 func TestApplyClientPolicies_DeliverMaxAttempts(t *testing.T) {
-	c := queue.NewClient(asynqdriver.New(asynqdriver.BuildRedisOpt(config.RedisOptions{Host: "localhost", Port: 6379}), asynqdriver.ServerConfig{}))
+	c := queue.NewClient(&stubDriver{client: &recordingDriverClient{}})
 	defer func() { _ = c.Close() }()
 
 	cfg := &config.Config{DeliverJobMaxAttempts: intp(5)}
@@ -89,7 +106,7 @@ func TestApplyClientPolicies_DeliverMaxAttempts(t *testing.T) {
 // Client は引き続き正常に動く (panic しない / EnqueueDeliver する経路は
 // 別 testで verify 済み)。
 func TestApplyClientPolicies_NoOpForZero(t *testing.T) {
-	c := queue.NewClient(asynqdriver.New(asynqdriver.BuildRedisOpt(config.RedisOptions{Host: "localhost", Port: 6379}), asynqdriver.ServerConfig{}))
+	c := queue.NewClient(&stubDriver{client: &recordingDriverClient{}})
 	defer func() { _ = c.Close() }()
 
 	require.NotPanics(t, func() {
@@ -380,34 +397,6 @@ func TestBuildPolicy(t *testing.T) {
 	}
 }
 
-// asynq は per-queue concurrency を持たないので、設定された knob が queue
-// 単位には効かないことを起動時 warning で知らせる。deliver だけは
-// asynqdriver に総 worker pool として渡るため対象外 (docs/configuration.md
-// の記述と揃える)。#2403。
-func TestAsynqIgnoredConcurrencyKnobs(t *testing.T) {
-	cases := []struct {
-		name string
-		in   map[string]int
-		want []string
-	}{
-		{"nil", nil, nil},
-		{"empty", map[string]int{}, nil},
-		{"deliverOnlyIsNotIgnored", map[string]int{"deliver": 8}, nil},
-		{"inbox", map[string]int{"inbox": 12}, []string{"inbox"}},
-		{"relationship", map[string]int{"relationship": 6}, []string{"relationship"}},
-		{
-			"sortedForStableLogOutput",
-			map[string]int{"relationship": 6, "inbox": 12, "deliver": 8},
-			[]string{"inbox", "relationship"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, asynqIgnoredConcurrencyKnobs(tc.in))
-		})
-	}
-}
-
 // relationship queue は #2403 で追加した。retention policy が付いていないと
 // 移行時の一括 follow で completed が積み上がり Redis を圧迫する。
 // 4 task type すべてが relationship queue に載ることも同時に pin する
@@ -500,7 +489,7 @@ func TestMkqConfig_PassesStuckWorkerAfter(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := &config.Config{QueueStuckWorkerSeconds: tc.seconds}
-			got := mkqConfig(cfg, 16, nil, nil)
+			got := mkqConfig(cfg, 16, nil, nil, nil)
 			assert.Equal(t, tc.want, got.StuckWorkerAfter)
 
 			// driver 側の解決規則まで通して、export (既定では追跡しない) が
@@ -528,8 +517,66 @@ func TestMkqConfig_PassesHandlerDeadline(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := &config.Config{QueueHandlerDeadlineSeconds: tc.seconds}
-			got := mkqConfig(cfg, 16, nil, nil)
+			got := mkqConfig(cfg, 16, nil, nil, nil)
 			assert.Equal(t, tc.want, got.HandlerDeadline)
 		})
 	}
+}
+
+// プラグイン専用のキューを driver へ渡すこと (#2818)。**worker が見るキューの
+// 一覧は構築時に固定される**ので、渡さないとジョブが誰にも処理されない。
+func TestMkqConfig_PluginQueues(t *testing.T) {
+	cfg := &config.Config{}
+
+	got := mkqConfig(cfg, 16, nil, nil, nil)
+	assert.Nil(t, got.QueueNames, "プラグインが無ければ driver の既定に任せる")
+
+	got = mkqConfig(cfg, 16, nil, nil, []string{"plugin:demo"})
+	require.NotEmpty(t, got.QueueNames)
+	assert.Contains(t, got.QueueNames, "plugin:demo")
+	// **本体のキューを落とさないこと。** 上書きすると deliver / inbox が
+	// 消えて連合が止まる。
+	for _, want := range mkqdriver.QueueNames {
+		assert.Containsf(t, got.QueueNames, want, "本体の %q が消えている", want)
+	}
+}
+
+// recordingQueueClient captures the options of the last Enqueue call.
+type recordingQueueClient struct {
+	lastOpts driver.EnqueueOptions
+}
+
+func (r *recordingQueueClient) Enqueue(_ context.Context, _ string, _ []byte, opts ...driver.EnqueueOption) error {
+	r.lastOpts = driver.ApplyEnqueueOptions(opts)
+	return nil
+}
+func (r *recordingQueueClient) Close() error { return nil }
+
+type recordingQueueDriver struct{ client driver.Client }
+
+func (d *recordingQueueDriver) Client() driver.Client        { return d.client }
+func (d *recordingQueueDriver) Inspector() driver.Inspector  { return nil }
+func (d *recordingQueueDriver) Server() driver.Server        { return nil }
+func (d *recordingQueueDriver) Scheduler() driver.Scheduler  { return nil }
+func (d *recordingQueueDriver) Close() error                 { return nil }
+func (d *recordingQueueDriver) WorkerCount(_ string) int     { return 0 }
+func (d *recordingQueueDriver) Resize(_ string, _ int) error { return driver.ErrResizeNotSupported }
+
+// **プラグインのキューにも retention を登録すること。**
+//
+// 登録が無いと `PolicyFor` が zero Policy を返し、`retentionOptsFromPolicy` の
+// `> 0` guard で option が 1 つも出ない = **completed ジョブが Redis に無期限で
+// 積まれる**。retention を付けたつもりが本番で no-op だった。
+func TestApplyClientPolicies_RegistersPluginQueueRetention(t *testing.T) {
+	rec := &recordingQueueClient{}
+	c := queue.NewClient(&recordingQueueDriver{client: rec})
+	defer func() { _ = c.Close() }()
+
+	applyClientPolicies(c, &config.Config{})
+
+	require.NoError(t, c.EnqueuePlugin(context.Background(), "someplugin", "job", []byte(`{}`)))
+	require.True(t, rec.lastOpts.KeepCompletedSet,
+		"プラグインのキューに completed の上限が渡っていない")
+	require.Positive(t, rec.lastOpts.KeepCompleted)
+	require.True(t, rec.lastOpts.KeepFailedSet)
 }

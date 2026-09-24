@@ -246,11 +246,7 @@ func TestDriveFileRepository_URLIndexes(t *testing.T) {
 		{"IDX_drive_file_webpublicUrl", true},
 		{"IDX_drive_file_thumbnailUrl", true},
 	} {
-		var indexdef string
-		err := testDB.Raw(
-			`SELECT indexdef FROM pg_indexes WHERE tablename = 'drive_file' AND indexname = ?`, tc.index,
-		).Scan(&indexdef).Error
-		require.NoError(t, err)
+		indexdef := indexDef(t, "drive_file", tc.index)
 		require.NotEmpty(t, indexdef, "index %s must exist (migration applied)", tc.index)
 		if tc.partial {
 			assert.Contains(t, indexdef, "IS NOT NULL", "%s must be a partial index", tc.index)
@@ -536,12 +532,17 @@ func TestDriveFileRepository_DeleteOrphansAndRemoteCache(t *testing.T) {
 	orphan.UserID = nil
 	kept := newTestDriveFile("kept1", user.ID, "md5k", nil)
 
-	// cached remote file (isLink=false, userHost set) は DeleteRemoteCache の
+	// cached remote file (isLink=false, userHost set) は ExpireRemoteCache の
 	// 対象。link-only proxy (isLink=true) は対象外で保持される (upstream 互換)。
 	host := "cache.example"
 	remoteCache := newTestDriveFile("rc1", user.ID, "md5rc", nil)
 	remoteCache.IsLink = false
 	remoteCache.UserHost = &host
+	rcURI := "https://cache.example/files/rc1"
+	remoteCache.URI = &rcURI
+	remoteCache.Size = 4096
+	rcKey := "rc1-access-key"
+	remoteCache.AccessKey = &rcKey
 	linkOnly := newTestDriveFile("lo1", user.ID, "md5lo", nil)
 	linkOnly.IsLink = true
 	linkOnly.UserHost = &host
@@ -563,13 +564,53 @@ func TestDriveFileRepository_DeleteOrphansAndRemoteCache(t *testing.T) {
 	_, err = repo.FindByID(kept.ID)
 	assert.NoError(t, err)
 
-	n, err = repo.DeleteRemoteCache()
+	n, err = repo.ExpireRemoteCache()
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, n, int64(1))
-	_, err = repo.FindByID(remoteCache.ID)
-	assert.Error(t, err, "isLink=false のキャッシュ実体は削除される")
+
+	// **行は消さず link に倒す** (#3102)。消すと `note.fileIds` の指す先が
+	// 無くなり、過去の投稿から添付が黙って消える (upstream は残す)。
+	got, err := repo.FindByID(remoteCache.ID)
+	require.NoError(t, err, "キャッシュ実体の行は残る")
+	assert.True(t, got.IsLink, "link に倒っていない")
+	assert.Equal(t, rcURI, got.URL, "url が uri になっていない")
+	assert.False(t, got.StoredInternal)
+	// mk-go が普段作る link 行と同じ形にする (size 0 / access key なし)。
+	assert.Equal(t, 0, got.Size, "size が残ると使用量が嘘になる")
+	assert.Nil(t, got.AccessKey, "実体が消えた後も古い /files URL が生きている")
+	assert.Nil(t, got.ThumbnailURL)
+	assert.Nil(t, got.WebpublicURL)
+
 	_, err = repo.FindByID(linkOnly.ID)
 	assert.NoError(t, err, "isLink=true の link-only は保持される")
+
+	// **2 回目は対象にならない。** 倒した行は isLink=true なので条件から外れる
+	// (外れないとバッチが同じ行を返し続けて進まない)。
+	again, err := repo.ExpireRemoteCache()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), again, "倒した行がまだ対象に残っている")
+}
+
+// **`uri` を持たない行は倒せないので消す** (#3102、upstream の else 枝と同じ)。
+// link 行の `url` は `uri` から作るので、NULL のままでは表示できない行が残る。
+func TestDriveFileRepository_ExpireRemoteCache_DeletesRowsWithoutURI(t *testing.T) {
+	repo := NewDriveFileRepository(testDB)
+	user := insertTestUser(t, "u_exp_nouri", "expn")
+	defer cleanupUser(t, user.ID)
+
+	host := "nouri.example"
+	noURI := newTestDriveFile("nouri1", user.ID, "md5nu", nil)
+	noURI.IsLink = false
+	noURI.UserHost = &host
+	noURI.URI = nil
+	require.NoError(t, repo.Create(noURI))
+	defer cleanupDriveFile(t, noURI.ID)
+
+	n, err := repo.ExpireRemoteCache()
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, n, int64(1))
+	_, err = repo.FindByID(noURI.ID)
+	assert.Error(t, err, "uri が無い行は倒せないので消える")
 }
 
 // TestDriveFileRepository_DeleteOrphans_PreservesEmojiReferenced は #722
@@ -1030,4 +1071,80 @@ func TestDriveFileRepository_ListOrphanRemoteAttachmentCandidates_Guards(t *test
 	ids, err = repo.ListOrphanRemoteAttachmentCandidates("oag_z", "", 0)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"oag_1"}, ids)
+}
+
+// **`type` の LIKE パターンを escape する (#3037)。**
+//
+// SQL は upstream も `type.replace('/*','/') + '%'` を生のまま載せる。
+// **ただし upstream ではその値が LIKE に届かない** — ajv の `pattern`
+// (`drive/files.ts:40` / `admin/drive/files.ts:40`) に `_` が入っていないので
+// `a_b/*` は 400 で弾かれる。mk-go はこの pattern を持たないため `_` が
+// 1 文字 wildcard として働き、「その型だけ」を指定したつもりの絞り込みが
+// 別の型まで拾う。MIME の subtype に `_` は稀だが使える。
+// mk-go は #1054 から LIKE を必ず escape する方針で、ここだけ通っていなかった。
+func TestDriveFileRepository_TypeFilterEscapesLike(t *testing.T) {
+	db := testDB
+	repo := NewDriveFileRepository(db)
+
+	require.NoError(t, db.Exec(`DELETE FROM drive_file`).Error)
+	// **wildcard が効くのは `/*` 終端の prefix だけ** (upstream と同じ
+	// semantics)。`_` はその prefix 側に置かないと LIKE に載らない。
+	for i, typ := range []string{"a_b/x", "axb/x"} {
+		require.NoError(t, db.Create(&model.DriveFile{
+			ID: "dtf" + string(rune('0'+i)), Name: "n", Type: typ,
+			MD5: "m", Size: 1, URL: "https://e/x",
+		}).Error)
+	}
+	t.Cleanup(func() { db.Exec(`DELETE FROM drive_file WHERE id LIKE 'dtf%'`) })
+
+	// `a_b/*` は `a_b/` で始まる型だけを指す。escape していないと `_` が
+	// 1 文字 wildcard になって `axb/x` まで拾う。
+	got, err := repo.ListForAdmin("", "local", "", "a_b/*", "", "", 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "1 文字 wildcard として解釈されている")
+	assert.Equal(t, "a_b/x", got[0].Type)
+}
+
+// **列に入らない `type` は引く前に空にする (#3037)。** NUL も不正な UTF-8 も
+// 比較の右辺に置くだけで PostgreSQL がクエリごと落とす。`drive/files` は
+// 任意の認証ユーザーが叩けるので、そのままだと 500 を起こせる。
+func TestDriveFileRepository_TypeFilterRejectsUnstorable(t *testing.T) {
+	db := testDB
+	repo := NewDriveFileRepository(db)
+
+	for name, typ := range map[string]string{
+		"NUL":           "image/a\x00b",
+		"invalid UTF-8": "image/a\x80b",
+		"NUL in prefix": "image/a\x00*",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := repo.ListForAdmin("", "local", "", typ, "", "", 10)
+			require.NoError(t, err, "SELECT に載せてしまっている")
+			assert.Empty(t, got)
+
+			got, err = repo.ListByUser("u1", nil, true, typ, "", "", "", 10)
+			require.NoError(t, err, "SELECT に載せてしまっている")
+			assert.Empty(t, got)
+		})
+	}
+}
+
+// **普通の絞り込みは効いたまま。** これが無いと「常に空を返す」実装でも上が通る。
+func TestDriveFileRepository_TypeFilterStillMatches(t *testing.T) {
+	db := testDB
+	repo := NewDriveFileRepository(db)
+
+	require.NoError(t, db.Exec(`DELETE FROM drive_file`).Error)
+	require.NoError(t, db.Create(&model.DriveFile{
+		ID: "dtf9", Name: "n", Type: "image/png", MD5: "m", Size: 1, URL: "https://e/x",
+	}).Error)
+	t.Cleanup(func() { db.Exec(`DELETE FROM drive_file WHERE id = 'dtf9'`) })
+
+	got, err := repo.ListForAdmin("", "local", "", "image/*", "", "", 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1, "prefix LIKE が効いていない")
+
+	got, err = repo.ListForAdmin("", "local", "", "image/png", "", "", 10)
+	require.NoError(t, err)
+	assert.Len(t, got, 1, "完全一致が効いていない")
 }

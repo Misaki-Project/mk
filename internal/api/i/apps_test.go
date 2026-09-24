@@ -2,12 +2,17 @@ package i
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/server/middleware"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -306,4 +311,170 @@ func TestRevokeToken_NoParams(t *testing.T) {
 	h.SetAccessTokenRepo(testutil.NewMockAccessTokenRepository())
 	// tokenId も token も空 → 400
 	assert.Equal(t, http.StatusBadRequest, postExtra(h.RevokeToken, `{}`, stubUser).Code)
+}
+
+// --- upstream c07ce75281: サードパーティアプリからのトークン失効 ---
+
+// postExtraWithScope は AuthScope を明示して叩く。**auth middleware は native
+// token でも AuthScope を立てる** (IsApp=false) ので、native 側を「AuthScope 無し」
+// で模すと IsApp を見ない実装でもテストが通ってしまう (変異検証で確認済み)。
+func postExtraWithScope(h func(echo.Context) error, body string, user *model.User, sc *middleware.AuthScope) *httptest.ResponseRecorder {
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set(string(middleware.UserContextKey), user)
+	c.Set(string(middleware.AuthScopeContextKey), sc)
+	_ = h(c)
+	return rec
+}
+
+func postExtraAsApp(h func(echo.Context) error, body string, user *model.User, tokenID string) *httptest.ResponseRecorder {
+	return postExtraWithScope(h, body, user, &middleware.AuthScope{IsApp: true, TokenID: tokenID})
+}
+
+// アクセストークン経由では、いま使っているトークン自身は失効できる。
+func TestRevokeToken_AppCanRevokeItself(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	tokens := testutil.NewMockAccessTokenRepository()
+	tokens.Tokens["h1"] = &model.AccessToken{ID: "t1", Hash: "h1", UserID: stubUser.ID}
+	h.SetAccessTokenRepo(tokens)
+
+	rec := postExtraAsApp(h.RevokeToken, `{"tokenId":"t1"}`, stubUser, "t1")
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	_, err := tokens.FindByID("t1")
+	assert.Error(t, err, "自分自身のトークンは失効できる")
+}
+
+// アクセストークン経由で**別の**自分のトークンを消そうとすると 403。
+// これが無いと、1 つ許可しただけのアプリが他のアプリの連携を全部切れる。
+func TestRevokeToken_AppCannotRevokeOtherOwnToken(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	tokens := testutil.NewMockAccessTokenRepository()
+	tokens.Tokens["h1"] = &model.AccessToken{ID: "t1", Hash: "h1", UserID: stubUser.ID}
+	tokens.Tokens["h2"] = &model.AccessToken{ID: "t2", Hash: "h2", UserID: stubUser.ID}
+	h.SetAccessTokenRepo(tokens)
+
+	rec := postExtraAsApp(h.RevokeToken, `{"tokenId":"t2"}`, stubUser, "t1")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "PERMISSION_DENIED")
+	assert.Contains(t, rec.Body.String(), "fc20d118-5705-4462-b6c5-2b5b43092cf3")
+	_, err := tokens.FindByID("t2")
+	assert.NoError(t, err, "403 のときは消さない")
+}
+
+// **他人のトークンには 403 ではなく 204。** 403 を返すと「その ID のトークンは
+// 実在する」ことが app に漏れる。
+func TestRevokeToken_AppForeignTokenStaysNoOp(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	tokens := testutil.NewMockAccessTokenRepository()
+	tokens.Tokens["h9"] = &model.AccessToken{ID: "t9", Hash: "h9", UserID: "other"}
+	h.SetAccessTokenRepo(tokens)
+
+	rec := postExtraAsApp(h.RevokeToken, `{"tokenId":"t9"}`, stubUser, "t1")
+	assert.Equal(t, http.StatusNoContent, rec.Code, "存在を漏らさない")
+	_, err := tokens.FindByID("t9")
+	assert.NoError(t, err)
+}
+
+// native session (IsApp=false) は従来どおり自分の任意のトークンを失効できる。
+// AuthScope 自体は立っているので、IsApp を見ずに TokenID だけ比べる実装は
+// ここで落ちる。
+func TestRevokeToken_NativeSessionUnrestricted(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	tokens := testutil.NewMockAccessTokenRepository()
+	tokens.Tokens["h2"] = &model.AccessToken{ID: "t2", Hash: "h2", UserID: stubUser.ID}
+	h.SetAccessTokenRepo(tokens)
+
+	// **native token の TokenID は必ず空文字**。auth.go の resolveUser が
+	// `put(token, user, nil, "", false)` を返すため。架空の値を置くと、production では
+	// 現行と等価なリファクタ (`sc.TokenID != "" && sc.TokenID != tok.ID`) を誤検出する。
+	sc := &middleware.AuthScope{IsApp: false, TokenID: ""}
+	rec := postExtraWithScope(h.RevokeToken, `{"tokenId":"t2"}`, stubUser, sc)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+	_, err := tokens.FindByID("t2")
+	assert.Error(t, err, "native session は制限を受けない")
+}
+
+// **アプリが実際に使える経路は raw token 指定だけ。** `/i/apps` は RequireSecure 付きで
+// アプリは自分のトークンの DB 上の ID を知る手段が無く、MiAuth / OAuth のレスポンスにも
+// id は含まれない。tokenId 側しかテストしないと、TokenID の比較対象を req.TokenID に
+// 取り違える実装 (raw token 経由が常に 403 になる) を見逃す。
+func TestRevokeToken_AppRevokesItselfByRawToken(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	tokens := testutil.NewMockAccessTokenRepository()
+	tokens.Tokens["h1"] = &model.AccessToken{ID: "t1", Hash: "h1", Token: "raw_app_xyz", UserID: stubUser.ID}
+	h.SetAccessTokenRepo(tokens)
+
+	rec := postExtraAsApp(h.RevokeToken, `{"token":"raw_app_xyz"}`, stubUser, "t1")
+	assert.Equal(t, http.StatusNoContent, rec.Code, "raw token による自己失効ができる")
+	_, err := tokens.FindByID("t1")
+	assert.Error(t, err)
+}
+
+// raw token 指定でも「自分の別トークン」は 403。
+func TestRevokeToken_AppCannotRevokeOtherOwnTokenByRawToken(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	tokens := testutil.NewMockAccessTokenRepository()
+	tokens.Tokens["h2"] = &model.AccessToken{ID: "t2", Hash: "h2", Token: "raw_other", UserID: stubUser.ID}
+	h.SetAccessTokenRepo(tokens)
+
+	rec := postExtraAsApp(h.RevokeToken, `{"token":"raw_other"}`, stubUser, "t1")
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	_, err := tokens.FindByID("t2")
+	assert.NoError(t, err, "403 のときは消さない")
+}
+
+// upstream c07ce75281 は requireCredential を外して **endpoint 固有の**
+// CREDENTIAL_REQUIRED を投げる。汎用 middleware に任せると id が
+// 1384574d-... になり wire が食い違う。
+func TestRevokeToken_UnauthenticatedUsesEndpointSpecificError(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	h.SetAccessTokenRepo(testutil.NewMockAccessTokenRepository())
+	rec := postExtra(h.RevokeToken, `{"tokenId":"t1"}`, nil)
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Contains(t, rec.Body.String(), "CREDENTIAL_REQUIRED")
+	assert.Contains(t, rec.Body.String(), "6f1f0d3a-3d5b-4b1f-9c3e-2a6d1e5b8c47")
+}
+
+// 凍結アカウントは 403。**upstream はこの endpoint で suspended を見ない** ので
+// 意図的な乖離 (docs/divergence.md に記録)。この分岐が無いと 401 になり、
+// upstream の 204 からさらに遠のく。
+func TestRevokeToken_SuspendedGets403(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	h.SetAccessTokenRepo(testutil.NewMockAccessTokenRepository())
+
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"tokenId":"t1"}`))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	// Authenticate は凍結ユーザーを anonymous に落としつつ flag だけ積む。
+	c.Set("misskeySuspended", true)
+	_ = h.RevokeToken(c)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "YOUR_ACCOUNT_SUSPENDED")
+}
+
+// **DB 障害を「失効した」(204) に丸めない** (#2792)。
+func TestRevokeToken_DBFailureIsNot204(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	h.SetAccessTokenRepo(&failingAccessTokenRepo{
+		MockAccessTokenRepository: testutil.NewMockAccessTokenRepository(),
+		err:                       errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"),
+	})
+	rec := postExtra(h.RevokeToken, `{"tokenId":"t1"}`, stubUser)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code, "DB 障害が 204 に化けている")
+}
+
+type failingAccessTokenRepo struct {
+	*testutil.MockAccessTokenRepository
+	err error
+}
+
+func (r *failingAccessTokenRepo) FindByID(string) (*model.AccessToken, error) { return nil, r.err }
+func (r *failingAccessTokenRepo) FindByHashOrToken(string, string) (*model.AccessToken, error) {
+	return nil, r.err
 }

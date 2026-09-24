@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shiroha-a/mk/internal/core/iplog"
+	"github.com/shiroha-a/mk/internal/core/iplookuplog"
+	"github.com/shiroha-a/mk/internal/core/signup"
 	"github.com/shiroha-a/mk/internal/queue/driver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -125,7 +128,7 @@ type fakeUserIPPruner struct {
 	err       error
 }
 
-func (f *fakeUserIPPruner) DeleteOlderThan(t time.Time) (int64, error) {
+func (f *fakeUserIPPruner) DeleteLastSeenBefore(t time.Time) (int64, error) {
 	f.gotBefore = t
 	return 1, f.err
 }
@@ -150,9 +153,23 @@ func (f *fakeGamePruner) DeleteOutdatedGames(threshold string) (int64, error) {
 	return 4, f.err
 }
 
-type fakeCleanIDGen struct{ got time.Time }
+// fakeCleanIDGen records **every** call. 1 つの clean で複数の閾値を生成する
+// ので (reversi と user_pending)、最後の 1 つだけ覚えると先の検査が後の呼び
+// 出しに上書きされる。
+type fakeCleanIDGen struct {
+	got  time.Time
+	all  []time.Time
+	next string
+}
 
-func (f *fakeCleanIDGen) Generate(t time.Time) string { f.got = t; return "threshold-id" }
+func (f *fakeCleanIDGen) Generate(t time.Time) string {
+	f.got = t
+	f.all = append(f.all, t)
+	if f.next != "" {
+		return f.next
+	}
+	return "threshold-id"
+}
 
 type fakeAntennaDeactivator struct {
 	gotCutoff time.Time
@@ -168,13 +185,39 @@ func (f *fakeAntennaDeactivator) DeactivateUnusedSince(cutoff time.Time) (int64,
 
 const testAntennaThreshold = 7 * 24 * time.Hour
 
+// fakePendingPruner records the threshold the clean job asks for.
+type fakePendingPruner struct {
+	gotThreshold string
+	called       bool
+	err          error
+}
+
+func (f *fakePendingPruner) DeleteOlderThan(thresholdID string) (int64, error) {
+	f.called = true
+	f.gotThreshold = thresholdID
+	return 3, f.err
+}
+
+// **掃除の猶予は `PendingSignupTTL` より長いこと (#3037 レビュー)。**
+//
+// `clean.go` のコメントは「短すぎると昇格できるはずの行を掃除が先に消す競合が
+// 生まれる」と書いているが、それを固定するものが無かった。
+// `TestClean_RunsAllSubtasks` の `WithinDuration` は同じ定数どうしの比較なので
+// **恒真**で、10 分に下げても緑のまま通る (その場合、有効な確認リンクが
+// `EXPIRED` ではなく `NO_SUCH_CODE` で死ぬ)。
+func TestPendingSignupRetentionOutlivesTheTTL(t *testing.T) {
+	assert.Greater(t, pendingSignupRetention, signup.PendingSignupTTL,
+		"掃除の猶予が確認リンクの寿命を下回っている")
+}
+
 func TestClean_RunsAllSubtasks(t *testing.T) {
 	ip := &fakeUserIPPruner{}
 	role := &fakeRolePruner{}
 	game := &fakeGamePruner{}
 	idGen := &fakeCleanIDGen{}
 	antenna := &fakeAntennaDeactivator{}
-	proc := NewCleanProcessor(ip, role, game, idGen, antenna, testAntennaThreshold)
+	pending := &fakePendingPruner{}
+	proc := NewCleanProcessor(ip, role, game, idGen, antenna, testAntennaThreshold, pending)
 	require.NoError(t, proc.Handle(context.Background(), driver.RawTask{TypeName: "test"}))
 
 	// user_ip は 90 日より前を prune する。
@@ -182,20 +225,28 @@ func TestClean_RunsAllSubtasks(t *testing.T) {
 	assert.True(t, role.called)
 	// reversi の閾値 id は now-10min から生成される。
 	assert.Equal(t, "threshold-id", game.gotThreshold)
-	assert.WithinDuration(t, time.Now().Add(-reversiOutdatedAfter), idGen.got, time.Minute)
+	require.Len(t, idGen.all, 2, "閾値の生成回数が変わっている")
+	assert.WithinDuration(t, time.Now().Add(-reversiOutdatedAfter), idGen.all[0], time.Minute)
+	// user_pending の閾値は now-24h。
+	assert.WithinDuration(t, time.Now().Add(-pendingSignupRetention), idGen.all[1], time.Minute)
 	// antenna は now-threshold より古い lastUsedAt を deactivate する。
 	assert.True(t, antenna.called)
 	assert.WithinDuration(t, time.Now().Add(-testAntennaThreshold), antenna.gotCutoff, time.Minute)
+	// **期限切れの pending signup も掃除する (#3037)。** `PromotePending` は
+	// 期限切れを拒否するだけで行を消さないので、放置された登録のメール
+	// アドレスとパスワードハッシュが無期限に貯まっていた。
+	assert.True(t, pending.called, "期限切れの user_pending を掃除していない")
+	assert.Equal(t, "threshold-id", pending.gotThreshold)
 }
 
 func TestClean_NilDepsNoOp(t *testing.T) {
-	require.NoError(t, NewCleanProcessor(nil, nil, nil, nil, nil, testAntennaThreshold).Handle(context.Background(), driver.RawTask{TypeName: "test"}))
+	require.NoError(t, NewCleanProcessor(nil, nil, nil, nil, nil, testAntennaThreshold, nil).Handle(context.Background(), driver.RawTask{TypeName: "test"}))
 }
 
 func TestClean_AntennaThresholdZeroSkips(t *testing.T) {
 	antenna := &fakeAntennaDeactivator{}
 	// threshold <= 0 は antenna deactivate を無効化する (本家 `> 0` ガード相当)。
-	proc := NewCleanProcessor(nil, nil, nil, nil, antenna, 0)
+	proc := NewCleanProcessor(nil, nil, nil, nil, antenna, 0, nil)
 	require.NoError(t, proc.Handle(context.Background(), driver.RawTask{TypeName: "test"}))
 	assert.False(t, antenna.called, "threshold=0 では呼ばれない")
 }
@@ -208,6 +259,7 @@ func TestClean_SubtaskErrorsSwallowed(t *testing.T) {
 		&fakeCleanIDGen{},
 		&fakeAntennaDeactivator{err: errors.New("d")},
 		testAntennaThreshold,
+		&fakePendingPruner{err: errors.New("e")},
 	)
 	require.NoError(t, proc.Handle(context.Background(), driver.RawTask{TypeName: "test"}), "個々の失敗は swallow して success")
 }
@@ -235,4 +287,72 @@ func TestCheckModeratorsActivity_NilSvcNoOp(t *testing.T) {
 func TestCheckModeratorsActivity_ErrorSwallowed(t *testing.T) {
 	proc := NewCheckModeratorsActivityProcessor(&fakeChecker{err: errors.New("boom")})
 	require.NoError(t, proc.Handle(context.Background(), driver.RawTask{TypeName: "test"}))
+}
+
+// 掃除の基準と、検索が画面に出す保持期間は**同じ値でなければならない** (#3104)。
+//
+// **`TestClean_RunsAllSubtasks` では検出できない。** あちらは `userIPRetention`
+// 自身を期待値に使うので、この定数を `45 * 24 * time.Hour` に切り離しても緑のまま
+// 通る (実測)。そのとき cron は 45 日で刈るのに `admin/ip/accounts` は
+// `retentionDays: 90` を返し、**画面が「90 日より前の接続は残っていない」と
+// 嘘をつく**。定義を `core/iplog` の 1 箇所に寄せた意味がここで消える。
+func TestUserIPRetentionMatchesIPLog(t *testing.T) {
+	assert.Equal(t, iplog.Retention, userIPRetention,
+		"user_ip の保持期間が core/iplog から切り離されている。"+
+			"掃除の基準と admin/ip/accounts が返す retentionDays がずれる (#3104)")
+}
+
+type fakeIPLookupLogPruner struct {
+	called    bool
+	gotBefore time.Time
+	err       error
+}
+
+func (f *fakeIPLookupLogPruner) DeleteOlderThan(t time.Time) (int64, error) {
+	f.called = true
+	f.gotBefore = t
+	return 1, f.err
+}
+
+// **IP 照会の監査記録にも保持期間を掛ける** (#3106)。掛けないと、照会に使った IP が
+// 永久に残り、moderation_log に IP を書くのと変わらなくなる。
+func TestClean_PrunesIPLookupLog(t *testing.T) {
+	ip := &fakeUserIPPruner{}
+	idGen := &fakeCleanIDGen{}
+	proc := NewCleanProcessor(ip, &fakeRolePruner{}, &fakeGamePruner{}, idGen,
+		&fakeAntennaDeactivator{}, testAntennaThreshold, &fakePendingPruner{})
+	audit := &fakeIPLookupLogPruner{}
+	proc.SetIPLookupLogPruner(audit)
+
+	require.NoError(t, proc.Handle(context.Background(), driver.RawTask{TypeName: "test"}))
+	assert.True(t, audit.called, "監査記録が刈られていない")
+	assert.WithinDuration(t, time.Now().Add(-ipLookupLogRetention), audit.gotBefore, time.Minute)
+}
+
+// 未配線でも他の sub-task は回る (nil は no-op)。
+func TestClean_IPLookupLogPrunerOptional(t *testing.T) {
+	ip := &fakeUserIPPruner{}
+	proc := NewCleanProcessor(ip, &fakeRolePruner{}, &fakeGamePruner{}, &fakeCleanIDGen{},
+		&fakeAntennaDeactivator{}, testAntennaThreshold, &fakePendingPruner{})
+
+	require.NoError(t, proc.Handle(context.Background(), driver.RawTask{TypeName: "test"}))
+	assert.False(t, ip.gotBefore.IsZero(), "他の sub-task まで止まっている")
+}
+
+// 刈り取りが失敗しても他の sub-task を止めない (各 sub-task は自分の error を飲む)。
+func TestClean_IPLookupLogPruneFailureIsSwallowed(t *testing.T) {
+	ip := &fakeUserIPPruner{}
+	proc := NewCleanProcessor(ip, &fakeRolePruner{}, &fakeGamePruner{}, &fakeCleanIDGen{},
+		&fakeAntennaDeactivator{}, testAntennaThreshold, &fakePendingPruner{})
+	proc.SetIPLookupLogPruner(&fakeIPLookupLogPruner{err: errors.New("db down")})
+
+	require.NoError(t, proc.Handle(context.Background(), driver.RawTask{TypeName: "test"}))
+	assert.False(t, ip.gotBefore.IsZero(), "失敗が他の sub-task を止めている")
+}
+
+// 保持期間は core/iplookuplog の値そのもの。掃除の基準と画面が出す日数がずれると、
+// 「これより前の照会は残っていない」という説明が嘘になる。
+func TestIPLookupLogRetentionMatchesCore(t *testing.T) {
+	assert.Equal(t, iplookuplog.Retention, ipLookupLogRetention,
+		"監査記録の保持期間が core/iplookuplog から切り離されている (#3106)")
 }

@@ -1,4 +1,4 @@
-// Package processors hosts queue task handlers consumed by the asynq worker.
+// Package processors hosts queue task handlers consumed by the queue worker.
 //
 // This file implements the scheduled-note publish path (#1040). It is a thin
 // orchestration layer: load the draft, materialise it into a note via the
@@ -20,6 +20,7 @@ import (
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/queue"
 	"github.com/shiroha-a/mk/internal/queue/driver"
+	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // ScheduledNoteDraftRepo is the narrow subset of NoteDraftRepository required
@@ -31,7 +32,7 @@ type ScheduledNoteDraftRepo interface {
 }
 
 // ScheduledNoteLock provides app-level idempotency for scheduled note publish.
-// asynq の at-least-once delivery で job が二度 fire しても TryAcquire が
+// queue の at-least-once delivery で job が二度 fire しても TryAcquire が
 // 1 度しか true を返さないことで重複 publish を防止する (#1045 Phase 2-A)。
 //
 // DB schema 不変な実装 (Redis SETNX + TTL 等) を選ぶことで upstream Misskey
@@ -45,6 +46,14 @@ type ScheduledNoteLock interface {
 	// the lock for draftID (= publish に進める), or (false, nil) when another
 	// retry already holds it (= silent skip). err != nil なら lock backend
 	// 自体の障害なので caller は retry に任せる。
+	//
+	// **取るのは publish の直前** (#3121)。job が retry されるように
+	// なったので、lookup の失敗より前で取ると「失敗 → lock を握ったまま
+	// 終了 → TTL (5 分) のあいだ retry が `ok=false` で silent skip」に
+	// なり、**障害が「already being published」という事実と逆の Info 1 行で
+	// 成功扱いになる** (#3116 が潰した形の再発)。解放の口を足して落とす案は
+	// 採らない — 解放が 1 度失敗するだけで同じ結末になるうえ、TTL より初回の
+	// backoff (約 60 秒) のほうが短いので TTL は救いにならない。
 	TryAcquire(ctx context.Context, draftID string) (bool, error)
 }
 
@@ -127,39 +136,38 @@ func logNotificationErr(action string, draftID string, err error) {
 		"action", action, "noteDraftId", draftID, "err", err)
 }
 
-// Handle implements the asynq task handler signature. It decodes the payload,
+// Handle implements the driver task handler signature. It decodes the payload,
 // guards against drafts that no longer exist or were unscheduled before the
 // trigger fired, materialises the note via the publisher, and finally deletes
 // the draft row.
 //
-// Errors are returned to the queue so asynq retries; transient DB failures
+// Errors are returned to the queue so the driver retries; transient DB failures
 // will be retried automatically. A draft that vanished (= user deleted it
 // before fire time) is treated as a no-op (= return nil) — upstream behaves
 // the same way (`if (draft == null || ...) return`)。
 func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Task) error {
 	payload, err := queue.DecodePostScheduledNotePayload(task.Payload())
 	if err != nil {
-		return fmt.Errorf("decode payload: %w", err)
-	}
-	// idempotency lock 取得 (#1045 Phase 2-A)。asynq の at-least-once
-	// delivery で job が二度 fire した場合、最初の retry が lock を保持し、
-	// 後続 retry は false を得て silent skip する。lock 未配線なら常に
-	// true (= Phase 1 互換挙動、production race 受容)。
-	if p.lock != nil {
-		ok, lockErr := p.lock.TryAcquire(ctx, payload.NoteDraftID)
-		if lockErr != nil {
-			// lock backend error は retry に任せる (asynq が exponential
-			// backoff で再試行する)。返した error は queue 側で log される。
-			return fmt.Errorf("acquire scheduled note lock: %w", lockErr)
-		}
-		if !ok {
-			// 他 retry が処理中 / 完了済み。本 caller は何もしない。
-			slog.Info("scheduled note already being published, skipping",
-				"noteDraftId", payload.NoteDraftID)
-			return nil
-		}
+		// **retry しない** (#3121)。attempts を積んだので、付けないと壊れた
+		// payload が backoff 込みで 30 時間ほど再試行され続ける。inbox 側の
+		// decode と同じ扱い。
+		return fmt.Errorf("decode payload: %w: %w", err, driver.ErrSkipRetry)
 	}
 	draft, err := p.drafts.FindByID(payload.NoteDraftID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **障害を成功として記録しない** (#3116)。以前は「retry しても解消しない」を
+		// 種別を見ずに全ての error へ適用しており、DB 障害でも Info ログ 1 行で
+		// 成功扱いになっていた。
+		//
+		// **retry される** (#3121)。`EnqueuePostScheduledNote` が policy から
+		// attempts を積むようになり、publish に到達する前の失敗では直下で
+		// lock を落とすので、retry が同じ draft を掴み直せる。
+		// publish そのものの失敗は下で ack する (二重 publish / 二重通知を
+		// 避けるための意図的な設計、#2106 L61)。
+		slog.Error("scheduled note draft lookup failed",
+			"noteDraftId", payload.NoteDraftID, "err", err)
+		return fmt.Errorf("scheduled note: lookup draft: %w", err)
+	}
 	if err != nil {
 		// Draft が消えていれば user 削除 / 手動 cancel / 既に publish 済み
 		// のどれかで、いずれも retry しても解消しない。silent success で
@@ -175,6 +183,15 @@ func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Tas
 	}
 	user, err := p.users.FindByID(draft.UserID)
 	if err != nil {
+		if repository.IsNotFound(err) {
+			// **retry しても変わらない** (#3121)。`note_draft.userId` は
+			// ON DELETE CASCADE なので普通は起きないが、起きたなら
+			// 利用者ごと消えている。attempts を積んだ今、伝播させると
+			// 空振りの retry を繰り返すだけになる。
+			slog.Info("scheduled note draft user no longer exists, skipping",
+				"noteDraftId", payload.NoteDraftID, "userId", draft.UserID)
+			return nil
+		}
 		return fmt.Errorf("load draft user: %w", err)
 	}
 	if user == nil {
@@ -217,6 +234,27 @@ func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Tas
 		}
 		in.Poll = pollInput
 	}
+	// idempotency lock 取得 (#1045 Phase 2-A)。at-least-once delivery で job が
+	// 二度 fire した場合、最初の 1 つが lock を保持し、後続は false を得て
+	// silent skip する。lock 未配線なら常に true (= Phase 1 互換挙動、
+	// production race 受容)。
+	//
+	// **ここまで下げてあるのは #3121。** 手前の lookup が失敗したときは lock を
+	// 握っていないので、retry が素直に掴み直せる (`ScheduledNoteLock` の doc)。
+	if p.lock != nil {
+		ok, lockErr := p.lock.TryAcquire(ctx, payload.NoteDraftID)
+		if lockErr != nil {
+			// lock backend error は retry に任せる (queue が backoff で
+			// 再試行する)。返した error は queue 側で log される。
+			return fmt.Errorf("acquire scheduled note lock: %w", lockErr)
+		}
+		if !ok {
+			// 他の試行が publish 済み / publish 中。本 caller は何もしない。
+			slog.Info("scheduled note already being published, skipping",
+				"noteDraftId", payload.NoteDraftID)
+			return nil
+		}
+	}
 	publishedNote, err := p.publisher.Create(in)
 	if err != nil {
 		// #2106 L61: upstream PostScheduledNoteProcessorService は publish 失敗時に
@@ -249,7 +287,9 @@ func (p *PostScheduledNoteProcessor) Handle(ctx context.Context, task driver.Tas
 	}
 	if _, err := p.drafts.Delete(draft.ID, draft.UserID); err != nil {
 		// publish 成功 + draft 削除失敗時は draft が残るだけで二重 publish
-		// は起きない (asynq job 自体は 1 回しか発火しない)。log のみ。
+		// は起きない — **ここから下は必ず nil を返す**ので job は retry されず
+		// (#3121 で attempts を積んだ後も同じ)、lock も落としていないため
+		// TTL 内の再発火は silent skip になる。log のみ。
 		slog.Warn("scheduled note draft delete failed",
 			"noteDraftId", payload.NoteDraftID, "err", err)
 	}

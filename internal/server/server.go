@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -11,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -105,7 +105,7 @@ type Server struct {
 	// 一度だけ解決して保持する。
 	mediaProxySecret []byte
 
-	// deliverSvc は federation deliver service への参照。本番では asynq
+	// deliverSvc は federation deliver service への参照。本番では queue
 	// 経由で deliver を enqueue するが、test (#780) で queue を bypass する
 	// ための SetSyncDeliverHookForTest を呼べるよう参照を保持する。
 	deliverSvc *corefederation.DeliverService
@@ -127,7 +127,7 @@ type Server struct {
 }
 
 // registerShutdownHook registers fn to be invoked during Shutdown.
-// Hooks run in registration order before the asynq / echo shutdown.
+// Hooks run in registration order before the queue / echo shutdown.
 // ctx は Shutdown() の caller から伝播され、graceful drain の deadline
 // として使える (#764)。
 func (s *Server) registerShutdownHook(fn func(context.Context)) {
@@ -239,6 +239,168 @@ func extractIPFallback(req *http.Request, trusted []*net.IPNet) string {
 		return r
 	}
 	return ""
+}
+
+// noCORSPaths lists the API paths that must not be usable from a cross-origin
+// browser (#2953).
+//
+// **フォロー一覧を一括で抜いて CSV にし、インポートに食わせる収集**を
+// ブラウザから行えなくする。対象は `POST` + `Content-Type: application/json`
+// なので**単純リクエストではなくプリフライトが必須**で、CORS ヘッダを出さなけ
+// れば越境のブラウザは実リクエストに到達できない。
+//
+// **壁ではない。** サーバー側プロキシを 1 つ挟めば CORS は無関係になる。狙う
+// 費用を上げるための措置で、レート制限 (`ratelimit_defs.go` の同じ 2 つ) と
+// 対になっている。
+//
+// **同一オリジンは影響を受けない。** ブラウザは同一オリジンの応答に CORS 検査
+// を適用しないので、ヘッダを出さなくても同梱のフロントエンドは動く (叩き先は
+// `window.location.origin + '/api'`)。**Origin の値は見ない** — 同一オリジンの
+// POST にもブラウザは Origin を付けるので「Origin があれば越境」は誤りだし、
+// `cfg.URL` と突き合わせる形は逆プロキシや別ドメイン運用で壊れる。
+//
+// **Origin を持たないクライアント (ネイティブアプリ / CLI / 連合) は無影響。**
+// 応答ヘッダを見ないため。
+var noCORSPaths = map[string]bool{
+	"/api/users/following": true,
+	"/api/users/followers": true,
+	// **signin 系は応答を越境で読ませない。**
+	//
+	// `ACAO: *` だと、悪意あるサイトが訪問者のブラウザからこれらを叩いて
+	// **応答を読める**。読めることで (a) ユーザー名の存在判定 (404 と 200)、
+	// (b) パスワード正誤と 2FA 有無のオラクル (403 / `next:"totp"` /
+	// `finished:true`)、(c) 成功時のセッショントークンの奪取 が、**訪問者の
+	// IP に分散したまま**成立する。1 IP あたりのレート制限を訪問者数ぶん
+	// 掛け算できてしまう。
+	//
+	// upstream は `SigninApiService` / `SigninWithPasskeyApiService` が
+	// `Access-Control-Allow-Origin` を `config.url` に**明示的に上書き**して
+	// いる (グローバルは `origin: '*'` なので、意図的な上書き)。
+	//
+	// **同一オリジンのフロントエンドは影響を受けない** — ブラウザは同一
+	// オリジンの応答に CORS 検査を適用しない。ネイティブアプリや CLI も
+	// 応答ヘッダを見ないので無影響。
+	"/api/signin":                 true,
+	"/api/signin-flow":            true,
+	"/api/signin-with-passkey":    true,
+	"/api/signup":                 true,
+	"/api/signup-pending":         true,
+	"/api/reset-password":         true,
+	"/api/request-reset-password": true,
+}
+
+// corsRestrictedPath reports whether the path must not advertise CORS.
+//
+// **AP のコレクションも塞ぐ (レビュー M-1)。** `/users/<id>/following` は
+// `s.echo` 直付けで `/api` グループの外にあり、**同じフォローグラフを
+// `ACAO: *`・レート制限なし・プリフライト不要 (単純リクエスト) で返す**
+// (本番で実測)。`/api` 側だけ費用を上げても、隣に無料の経路が残っていては
+// 意味がない。
+//
+// **連合は壊れない。** AP の取得はサーバー間なので応答ヘッダを見ない。
+// ブラウザがこのパスを開く経路は SPA へのフォールバック (同一オリジンの
+// 画面遷移) で、CORS の対象外。
+func corsRestrictedPath(p string) bool {
+	if noCORSPaths[p] {
+		return true
+	}
+	// `/users/<id>/following` / `/followers`。id は可変なので前方 + 後方一致で
+	// 見る。広く取っても catchall が空を返すだけで無害な側に倒れる。
+	if strings.HasPrefix(p, "/users/") {
+		return strings.HasSuffix(p, "/following") || strings.HasSuffix(p, "/followers")
+	}
+	return false
+}
+
+// corsMiddleware returns the global CORS middleware.
+// Shared with cors_test.go so production and tests stay in sync.
+func corsMiddleware() echo.MiddlewareFunc {
+	inner := echomw.CORSWithConfig(echomw.CORSConfig{
+		// discovery endpoint は upstream が専用の hook で
+		// `Access-Control-Allow-Headers: Accept` だけを広告する。ここで
+		// グローバル CORS を通すと preflight に Origin/Content-Type/
+		// Authorization まで載って乖離するので除外する (handler 側が
+		// setDiscoveryCORS で必要なヘッダを全て付ける)。
+		Skipper: func(c echo.Context) bool {
+			return strings.HasPrefix(c.Request().URL.Path, "/.well-known/")
+		},
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
+		AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization},
+	})
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		wrapped := inner(next)
+		return func(c echo.Context) error {
+			// **`c.Request().URL.Path` で見る。** グローバル middleware の
+			// 時点では `c.Path()` が `/api/*` に解決されていることがある。
+			if !corsRestrictedPath(c.Request().URL.Path) {
+				return wrapped(c)
+			}
+			// **`Vary: Origin` は自分で戻す。** echo の CORS は Skipper の
+			// **後**で `Vary` を付けるので、迂回した経路では落ちる (実測:
+			// `/.well-known/` の応答には元から `Vary: Origin` が無い)。
+			//
+			// **`Set` ではなく `Add`。** 現状 CORS より前に `Vary` を付ける
+			// middleware は無い (gzip は後段) ので `Set` でも同じ結果になるが、
+			// 順序を入れ替えたときに他の `Vary` を消さないため。
+			c.Response().Header().Add(echo.HeaderVary, echo.HeaderOrigin)
+			// **プリフライトはここで打ち切る。** 通すと `api.Any("/*")` の
+			// catchall が拾って `200 + {}` を返し、プリフライトのたびに
+			// 「unimplemented API endpoint」の警告ログを吐く。auth の
+			// `io.ReadAll` やレート制限にも OPTIONS が流れる。
+			//
+			// **拒否はしない (204)。** CORS ヘッダが無い時点でブラウザは
+			// 止まるので 403 にしても挙動は変わらず、Origin を付けてくる
+			// 非ブラウザのクライアントを壊す側にだけ倒れる。
+			if c.Request().Method == http.MethodOptions {
+				return c.NoContent(http.StatusNoContent)
+			}
+			return next(c)
+		}
+	}
+}
+
+// accessLogConfig returns the access log middleware config.
+//
+// **request URI は query を含む**ので、そのまま出すと `?i=<token>` の形で有効な
+// credential がアクセスログに残る (redact package の doc 参照)。`redact.URI` で
+// 秘密パラメータの**値だけ**を伏せる。**この配線は必ずテストで固定すること**
+// (`TestAccessLogConfig_RedactsToken`) — 壊れても外から見えないので、無検証だと
+// 書き換えで黙って credential が出る側に倒れる。
+//
+// 出力先を引数に取るのはテストと共有するため。`gzipConfig` と同じ意図だが、
+// `RequestLoggerConfig` は `Output` を持たず `LogValuesFunc` の中で自分で書くので
+// writer を渡す形になる。
+func accessLogConfig(out io.Writer) echomw.RequestLoggerConfig {
+	return echomw.RequestLoggerConfig{
+		LogMethod:  true,
+		LogStatus:  true,
+		LogLatency: true,
+		// **`HandleError` を立てる。** 既定 (false) だと `c.Error(err)` が呼ばれず
+		// `res.Status` が更新されないので、handler が素の error を返したときに
+		// **クライアントには 500 を返しながらログには 200 と書く**。旧実装は
+		// `c.Error(err)` を先に呼んでから status を読んでいた (実測で 17 ケース中
+		// 4 ケースが食い違い、これを立てると 17/17 一致する)。
+		HandleError: true,
+		// `LogURI` は `req.RequestURI` をそのまま入れる (query 込み)。自分で
+		// `c.Request().RequestURI` を読んでも同じだが、フラグと使う値を対応させておく。
+		LogURI: true,
+		LogValuesFunc: func(_ echo.Context, v echomw.RequestLoggerValues) error {
+			// 旧 `LoggerWithConfig` の
+			// `${time_rfc3339} ${method} ${custom} ${status} ${latency_human}` と
+			// 同じ並び・同じ書式。**時刻は `v.StartTime` ではなく `time.Now()`** —
+			// 旧実装の `${time_rfc3339}` が書き込み時点を出していたのに合わせる
+			// (`StartTime` はリクエスト開始時刻なので値がずれる)。
+			_, err := fmt.Fprintf(out, "%s %s %s %d %s\n",
+				time.Now().Format(time.RFC3339),
+				v.Method,
+				redact.URI(v.URI),
+				v.Status,
+				v.Latency.String(),
+			)
+			return err
+		},
+	}
 }
 
 // gzipConfig returns the GzipConfig used by the global middleware stack.
@@ -408,28 +570,25 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	// Recover に巻き戻し、5xx の最終整形は echo に任せる。
 	e.Use(mksentry.Middleware(cfg))
 	e.Use(echomw.RequestID())
-	e.Use(echomw.LoggerWithConfig(echomw.LoggerConfig{
-		// `${uri}` は query を含むため、そのまま出すと `?i=<token>` の形で
-		// 有効な credential がアクセスログに残る (redact package の doc 参照)。
-		// `${custom}` に差し替えて秘密パラメータの値だけを伏せる。
-		Format: "${time_rfc3339} ${method} ${custom} ${status} ${latency_human}\n",
-		CustomTagFunc: func(c echo.Context, buf *bytes.Buffer) (int, error) {
-			return buf.WriteString(redact.URI(c.Request().RequestURI))
-		},
-	}))
-	e.Use(echomw.CORSWithConfig(echomw.CORSConfig{
-		// discovery endpoint は upstream が専用の hook で
-		// `Access-Control-Allow-Headers: Accept` だけを広告する。ここで
-		// グローバル CORS を通すと preflight に Origin/Content-Type/
-		// Authorization まで載って乖離するので除外する (handler 側が
-		// setDiscoveryCORS で必要なヘッダを全て付ける)。
-		Skipper: func(c echo.Context) bool {
-			return strings.HasPrefix(c.Request().URL.Path, "/.well-known/")
-		},
-		AllowOrigins: []string{"*"},
-		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
-		AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization},
-	}))
+	// 設定は accessLogConfig() に集約してテストと共有する (gzipConfig と同じ形)。
+	//
+	// **エラーを上位へ返さない。** 旧 `LoggerWithConfig` は名前付き戻り値が後続の
+	// 代入で上書きされる副作用で handler のエラーを飲んでいた。
+	// `RequestLoggerWithConfig` は `return err` するので、そのままだと外側の Sentry
+	// middleware が 404 / 405 まで capture し始める — **未認証で誰でも叩ける経路**
+	// なので、存在しないパスへ POST を投げるだけで quota を焼ける (`sampleRate` の
+	// 既定は 1.0 で全部送る)。`HandleError: true` でレスポンスは確定させたうえで、
+	// ここで握って旧挙動に揃える。**飲むこと自体の是非は別途** — 直すなら
+	// Sentry 側を「5xx だけ capture」にするのが筋で、この移行の範囲ではない。
+	accessLog := echomw.RequestLoggerWithConfig(accessLogConfig(os.Stdout))
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		logged := accessLog(next)
+		return func(c echo.Context) error {
+			_ = logged(c)
+			return nil
+		}
+	})
+	e.Use(corsMiddleware())
 	// gzip response compression (#413 Phase 3 #12)。Misskey TS は nginx
 	// 前段で gzip するのが定石だが、mk-go は単体運用も想定するので app 側
 	// で提供する。設定は gzipConfig() に集約してテストと共有。
@@ -443,13 +602,19 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	// body size 制限は auth.Authenticate より前に置く: auth は token 抽出のため
 	// body を io.ReadAll するので、後に置くと巨大 body が auth で先に読まれて
 	// bypass される (#1958 / #2075)。/api → 1MiB / inbox → 64KiB / multipart 除外。
-	e.Use(middleware.BodyLimitByPath(cfg.MaxFileSize))
+	e.Use(middleware.BodyLimitByPath(cfg.MaxFileSize, peerBodyLimitsByPath(plugins, cfg.Plugins)))
 	// クリックジャッキング防止。upstream が ClientServerService の
 	// onRequest hook で付けている X-Frame-Options: DENY に相当する。
 	e.Use(middleware.FrameGuard())
 	// 外部リンク遷移で閲覧中の URL が path ごと漏れるのを防ぐ (#2404)。
 	// upstream には無い mk-go 独自の hardening。
 	e.Use(middleware.ReferrerPolicy())
+	// MIME sniffing を止める (#2782)。**drive とプラグイン proxy にしか付いて
+	// いなかった** ので SPA shell も API も素通しだった。これも upstream には無い。
+	e.Use(middleware.NoSniff())
+	// 使わないブラウザ機能 (カメラ / マイク / 位置情報 / 支払い) を落とす (#2782)。
+	// 同じく upstream には無い。fullscreen は動画プレイヤーが使うので落とさない。
+	e.Use(middleware.PermissionsPolicy())
 	// upstream ServerService と同じ HSTS。**disableHsts を設定として読んで
 	// いたのに header を出していなかった**ので、TS から切り替えると黙って
 	// 消えていた。https でない構成では付けない。
@@ -472,20 +637,17 @@ func newServer(cfg *config.Config, db *gorm.DB, redis *cache.RedisClients, plugi
 	auth := middleware.NewAuthMiddleware(userRepo, accessTokenRepo)
 	e.Use(auth.Authenticate())
 
-	// queue driver セットアップ: jobQueueDriver config で asynq / mkq を
-	// 選択。Host が UNIX domain socket パス ("/" 始まり) のときは driver
-	// 内部で Network を unix に切り替える。
-	queueDriver, err := buildQueueDriver(context.Background(), cfg)
+	// queue driver セットアップ。Host が UNIX domain socket パス ("/" 始まり)
+	// のときは driver 内部で Network を unix に切り替える。
+	// プラグイン専用のキュー (#2818)。**driver を作る前に決める** — worker が
+	// 見るキューの一覧は構築時に固定される。
+	pluginQueues := pluginJobQueueNames(plugins, cfg.Plugins)
+	queueDriver, err := buildQueueDriver(context.Background(), cfg, pluginQueues)
 	if err != nil {
 		return nil, fmt.Errorf("server: build queue driver: %w", err)
 	}
 	queueClient := queue.NewClient(queueDriver)
 	applyClientPolicies(queueClient, cfg)
-	// scheduled note 機能の driver capability (= mkq のみ確実に動作、asynq
-	// は task ID 仕様の制約で clearSchedule が困難なため無効化)。空文字列
-	// は mkq に正規化される config 経路だが defensive に判定する
-	// (#1045 Phase 2-C)。
-	queueClient.SetSupportsScheduledNote(cfg.JobQueueDriver == "" || cfg.JobQueueDriver == "mkq")
 	queueServer := queue.NewServer(queueDriver)
 	queueScheduler := queue.NewScheduler(queueDriver)
 	queueInspector := queue.NewInspector(queueDriver)
@@ -623,7 +785,7 @@ func (s *Server) DumpRoutes(w io.Writer) error {
 	return enc.Encode(payload)
 }
 
-// StartBackgroundForTest starts the asynq queue worker (and optional
+// StartBackgroundForTest starts the queue worker (and optional
 // scheduler / chart management) without launching the HTTP listener.
 // 用途: e2e_federation 系のテストで `httptest.Server` 経由で echo handler を
 // 外部 listener にぶら下げつつ、deliver / inbox 処理など async queue 経路も
@@ -677,12 +839,22 @@ func (s *Server) registerSchedulerJobs() {
 			slog.Warn("scheduler register failed", "job", j.name, "err", err)
 		}
 	}
+	// **登録しなかった cron を撤去する (#3173)。** プラグインの cron は router の
+	// 構築中 (setupPlugins) に登録済みなので、ここが全登録の後になる。登録先や
+	// 名前を変えた cron の旧スケジューラは、消さないと永久に発火し続ける。
+	removed, err := s.queueScheduler.PruneUnregistered()
+	for _, r := range removed {
+		slog.Info("scheduler: removed a schedule that is no longer registered", "schedule", r)
+	}
+	if err != nil {
+		slog.Warn("scheduler prune failed", "err", err)
+	}
 	if err := s.queueScheduler.Start(); err != nil {
 		slog.Warn("scheduler start failed", "err", err)
 	}
 }
 
-// SetSyncDeliverHookForTest replaces the asynq deliver enqueue with the
+// SetSyncDeliverHookForTest replaces the queued deliver enqueue with the
 // supplied synchronous hook. e2e_federation 系テストで queue worker 経由の
 // deliver が動かない/動かしたくないシナリオで、sign + HTTP POST を inline
 // で実行する用途。fn=nil で本番経路 (queue) に戻る。
@@ -695,7 +867,7 @@ func (s *Server) SetSyncDeliverHookForTest(fn func(payload queue.DeliverPayload)
 }
 
 // Start begins listening on the configured port (or UNIX domain socket) and
-// launches the asynq worker.
+// launches the queue worker.
 //
 // If s.config.Socket is non-empty the HTTP server binds to that path instead
 // of a TCP port. This matches Misskey 本家 YAML の `socket` / `chmodSocket`
@@ -752,7 +924,7 @@ func (s *Server) Start() error {
 	return s.echo.Start(addr)
 }
 
-// Shutdown gracefully shuts down the server, the asynq worker and
+// Shutdown gracefully shuts down the server, the queue worker and
 // any background services such as the chart management loop.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
@@ -776,8 +948,8 @@ func (s *Server) shutdown(ctx context.Context) error {
 	// 伝播することで autoscale の goroutine drain にも graceful deadline が効く。
 	s.autoscale.Stop(ctx)
 	// RoleServer では scheduler も worker も起動していない。mkq driver は
-	// どちらの Shutdown も未起動で安全だが、asynq driver は inner にそのまま
-	// 委譲するので、起動していない前提を持ち込まない (#2459)。
+	// どちらの Shutdown も未起動で安全だが、「起動済み」を前提にした driver へ
+	// 差し替わっても壊れないよう role で守る (#2459)。
 	if s.role.RunsQueue() {
 		if s.queueScheduler != nil {
 			s.queueScheduler.Shutdown()
@@ -785,11 +957,9 @@ func (s *Server) shutdown(ctx context.Context) error {
 		s.queueServer.Shutdown()
 	}
 	// queueClient.Close を直接呼ばないこと。queueDriver.Close が
-	// Client / Inspector を含むサブコンポーネントの Close を一括処理
-	// するため、ここで呼ぶと asynq driver では同じ *asynq.Client を
-	// 二重 close して pool.ErrPoolClosed の warn log が毎回出る。
-	// mkq driver は Client.Close が no-op で driver 本体に集約する
-	// 仕様なので、driver.Close 一本に統一する方が両 driver で対称。
+	// Client / Inspector を含むサブコンポーネントの Close を一括処理する。
+	// mkq driver は Client.Close が no-op で接続は driver 本体が持つので、
+	// 閉じ口は driver.Close の一本に統一する。
 	if s.queueDriver != nil {
 		if err := s.queueDriver.Close(); err != nil {
 			slog.Warn("queue driver close failed", "err", err)

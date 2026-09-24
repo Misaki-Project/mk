@@ -37,7 +37,8 @@ type Handler func(Request) (any, error)
 
 // Blob is a raw response body, for endpoints that do not return JSON.
 //
-// 主な用途は画像のプロキシ。本体の CSP は `img-src 'self' data: blob:` なので、
+// 主な用途は画像のプロキシ。本体の CSP は `img-src` を `'self' data: blob:` +
+// 固定 2 host に絞っている (#2892) ので、
 // **外部の画像を <img> で直接読めない**。プラグインが同一オリジンで配信すれば
 // CSP を緩めずに済み、取得元にも優しい (キャッシュできる)。
 //
@@ -47,10 +48,15 @@ type Handler func(Request) (any, error)
 //	    CacheControl: "public, max-age=86400",
 //	}, nil
 //
-// mk-go は `X-Content-Type-Options: nosniff` を必ず付ける。外部から取得した
-// ものをそのまま流す場合、ブラウザの MIME 推測で意図しない解釈をされるのを
-// 防ぐため。**ContentType は取得元の値をそのまま使わず、扱う型を決めて
-// 検証すること。**
+// mk-go は `filesHandler` と同じ 3 点を必ず付ける: `Content-Type` を
+// browser-safe allowlist (image / audio / video) に通して**それ以外は
+// `application/octet-stream` に矯正**し、`Content-Security-Policy` と
+// `X-Content-Type-Options: nosniff` / `Content-Disposition: inline` を付ける。
+// `nosniff` はブラウザの MIME 推測を止めるだけで、Content-Type が**実際に**
+// `text/html` / `image/svg+xml` のときには何も止めないため。
+//
+// JSON を返したいときは Blob ではなく素の値を返す (本体が JSON 化する)。
+// **ContentType は取得元の値をそのまま使わず、扱う型を決めて検証すること。**
 //
 // 応答の大きさは mk-go では制限しない。取得元からの読み込みは
 // `io.LimitReader` などでプラグイン側が必ず上限を設けること。

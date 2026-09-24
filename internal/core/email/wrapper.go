@@ -32,6 +32,9 @@ type HTMLWrapInput struct {
 	// 認証済 user 向けメール (reset-password 等) で設定。signup-pending のような
 	// 未認証ユーザー向けメールでは空にして footer 自体省略 (TS と同じ運用)。
 	EmailSettingsURL string
+	// EmailSettingsLabel は footer link の表示文言。l10n 済み文字列を渡す。
+	// 空なら "Email setting" (英語 fallback)。
+	EmailSettingsLabel string
 }
 
 // WrapHTML returns an Misskey TS-style HTML email body suitable for the html
@@ -67,9 +70,13 @@ func WrapHTML(in HTMLWrapInput) string {
 	// 二段構造に揃える)。空なら footer ごと省略してすっきり見せる。
 	var innerFooter string
 	if in.EmailSettingsURL != "" {
+		label := in.EmailSettingsLabel
+		if label == "" {
+			label = "Email setting"
+		}
 		innerFooter = fmt.Sprintf(
-			`<footer style="padding:32px;border-top:solid 1px #eee"><a href="%s" style="color:#86b300;text-decoration:none">Email setting</a></footer>`,
-			html.EscapeString(in.EmailSettingsURL))
+			`<footer style="padding:32px;border-top:solid 1px #eee"><a href="%s" style="color:#86b300;text-decoration:none">%s</a></footer>`,
+			html.EscapeString(in.EmailSettingsURL), html.EscapeString(label))
 	}
 
 	return fmt.Sprintf(`<!doctype html>

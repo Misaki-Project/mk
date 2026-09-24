@@ -720,3 +720,79 @@ func TestCreate_InvalidVisibility(t *testing.T) {
 	require.NoError(t, h.Create(c))
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
+
+// **列に入らないカーソルは 400 (#3025)。** NUL を含む値は `id < ?` の bind
+// parameter に載せた時点で PostgreSQL が落とすので、そのまま repository へ渡すと
+// 500 になる。**JSON では NUL をエスケープで送る** — 生バイトを body に載せると
+// JSON として不正になり、`Bind` の 400 で guard まで届かない。
+func TestCursorGuardRejectsUnstorableCursor(t *testing.T) {
+	const body = `{"untilId":"a\u0000b"}`
+	for _, tt := range []struct {
+		name string
+		fn   func(h *Handler) func(echo.Context) error
+	}{
+		{"My", func(h *Handler) func(echo.Context) error { return h.My }},
+		{"Featured", func(h *Handler) func(echo.Context) error { return h.Featured }},
+		{"Search", func(h *Handler) func(echo.Context) error { return h.Search }},
+		{"MyLikes", func(h *Handler) func(echo.Context) error { return h.MyLikes }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _, _ := newHandler(t)
+			c, rec := newReq(t, body)
+			setUser(c, "alice")
+			require.NoError(t, tt.fn(h)(c))
+			assert.Equal(t, http.StatusBadRequest, rec.Code,
+				"列に入らないカーソルを repository へ渡している (SELECT がそこで落ちる)")
+			assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+		})
+	}
+}
+
+// --- 非公開 Flash の削除 (敵対的レビュー: f6063263 の回帰) ---
+//
+// `Show` に可視性ゲートを足したとき、`Delete` がその `Show` を requester 空文字で
+// 呼んでいたため、**非公開の Flash が所有者にもモデレーターにも消せなくなった**。
+// 既存テストは全て public の Flash しか置いていなかったので 1 件も落ちなかった。
+
+func TestDelete_OwnerCanDeletePrivate(t *testing.T) {
+	h, repo, _ := newHandler(t)
+	repo.Flashes["f1"] = &model.Flash{ID: "f1", UserID: "alice", Visibility: "private"}
+	c, rec := newReq(t, `{"flashId":"f1"}`)
+	setUser(c, "alice")
+	require.NoError(t, h.Delete(c))
+	assert.Equal(t, http.StatusNoContent, rec.Code, "所有者は自分の非公開 Flash を削除できること")
+	assert.NotContains(t, repo.Flashes, "f1")
+}
+
+func TestDelete_ModeratorCanDeletePrivate(t *testing.T) {
+	h, repo, _ := newHandler(t)
+	h.SetRoleChecker(&stubRoles{moderators: map[string]bool{"mod": true}})
+	repo.Flashes["f1"] = &model.Flash{ID: "f1", UserID: "owner", Visibility: "private"}
+	c, rec := newReq(t, `{"flashId":"f1"}`)
+	setUser(c, "mod")
+	require.NoError(t, h.Delete(c))
+	assert.Equal(t, http.StatusNoContent, rec.Code, "モデレーターは他人の非公開 Flash を削除できること")
+	assert.NotContains(t, repo.Flashes, "f1")
+}
+
+// **ゲートを外したわけではないこと。** 第三者は非公開 Flash を消せない。
+func TestDelete_StrangerCannotDeletePrivate(t *testing.T) {
+	h, repo, _ := newHandler(t)
+	repo.Flashes["f1"] = &model.Flash{ID: "f1", UserID: "owner", Visibility: "private"}
+	c, rec := newReq(t, `{"flashId":"f1"}`)
+	setUser(c, "stranger")
+	require.NoError(t, h.Delete(c))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, repo.Flashes, "f1")
+}
+
+// **閲覧のゲートは残っていること** (`ShowAny` を `Show` の代わりに使い回して
+// いないこと)。
+func TestShow_PrivateStillHiddenFromStranger(t *testing.T) {
+	h, repo, _ := newHandler(t)
+	repo.Flashes["f1"] = &model.Flash{ID: "f1", UserID: "owner", Visibility: "private"}
+	c, rec := newReq(t, `{"flashId":"f1"}`)
+	setUser(c, "stranger")
+	require.NoError(t, h.Show(c))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}

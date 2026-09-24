@@ -1,5 +1,5 @@
 .PHONY: help check gates version plugin-test frontend-check diff-check playwright-check e2e-down-all \
-	update docker-update uds-update \
+	update pull pull-plugins docker-update docker-rebuild docker-restart uds-update \
 	image-up image-down image-down-v image-logs image-build \
 	build run dev clean tidy test fmt lint plugin-doc-check migrate-up migrate-down migrate-create \
 	plugins plugins-all plugin-dev plugin-vet \
@@ -12,10 +12,10 @@
 	dropin-frontend-up dropin-frontend-down dropin-frontend-baseline dropin-frontend-logs \
 	dropin-frontend-mk-up dropin-frontend-mk-down dropin-frontend-swap-test \
 	e2e-submodule-init e2e-frontend-build \
-	uds-init uds-frontend-build uds-build uds-up uds-down uds-down-v uds-logs uds-ps \
+	uds-init uds-frontend-build uds-build uds-rebuild uds-restart uds-up uds-down uds-down-v uds-logs uds-ps \
 	bench-up bench-run bench-down bench-logs \
 	apicompat apicompat-routes apicompat-render \
-	shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check wiring-check \
+	test-fast shapecheck shapecheck-gen shapecheck-report errorid-check limitspec-check perm-check wiring-check catalog-check notfound-check nulparam-check compose-check testflags-check gaterun-check secretfield-check ipshape-check iprecord-check submodulepin-check \
 	diff-up diff-test diff-down diff-logs \
 	upstream-e2e upstream-e2e-deps upstream-e2e-up upstream-e2e-down upstream-e2e-migrate upstream-e2e-test
 
@@ -31,20 +31,61 @@ help: ## この一覧を表示 (引数なしの make でも出る)
 
 ##@ まとめて実行
 
-check: fmt lint test ## コミット前の必須 3 点 (fmt → lint → test)
+check: fmt lint actionlint golangci-lint test ## コミット前に必須 (lint job の静的検査 + test)
+	# **`lint` job と揃える。** あちらは go vet だけでなく actionlint と
+	# golangci-lint も回すので、`fmt`/`lint`/`test` だけだと新しい検査が手元で
+	# 一度も走らない (レビューで指摘された)。
+	#
+	# **required check の全部ではない。** `build` job (`go build ./...` と同梱
+	# プラグインの vet → `make plugin-vet`)、`lint` job の重複 fixture ID 検査、
+	# `test` のカバレッジ閾値は再現しない。
 
-gates: shapecheck errorid-check limitspec-check perm-check wiring-check ## 静的 parity ゲートを一括実行
+gates: shapecheck errorid-check limitspec-check perm-check wiring-check catalog-check notfound-check nulparam-check compose-check testflags-check migrationdoc-check mdtable-check notiftype-check pluginembed-check dockerignore-check secretfield-check ipshape-check iprecord-check sqlbind-check submodulepin-check gaterun-check ## 静的 parity ゲートを一括実行
 
 version: ## mk-go / 互換 Misskey / submodule のバージョンを表示
 	@printf "mk-go            : %s\n" "$$(sed -n 's/^var MkGoVersion = "\(.*\)"/\1/p' internal/config/config.go)"
 	@printf "互換 Misskey     : %s\n" "$$(sed -n 's/^var MisskeyVersion = "\(.*\)"/\1/p' internal/config/config.go)"
 	@printf "submodule (fork) : %s\n" "$$(git -C third_party/misskey describe --tags 2>/dev/null || echo '(未取得)')"
 
-frontend-check: ## fork の frontend を型チェック (vue-tsc --noEmit のみ)
+frontend-check: ## fork の frontend を型チェックし、submodule 依存のゲートを回す
 	# uds-frontend-build / e2e-frontend-build は本番が bind-mount している
 	# third_party/misskey/built を書き換えるため、検証目的では使わないこと。
 	# 型を見るだけならこちらで済む (Docker 不要、出力物も作らない)。
 	cd third_party/misskey/packages/frontend && npx vue-tsc --noEmit
+	# submodule のソースを読むゲート。**`make gates` には入れない** — あちらは
+	# submodule 無しでも回る前提で、ここを混ぜると checkout していない環境で
+	# skip され「検査していないのに緑」になる。REQUIRE を渡して skip を禁じる
+	# (#2892)。
+	MK_FRONTEND_GATES_REQUIRE_SUBMODULE=1 go test ./internal/server/ \
+		-run 'TestCreditImageOriginsCoverAboutMisskey|TestMkGoRolePolicyKeysAreListedInFrontend|TestReactionLongPressIsWired|TestReactableRemoteReactionIsWired|TestMkGoUpdatedDialogIsWired|TestEmojiApplicationIsWired|TestEveryPluginSlotHasAMountPoint|TestAutoLoadingComponentsShowRateLimit|TestRemoteImagesGoThroughMediaProxy|TestRemoteImageProxyGateClassifiesSources|TestEmojiDecorationErrorIDsMatchFrontend|TestStaffNotificationTypesAreOptOutable|TestNotificationBadgeClassesHaveNoPadding|TestEmojiRequestEntriesUseTheSharedHelper|TestCSSModulesHaveNoDuplicateClasses|TestCleanRemoteFilesButtonIsConditional|TestStreamResyncIsWiredInTimelines' -count=1
+	# **eslint も回す (#2906)。** CI は別 step で `pnpm eslint` を回しており、
+	# ここに無いと**手元で緑でも CI が落ちる**。#2903 で実際に踏んだ (デッドコードを
+	# 消したときの空行が @stylistic/no-multiple-empty-lines で落ちた)。個別ファイルに
+	# `npx eslint` を掛けても CI と同じ glob ではないので見落とす。
+	#
+	# **script を呼ぶ (引数を書き写さない)。** 書き写すと package.json と
+	# ドリフトする (#2841 の `make test` と CI の flag が同じ形でずれた)。
+	$(MAKE) frontend-lint
+
+.PHONY: frontend-lint
+frontend-lint: ## fork の frontend を eslint で検査 (CI と同じ範囲)
+	# CI の `Lint (eslint)` step と同じ。範囲は package.json の script が持つ
+	# (`--quiet "src/**/*.{ts,vue}"`)。**`eslint .` にしないこと** — upstream が
+	# lint していない test/ まで拾い、追従のたびに他人の負債で落ちる。
+	#
+	# **`npm run` で script を呼ぶ (引数を書き写さない)。** 書き写すと
+	# package.json とドリフトする (#2841 の `make test` と CI の flag が同じ形で
+	# ずれた)。CI は `pnpm eslint` だが手元に pnpm があるとは限らないので、
+	# 同じ script を呼べる npx/npm 側に寄せる (frontend-check / frontend-test も
+	# npx を使っている)。
+	cd third_party/misskey/packages/frontend && npm run --silent eslint
+
+.PHONY: frontend-test
+frontend-test: ## fork の frontend の vitest を実行
+	# upstream の `pnpm --filter frontend test` と同じ。CI は frontend-check job で
+	# 回す (#2844)。workspace package の生成物が要るので、初回や submodule bump 後は
+	# 先に `cd third_party/misskey && pnpm install && pnpm build-pre && pnpm -r build`。
+	cd third_party/misskey/packages/frontend && npx vitest --run --globals --config vitest.config.unit.ts
 
 diff-check: ## 差分比較ハーネスを作り直して実行 (クリーン DB 前提)
 	$(MAKE) diff-down
@@ -88,9 +129,29 @@ e2e-down-all: ## 検証用スタックを一括撤去 (本番 project mk は対�
 
 ##@ 更新 (運用)
 
+# submodule の中でビルドが書き換える tracked ファイル。`make plugins` (pluginbuild) が
+# server-plugins.generated.ts を、`pnpm -r build` の i18n パッケージが locale.ts を
+# 上書きするので、一度でもビルドしたワークツリーは常に dirty になる。**dirty なまま gitlink が動くと `git pull --recurse-submodules` は checkout に
+# 失敗する** — つまり frontend の再ビルドが要る回 (= submodule bump 回) に限って必ず
+# 止まり、しかも親リポだけ進んだ混在状態で止まる (#2885 のレビューで判明)。
+#
+# **生成物だけ**戻す。それ以外の変更が残っていれば git 自身が止めるので、
+# frontend に手を入れている最中の作業を黙って捨てることはない。
+SUBMODULE_GENERATED = \
+	packages/frontend/src/server-plugins.generated.ts \
+	packages/i18n/src/autogen/locale.ts
+
 update: ## submodule ごと pull し、frontend 再ビルドの要否を知らせる
+	@for f in $(SUBMODULE_GENERATED); do \
+		git -C third_party/misskey checkout -- "$$f" 2>/dev/null || true; \
+	done
 	@before=$$(git -C third_party/misskey rev-parse HEAD 2>/dev/null); \
-	git pull --recurse-submodules; \
+	if ! git pull --recurse-submodules; then \
+		printf "\033[31m==> pull に失敗した\033[0m\n"; \
+		printf "    submodule に手を入れている場合は third_party/misskey で\n"; \
+		printf "    変更を commit / stash してからやり直すこと。\n"; \
+		exit 1; \
+	fi; \
 	after=$$(git -C third_party/misskey rev-parse HEAD 2>/dev/null); \
 	if [ "$$before" != "$$after" ]; then \
 		printf "\n\033[33m==> submodule が更新された。frontend の再ビルドが必要\033[0m\n"; \
@@ -100,20 +161,76 @@ update: ## submodule ごと pull し、frontend 再ビルドの要否を知ら�
 		printf "\n==> submodule に変更なし。frontend の再ビルドは不要\n"; \
 	fi
 
+# plugins/*/ のうち独立した git リポジトリのものを更新する。同梱プラグイン
+# (status / trustlevel) は mk 本体に tracked なので本体の pull で追従する。
+#
+# dirty なリポジトリは触らない。勝手に stash すると編集中の変更が「消えた」
+# ように見えるうえ、復元手順もどこにも残らない。
+pull-plugins: ## plugins/ 配下の独立リポジトリを pull
+	@found=0; failed=""; \
+	for d in plugins/*/; do \
+		[ -e "$$d.git" ] || continue; \
+		found=$$((found + 1)); \
+		name=$$(basename "$$d"); \
+		if [ -n "$$(git -C "$$d" status --porcelain)" ]; then \
+			printf "\033[33m==> %-12s skip (未コミットの変更あり)\033[0m\n" "$$name"; \
+			continue; \
+		fi; \
+		if ! git -C "$$d" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then \
+			printf "\033[33m==> %-12s skip (upstream 未設定)\033[0m\n" "$$name"; \
+			continue; \
+		fi; \
+		printf "==> %s\n" "$$name"; \
+		git -C "$$d" pull --ff-only || failed="$$failed $$name"; \
+	done; \
+	if [ "$$found" -eq 0 ]; then printf "==> plugins/ に git リポジトリが無い\n"; fi; \
+	if [ -n "$$failed" ]; then \
+		printf "\033[31m==> pull に失敗:%s\033[0m\n" "$$failed"; \
+		exit 1; \
+	fi
+
+pull: ## 本体・submodule・プラグインをまとめて pull
+	$(MAKE) update
+	$(MAKE) pull-plugins
+
 # frontend の再ビルドと再起動は必ずセットで行う。mk-go は entry point を
 # 起動時に 1 回だけ解決してキャッシュするため、ビルドだけして再起動しないと
 # HTML が消えた古い scripts/<hash>.js を指したまま 404 になる。
-docker-update: ## pull → frontend ビルド → image 再ビルド → 再起動 (Docker Compose 構成)
-	$(MAKE) update
+#
+# **`up -d` では足りない。** compose は image と設定が変わらなければコンテナを
+# 作り直さないが、frontend は bind mount なので frontend だけ更新したときは
+# 何も変わらず、再起動されない (#2885。2026-09-07 に本番で実際に踏んだ)。
+# restart を明示したうえで、配信中の entry が実在するかまで見る。
+docker-rebuild: ## frontend と image をまとめてビルド (Docker Compose 構成)
 	$(MAKE) e2e-frontend-build
 	docker compose build
-	docker compose up -d
 
-uds-update: ## pull → frontend ビルド → image 再ビルド → 再起動 (UDS 本番構成)
-	$(MAKE) update
-	$(MAKE) uds-frontend-build
-	$(MAKE) uds-build
-	$(MAKE) uds-up
+# **本番 UDS を動かしているホストで叩かないこと。** docker-compose.yml は
+# `name:` を持たないので project 名がディレクトリ名 `mk` になり、UDS 本番と
+# 同じ project へ合流する。app / db / redis が本番の隣に立ち上がり、本番の
+# コンテナは orphan 扱いになる (compose 自身が --remove-orphans を勧めてくる)。
+# 検証先も .config/docker.yml の url なので、本番ではなく新しく立てた方を見て
+# 緑を返す。本番の更新は uds-update を使うこと。
+docker-restart: ## app を再起動して配信アセットを検証 (Docker Compose 構成。本番 UDS ホストでは使わない)
+	@before=$$(docker compose ps -q app 2>/dev/null); \
+	docker compose up -d || exit 1; \
+	after=$$(docker compose ps -q app 2>/dev/null); \
+	if [ -n "$$before" ] && [ "$$before" = "$$after" ]; then \
+		docker compose restart app || exit 1; \
+	else \
+		printf "==> up -d が起動し直したので restart は省略\n"; \
+	fi
+	@./deploy/check-frontend-entry.sh $(ENTRY_CHECK_DOCKER_CONFIG)
+
+docker-update: ## pull → ビルド → 再起動 → 検証 (Docker Compose 構成)
+	$(MAKE) pull
+	$(MAKE) docker-rebuild
+	$(MAKE) docker-restart
+
+uds-update: ## pull → ビルド → 再起動 → 検証 (UDS 本番構成)
+	$(MAKE) pull
+	$(MAKE) uds-rebuild
+	$(MAKE) uds-restart
 
 
 # Binary output
@@ -144,6 +261,19 @@ ifneq ($(MISSKEY_VERSION),)
 LDFLAGS += -X github.com/shiroha-a/mk/internal/config.MisskeyVersion=$(MISSKEY_VERSION)
 endif
 
+# ビルドした revision と同梱 frontend の版。/about-mkgo が
+# 「mk-go 1.3.0 (abc1234)」「Misskey 2026.9.0-mk.3」として出す (#2700)。
+#
+# **`$(shell ...)` は使わない。** make の parse 時に必ず走るので、target と
+# 無関係な `make help` でも git を呼ぶことになるうえ、`gaterun-check` が
+# 「この Makefile に `$(shell …)` が無いので `make -pn` に副作用が無い」という
+# 前提で回っている (CLAUDE.md 2026-09-06)。recipe 内の `$$(...)` なら展開は
+# 実行時だけで、`make -n` では表示されるだけになる。
+#
+# git が無い / リポジトリ外でビルドした場合は空のまま。読む側が「不明」として
+# 扱うので、ここで `unknown` のような値を作らない (表示に出てしまう)。
+REVISION_LDFLAGS = -X github.com/shiroha-a/mk/internal/config.MkGoCommit=$$(git rev-parse --short HEAD 2>/dev/null) -X github.com/shiroha-a/mk/internal/config.MkGoFrontendVersion=$$(git -C third_party/misskey describe --tags 2>/dev/null)
+
 ##@ 開発
 plugins: ## plugins/ を走査して組み込み用ファイルを生成 (#2480)
 	GOWORK=off go run ./tools/pluginbuild
@@ -164,7 +294,7 @@ plugin-dev: ## プラグインを編集しながら動かす (PLUGIN=plugins/sta
 	GOWORK=off go run ./tools/plugindev $(if $(PLUGIN),-plugin $(PLUGIN),)
 
 build: plugins ## バイナリを ./built/misskey に生成
-	go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/misskey
+	go build $(GOFLAGS) -ldflags "$(LDFLAGS) $(REVISION_LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/misskey
 
 run: build ## build して起動
 	$(BUILD_DIR)/$(BINARY) -config .config/default.yml
@@ -178,8 +308,25 @@ clean: ## ビルド成果物を削除
 tidy: ## go mod tidy
 	go mod tidy
 
-test: ## 全テストを実行
-	go test ./... -v
+test: ## 全テストを実行 (CI と同じ -race / -count=1 / -shuffle seed)
+	# CI (.github/workflows/ci.yml) の test-shards と条件を揃える (#2841)。
+	# -shuffle の seed を揃えたのは #2795。順序依存は seed 固定で塞いだのに
+	# **データ競合は塞げていなかった** ので、同じ理屈で -race も揃える
+	# (実測 65s -> 160s。CI は push から結果まで 4-5 分かかるので往復するより速い)。
+	# -count=1 は CI との一致のため。-shuffle は cacheable flag ではないので、
+	# seed を渡している時点でキャッシュは元から効いていない。
+	# -race は cgo を要求する (CGO_ENABLED=0 の環境では make test-fast を使う)。
+	# -timeout / -coverprofile / -covermode は揃えなくてよい。前者は既定と同じ
+	# 10m で、後 2 つはカバレッジ閾値チェック用なので挙動に影響しない。
+	go test ./... -v -race -count=1 -shuffle=3
+
+.PHONY: test-fast
+test-fast: ## 全テストを -race 抜きで実行 (反復用。コミット前は make check を使う)
+	# **これはコミット前の検査ではない。** -race が無いので CI で落ちるものが
+	# 手元で緑になる。編集しながら回す用 (実測で make test の 1/2.5)。
+	# -count=1 は落とさない — -shuffle を外したときに (cached) で無検証の緑を
+	# 返すようになるため。
+	go test ./... -count=1 -shuffle=3
 
 plugin-doc-check: ## authoring.md の Go スニペットがコンパイルできるか検査
 	./tests/plugin-doc/check-snippets.sh
@@ -214,10 +361,75 @@ plugin-test: ## 同梱プラグインのテストを実行 (PostgreSQL が要る
 	done
 
 fmt: ## gofmt -s -w . で整形
-	gofmt -s -w .
+	# **PATH の gofmt ではなく go.mod の toolchain のものを使う。** gofmt は版で
+	# 整形結果が変わる (Go 1.27 でコメントの桁揃えが変わった) が、PATH の gofmt は
+	# GOTOOLCHAIN の切り替えに追従しない。手元で緑なのに CI (setup-go が go.mod の
+	# 版を入れる) の Format check で落ちる (実測)。
+	"$$(go env GOROOT)/bin/gofmt" -s -w .
 
 lint: ## go vet ./...
 	go vet ./...
+
+.PHONY: golangci-lint
+golangci-lint: ## golangci-lint (errcheck / govet / ineffassign / staticcheck)
+	# `go vet` だけでは見えない層を埋める。設定は .golangci.yml。
+	#
+	# **版を固定する。** 新しいチェックが増えると、コードを触っていない PR が
+	# 赤くなる。`lint` は required check なので、上げるのは明示的な操作にする。
+	# CI もこの target を呼ぶので、版の定義はここ 1 箇所だけ。
+	#
+	# **CI と同じ条件で回すために `GOWORK=off` を付ける。**
+	# `make build` を一度でも回すと `go.work` と `cmd/misskey/plugins_generated.go`
+	# が出来る。CI は clean checkout でどちらも持たないので、揃えないと手元だけ
+	# 結果が変わる (actionlint の shellcheck で踏んだのと同じ型)。
+	#
+	# **`go.work` が変えるのは解析対象ではなく build list。** `./...` は module
+	# 境界を越えないので `plugins/` は lint されない (実測で package 数 207 が
+	# go.work の有無で一致)。変わるのは**依存の選択版**で、workspace 内の module の
+	# require が MVS に参加するぶん共通依存が上がる (実測: `golang.org/x/telemetry`
+	# が 2025-10-08 → 2026-07-08)。
+	#
+	# **生成物のほうは退避が要る。** `plugins_generated.go` は private な plugins を
+	# import するので `GOWORK=off` では解決できず typecheck で落ちる。**typecheck が
+	# 落ちると golangci-lint は他の解析結果を報告しない**ので、別パッケージの違反が
+	# 黙って見えなくなる (実測)。`make plugins` で作り直せるので退避して戻す
+	# (trap 付きなので中断しても復元される)。**`cp -p` で mode も保存する** —
+	# mktemp は 0600 で作るので、素の `cp` だと復元後に 644 → 600 になる (実測)。
+	#
+	# **toolchain を go.mod の版に固定する。** `go run pkg@version` はこの
+	# リポジトリの go.mod を見ず、golangci-lint 自身の `go` directive (1.26.0) を
+	# 基準に toolchain を選ぶ。手元の go が go.mod より古いとそれでビルドされ、
+	# `the Go language version (go1.26) used to build golangci-lint is lower than
+	# the targeted Go version (1.27.1)` で止まる (Go 1.27.1 への更新で実測)。
+	@set -e; \
+	gen=cmd/misskey/plugins_generated.go; bak=""; \
+	if [ -f "$$gen" ]; then bak=$$(mktemp); cp -p "$$gen" "$$bak"; rm -f "$$gen"; fi; \
+	trap 'if [ -n "$$bak" ]; then cp -p "$$bak" "$$gen"; rm -f "$$bak"; fi' EXIT INT TERM; \
+	gover=$$(awk '/^go [0-9]/ {print $$2; exit}' go.mod); \
+	GOWORK=off GOTOOLCHAIN=go$$gover go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout 10m
+
+.PHONY: actionlint
+actionlint: ## GitHub Actions の workflow を検査
+	# CodeQL の `actions` クエリが見るのは script injection などの**セキュリティ**で、
+	# 式の typo・存在しない needs 参照・`runs-on` の誤りといった**正しさ**は見ない。
+	# workflow のミスは動かすまで分からないので (#2940 で実際に踏んだ)、静的に落とす。
+	# `run:` の中身は actionlint が shellcheck へ渡す。
+	#
+	# **バージョンを固定する。** 新しい検査が増えると、workflow を触っていない PR が
+	# 赤くなる。`lint` は required check なので、上げるのは明示的な操作にする。
+	#
+	# **shellcheck が無いと黙って検査が減る。** actionlint は `run:` の中身を
+	# shellcheck へ渡すが、無ければその分だけ落として成功で返す。CI の
+	# ubuntu-latest には入っているので、**手元だけ通って CI で落ちる**
+	# (実測: 手元 0 件 / CI 10 件。うち 1 件は二重引用符の中のバッククォートが
+	# コマンド置換として実行される実バグだった)。skip を成功として扱わない。
+	@command -v shellcheck >/dev/null 2>&1 || { \
+		echo "shellcheck が見つかりません。" >&2; \
+		echo "actionlint は run: の中身をこれに渡すので、無いまま実行すると CI より弱い検査になります。" >&2; \
+		echo "  Debian/Ubuntu: sudo apt install shellcheck" >&2; \
+		echo "  承知で飛ばす:   MK_ACTIONLINT_ALLOW_NO_SHELLCHECK=1 make actionlint" >&2; \
+		[ -n "$$MK_ACTIONLINT_ALLOW_NO_SHELLCHECK" ]; }
+	go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
 # Migration
 #
@@ -228,7 +440,7 @@ migrate-up: ## マイグレーションを最新まで適用
 	go run ./cmd/migrate -direction up
 
 # **-steps 1 は必須。** cmd/migrate は steps 未指定 (0) を「全部」と解釈するので、
-# 付け忘れると 1 段のつもりで全 down が走り schema が消える。
+# 付け忘れると 1 段のつもりで全 down が走り 全テーブルが消える。
 # 適用済みが 0 件のときは golang-migrate が "file does not exist" で exit 1 する
 # (steps 指定時は ErrNoChange に落ちないため)。冪等に叩くなら呼び出し側で吸収する。
 migrate-down: ## マイグレーションを 1 段階ロールバック
@@ -241,6 +453,16 @@ migrate-create: ## 新規マイグレーションファイルを作成
 
 # Docker
 ##@ Docker
+
+# 配信アセットの検証で url を読む先。operator が独自設定を置いていればそちら、
+# 無ければ image に焼き込まれる .example を見る (Dockerfile と同じ既定)。
+#
+# **`DOCKER_CONFIG` という名前にしてはいけない。** docker CLI が設定
+# ディレクトリとして読む予約名で、make は環境由来の変数を recipe へ export し
+# 直すため、operator の環境にそれがあると値を奪って `docker compose` 自体が
+# `unknown command` で死ぬ (このリポジトリの docker 系 target が全滅する)。
+ENTRY_CHECK_DOCKER_CONFIG=$(if $(wildcard .config/docker.yml),.config/docker.yml,.config/docker.yml.example)
+
 docker-build: ## Docker イメージをビルド
 	docker build -t mk-go .
 
@@ -401,7 +623,18 @@ dropin-frontend-swap-test: ## TS-A → mk-A 切替まで含む frontend e2e
 #
 # frontend e2e は Playwright に一本化した (#2437)。Cypress ラッパーは本家が
 # Cypress を廃止して参照先が消滅したため削除済み。spec は tests/playwright/。
-E2E_NODE_IMAGE=node:22-bookworm
+# **base image は upstream 自身の Dockerfile から取る (#2921)。**
+# `third_party/misskey/Dockerfile` の `ARG NODE_VERSION` は `26.4.0-trixie` の形で、
+# **版と distro の両方**を持つ。upstream がコンテナでビルドするときの組み合わせ
+# そのものなので、こちらで distro を決め打つより確か
+# (`docs/update/20260700diff.md` も「base image は submodule bump 時に要確認」と
+# 書いていた)。recipe の中で読む — `$(shell ...)` は使わない (260 行目の理由)。
+#
+# 以前は `node:22-bookworm` 固定で、CI が `.node-version` (Node 26) を使うのに
+# **本番のビルドだけ Node 22** という食い違いがあった。しかも `packages/backend` の
+# `engines.node` は `^22.22.2 || ...` で、node:22-bookworm の 22.22.2 は**下限
+# ちょうど**。upstream が下限を上げた瞬間に本番のビルドだけが engines で弾かれ、
+# CI は緑のまま気付けない。
 E2E_WORKDIR=/work
 
 # submodule を初期化し、Misskey 本家のフロントエンドソースを取得する。
@@ -419,10 +652,34 @@ e2e-submodule-init: ## submodule を初期化 (本家フロントエンドの取
 # REMOVE_MODULES_DIR_NO_TTY で abort する。CI=true で skip させる。
 # plugins を先に走らせる。生成物が無いとプラグインの frontend が取り込まれず、
 # backend にだけ入った片肺の状態になる (#2479)。
+# **corepack は使わない (#2921)。** Node.js 26 の配布物に corepack は含まれて
+# いない (`node:26-bookworm` で `command not found` を実測)。`.node-version` に
+# 追従して image を上げると同時に踏むので、`npm i -g pnpm@<packageManager>` に
+# 変えてある。**版は submodule の `packageManager` から取る** — CI は #2914 で
+# `pnpm/action-setup` + `package_json_file` に寄せてあり、これで両者が同じ
+# 定義を見る。
+#
+# **拾えなかったら落とす。** docker 側は空タグ (`node:`) なら
+# `invalid reference format` で落ちるので実は安全側だが、**pnpm 側は
+# `npm i -g pnpm@` が exit 0 で最新を入れてしまう** (実測)。ガードが効いている
+# のは pnpm 側で、黙って別の版でビルドするのを止めている。
+# **node_modules の ABI に注意。** このターゲットはコンテナの Node で
+# `node_modules` を作り直すが、同じ木を**ホストで動く target** も使う
+# (`frontend-check` / `frontend-lint` / `frontend-test` / `upstream-e2e-test`)。
+# ホストの Node が違う版だと、ABI 固定の native module (`re2`) が
+# NODE_MODULE_VERSION 不一致で落ちる。**ホストも `.node-version` に揃えるのが前提**
+# (devcontainer は postCreate.sh がそうする)。ずれた場合はホスト側で
+# `pnpm install` を流し直せば直る。
 e2e-frontend-build: plugins ## フロントエンドをビルド (本番の bind-mount 先を上書きするので注意)
+	@node_tag=$$(sed -n 's/^ARG NODE_VERSION=\(.*\)$$/\1/p' third_party/misskey/Dockerfile | head -1); \
+	pnpm_ver=$$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"pnpm@\([^"+]*\).*/\1/p' \
+		third_party/misskey/package.json | head -1); \
+	if [ -z "$$node_tag" ]; then echo "third_party/misskey/Dockerfile の ARG NODE_VERSION を読めない" >&2; exit 1; fi; \
+	if [ -z "$$pnpm_ver" ]; then echo "package.json の packageManager を読めない" >&2; exit 1; fi; \
+	echo "==> node:$$node_tag / pnpm@$$pnpm_ver でビルドする"; \
 	docker run --rm -e CI=true -v $(PWD):$(E2E_WORKDIR) -w $(E2E_WORKDIR)/third_party/misskey \
-		$(E2E_NODE_IMAGE) \
-		bash -lc "corepack enable && corepack prepare pnpm@latest --activate && pnpm install --frozen-lockfile && pnpm build"
+		"node:$$node_tag" \
+		bash -lc "npm i -g pnpm@$$pnpm_ver && pnpm install --frozen-lockfile && pnpm build"
 
 # UDS-only compose stack (Phase 12-2)。Phase 12-1 で入った UNIX domain socket
 # 対応を使って nginx → mk-go → postgres / valkey をすべて UDS で繋ぐ。
@@ -446,11 +703,34 @@ uds-init: | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS 構成を初期化
 # 既存 e2e-frontend-build のエイリアス (成果物先が同じなので共有して OK)。
 uds-frontend-build: e2e-frontend-build ## 本番向けフロントエンドをビルド (本番の配信物を差し替える)
 
+# revision は build-arg で渡す。**Dockerfile の中では git を呼べない** —
+# `.dockerignore` が `.git` を落とすので、コンテキストにリポジトリが入らない。
 uds-build: | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックのイメージをビルド
+	MKGO_COMMIT=$$(git rev-parse --short HEAD 2>/dev/null) \
+	MKGO_FRONTEND_VERSION=$$(git -C third_party/misskey describe --tags 2>/dev/null) \
 	docker compose -f $(UDS_COMPOSE) build
 
 uds-up: | $(UDS_COMPOSE) $(UDS_CONFIG) ## UDS スタックを起動
 	docker compose -f $(UDS_COMPOSE) up -d --build
+
+uds-rebuild: ## frontend と image をまとめてビルド (本番の配信物を差し替える)
+	$(MAKE) uds-frontend-build
+	$(MAKE) uds-build
+
+# up -d は image と設定が変わらなければコンテナを作り直さない。frontend は
+# bind mount なので、frontend だけ更新したときは mkgo が再起動されず、起動時に
+# キャッシュした古い entry を配り続ける (実体は新しいビルドで消えているので
+# 404、#2885)。restart を明示し、配信中の entry が実在するかまで確かめる。
+uds-restart: | $(UDS_COMPOSE) $(UDS_CONFIG) ## mkgo を再起動して配信アセットを検証
+	@before=$$(docker compose -f $(UDS_COMPOSE) ps -q mkgo 2>/dev/null); \
+	docker compose -f $(UDS_COMPOSE) up -d || exit 1; \
+	after=$$(docker compose -f $(UDS_COMPOSE) ps -q mkgo 2>/dev/null); \
+	if [ -n "$$before" ] && [ "$$before" = "$$after" ]; then \
+		docker compose -f $(UDS_COMPOSE) restart mkgo || exit 1; \
+	else \
+		printf "==> up -d が起動し直したので restart は省略\n"; \
+	fi
+	@./deploy/check-frontend-entry.sh $(UDS_CONFIG)
 
 uds-down: | $(UDS_COMPOSE) ## UDS スタックを停止
 	docker compose -f $(UDS_COMPOSE) down
@@ -489,8 +769,8 @@ bench-down: ## k6 ベンチのスタックを撤去
 bench-logs: ## k6 ベンチのログを表示
 	docker compose -f $(BENCH_COMPOSE) logs -f
 
-# Queue bench (#563): 3-way deliver/inbox throughput comparison across
-# Misskey TS (BullMQ), mk-go (asynq), mk-go (mkq).
+# Queue bench (#563): deliver/inbox throughput comparison between
+# Misskey TS (BullMQ) and mk-go (mkq). asynq driver は #2985 で削除。
 QUEUE_BENCH_COMPOSE=tests/queue-bench/docker-compose.queue-bench.yml
 
 queue-bench-up: ## queue-bench スタックを起動
@@ -499,8 +779,8 @@ queue-bench-up: ## queue-bench スタックを起動
 queue-bench-seed: ## queue-bench 用のデータを投入
 	# `--force-recreate` で seed container を毎回 fresh に作る (#1163)。
 	#
-	# `--no-deps` が要る。付けないと --force-recreate が依存 (app-asynq /
-	# app-mkq) まで作り直し、それらの IP が変わる。nginx の upstream は
+	# `--no-deps` が要る。付けないと --force-recreate が依存 (app-mkq /
+	# app-ts) まで作り直し、それらの IP が変わる。nginx の upstream は
 	# `server app-mkq:3000;` とホスト名で書かれていて **起動時に一度だけ**
 	# 名前解決するため、nginx は死んだ IP を掴んだまま 502 を返し続ける。
 	# seed の wait_health は例外にならない 502 を 240 秒受け取って
@@ -515,18 +795,54 @@ queue-bench-seed: ## queue-bench 用のデータを投入
 	docker compose -f $(QUEUE_BENCH_COMPOSE) --profile bench up --abort-on-container-exit --force-recreate --no-deps seed
 	# meta cache (5min TTL) が古い federation='none' を握っているので、seed
 	# 後に app コンテナを再起動して新しい meta.federation='all' を読ませる。
-	docker compose -f $(QUEUE_BENCH_COMPOSE) restart app-asynq app-mkq app-ts
+	docker compose -f $(QUEUE_BENCH_COMPOSE) restart --no-deps app-mkq app-ts
 	@echo "waiting for apps to become healthy after restart..."
 	@for i in $$(seq 1 60); do \
-		ASYNQ=$$(docker compose -f $(QUEUE_BENCH_COMPOSE) ps app-asynq --format json 2>/dev/null | grep -o '"Health":"healthy"' || true); \
 		MKQ=$$(docker compose -f $(QUEUE_BENCH_COMPOSE) ps app-mkq --format json 2>/dev/null | grep -o '"Health":"healthy"' || true); \
 		TS=$$(docker compose -f $(QUEUE_BENCH_COMPOSE) ps app-ts --format json 2>/dev/null | grep -o '"Health":"healthy"' || true); \
-		if [ -n "$$ASYNQ" ] && [ -n "$$MKQ" ] && [ -n "$$TS" ]; then \
-			echo "ready (asynq+mkq+ts all healthy)"; exit 0; \
+		if [ -n "$$MKQ" ] && [ -n "$$TS" ]; then \
+			echo "ready (mkq+ts all healthy)"; exit 0; \
 		fi; \
 		sleep 2; \
 	done; \
 	echo "warning: not all apps became healthy in time" >&2; exit 1
+	# **nginx も再起動する (#2917)。** `restart` はコンテナに IP を割り当て直し
+	# うるので、app 同士が IP を交換すると、upstream をホスト名で書いた nginx が
+	# **古いアドレスを掴んだまま相手側の app へ繋ぐ**。実測では nginx-ts が
+	# app-mkq に、nginx-mkq が app-ts に繋がり、Host が食い違って inbound が
+	# 全件 401 になっていた (9/4 から 6 夜連続で nightly が赤かった原因)。
+	# #2364 で seed の `--force-recreate` に `--no-deps` を足して依存の作り直しは
+	# 止めたが、**その次の restart は塞がっていなかった**。
+	#
+	# **app が healthy になってから restart する。** nginx は起動時に一度だけ
+	# 名前解決するので、app の IP が確定した後でなければ意味が無い。
+	docker compose -f $(QUEUE_BENCH_COMPOSE) restart --no-deps nginx-mkq nginx-ts
+	# **front が「生きているか」ではなく「自分の app に繋がっているか」を見る。**
+	# TCP connect や単なる 200 では足りない — 誤配線した front も listener は
+	# 生きていて、相手の app の応答を 200 で返す (#2917 の症状そのもの)。
+	# `/api/meta` の `uri` は config.url 由来なので、front ごとに期待する値が違う。
+	#
+	# network 名は project 名から決まるが、`COMPOSE_PROJECT_NAME` が compose の
+	# `name:` を上書きするので**実物から引く**。ハードコードすると、export して
+	# いる手元だけ「front が上がらない」と誤診する。
+	@echo "verifying each nginx front reaches its own app..."
+	@net=$$(docker inspect -f '{{range $$k, $$v := .NetworkSettings.Networks}}{{$$k}}{{end}}' \
+		$$(docker compose -f $(QUEUE_BENCH_COMPOSE) ps -q nginx-mkq)); \
+	if [ -z "$$net" ]; then echo "could not resolve the bench network" >&2; exit 1; fi; \
+	for i in $$(seq 1 30); do \
+		bad=""; \
+		for h in mk-mkq ts; do \
+			got=$$(docker run --rm --network "$$net" curlimages/curl:8.11.1 -sk --max-time 5 \
+				-X POST -H 'content-type: application/json' -d '{}' "https://$$h/api/meta" 2>/dev/null \
+				| grep -o '"uri":"[^"]*"' | head -1); \
+			if [ "$$got" != "\"uri\":\"https://$$h\"" ]; then bad="$$bad $$h(got=$$got)"; fi; \
+		done; \
+		if [ -z "$$bad" ]; then echo "ready (each front reaches its own app)"; exit 0; \
+		fi; \
+		sleep 2; \
+	done; \
+	echo "nginx fronts are not wired to their own apps:$$bad" >&2; \
+	echo "hint: nginx resolves its upstream once at startup (#2917)" >&2; exit 1
 
 queue-bench-outbound: ## queue-bench の outbound 計測
 	# queue-bench-seed と同じ理由で `--force-recreate` (#1163)。
@@ -612,7 +928,11 @@ playwright-ts-up: ## Playwright スタック (Misskey TS backend) を起動
 
 playwright-ts-test: ## Playwright spec を実行 (TS backend、upstream 追従時のみ)
 	# `playwright-test` と同じく `--build` で runner image を最新化する。
-	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test run --rm --build playwright-runner test $(PLAYWRIGHT_ARGS)
+	#
+	# **`specs/upstream` に絞る。** `specs/mkgo` は mk-go 独自機能の spec で、
+	# 公式 image に対しては通らない (README の「境界」を参照)。絞らないと
+	# TS backend 実行が mkgo 側の spec で落ちる。
+	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test run --rm --build playwright-runner test specs/upstream $(PLAYWRIGHT_ARGS)
 
 playwright-ts-down: ## Playwright TS スタックを撤去
 	docker compose -f $(PLAYWRIGHT_COMPOSE) -f $(PLAYWRIGHT_TS_OVERLAY) --profile test down -v
@@ -780,9 +1100,127 @@ limitspec-check: ## ページネーションの default / max の drift を検�
 
 # permission drift gate をローカルで実行する。mk-go の router middleware が
 # Misskey の requireAdmin/requireModerator/requireCredential より緩くないか検証。
+# TestOAuthKindDrift は別軸で、meta.kind (OAuth scope) の一致を見る。
+# **アクセス階層の gate では scope の取り違えを検出できない** (#2877)。
 perm-check: ## router middleware の権限が upstream より緩くないか検査
-	go test ./internal/entitycompat/... -run 'TestPermissionDrift|TestSecureDrift' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestPermissionDrift|TestSecureDrift|TestOAuthKindDrift' -count=1 -v
 
 .PHONY: wiring-check
 wiring-check: ## router で配線が必要なものが外れていないか検査
-	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired' -count=1 -v
+	go test ./internal/entitycompat/... -run 'TestTimelineTogglesAreWired|TestSecurityHeadersAreWired|TestCriticalWiringCountMatchesTable|TestInviteModeratorCheckerIsWired|TestPluginPeerBodyLimitIsWired|TestPluginPeerRateLimiterIsWired|TestAPICatchallIsWired|TestPluginJobQueuesAreWired|TestPluginPeerEnqueuerIsWired|TestReadAllNotificationsPusherIsWired|TestWebPushProducersAreWired|TestChatPusherIsWired|TestChartManagementLoggerIsResolvedAtWiring|TestNotificationPolicyResolverIsWired|TestAbuseReportInAppNotifierIsWired|TestNotificationModeratorCheckerIsWired|TestRemoteAbuseReportNotificationIsWired|TestAbuseReportLookupIsWired|TestNormalizeWiringKeepsStringLiteralSpacing|TestEmojiDecorationCacheIsWired|TestEmojiMutationsDropDecorationCache|TestApplicationReceivedNotificationIsWired|TestMediaProxyConcurrencyIsWired|TestCaptchaReloadIsWired|TestRoleInvalidationIsWired|TestCredentialRoutesWithoutScopeRejectAppTokens|TestAppTokenGateExemptHasNoDeadEntries|TestOutboundConstructorsReceiveSharedOptions|TestPeerJobEnvelopeTagIsStable|TestPrivilegedPolicyKeysMatchAdminRoutes|TestStripGoComments|TestCleanProcessorReceivesThePendingPruner|TestDriveUsageProviderIsWired|TestDriveUsageRouteIsRegistered|TestIPLogServiceIsWired|TestClientIPMiddlewareIsWired|TestSigninIPRecorderIsWired|TestIPAccountSearchRepoIsWired|TestIPAccountSearchRouteIsRegistered|TestIPRelatedAccountsRouteIsRegistered|TestIPLookupAuditIsWired|TestIPLookupLogRetentionIsWired|TestIPLookupLogRouteIsRegistered|TestIPLookupRoutesHaveRateLimits|TestRemoteStatsGateUsesFailClosedPredicate' -count=1 -v
+
+.PHONY: notiftype-check
+notiftype-check: ## 通知タイプの一覧が 1 箇所から導出されているか検査
+	go test ./internal/core/notification/ -run 'TestRegistryCoversEveryTypeConstant|TestRegistryKindsAreConsistent|TestMkGoTypesAreNotInUpstreamCoverage' -count=1 -v
+	go test ./internal/api/notifications/ -run 'TestTypeListsAreDerivedFromRegistry|TestExcludeAllUpstreamTypesCoversEverything' -count=1 -v
+
+.PHONY: migrationdoc-check
+migrationdoc-check: ## migration の本数を述べた doc が実態と合っているか検査
+	go test ./internal/entitycompat/... -run 'TestMigrationCountsInDocsMatchReality|TestNoopDownMigrationListMatchesReality|TestDestructiveMigrationTableRowsAreUnique' -count=1 -v
+
+.PHONY: mdtable-check
+mdtable-check: ## md の表の各行がヘッダと同じ列数か検査 (溢れたセルは描画時に捨てられる)
+	# GFM は溢れたセルを黙って捨てるので、ソースに書いた内容が GitHub 上で
+	# 読めなくなる。原因はほぼセル区切りとして働くパイプで、**コードスパンの
+	# 中でも働く** (`\|` へエスケープする)。#2930 で実際に踏んだ。
+	# **見るのは列数だけ。** 取りこぼす形はテストの doc コメントに明記してある。
+	go test ./internal/entitycompat/... -run 'TestMarkdownTablesDoNotDropContent' -count=1 -v
+
+.PHONY: submodulepin-check
+submodulepin-check: ## fork frontend の pin が doc / gitlink / bundled image で一致しているか検査
+	# submodule に commit して fork へ push したあと、親リポの gitlink を上げ
+	# 忘れる片側更新が実際に起きた (#2963)。doc には新しい tag を書き、fork の
+	# branch と tag も push 済みなのに gitlink だけ古い、という状態で CI 28
+	# チェックが全部緑のままマージされた。SHA で突き合わせるので submodule の
+	# checkout は要らない。
+	#
+	# 配る bundled image が焼き込む assets image の tag も同じ輪に入れてある
+	# (#3011)。古い tag でも image はビルドできるので CI は落ちず、配った先に
+	# だけ古い frontend が載る。実測で develop は 29 世代ずれていた (pin されていた
+	# `mk.0` から数えた間隔。数字付きの tag 30 個から 1 を引いた値で、英字付きを
+	# 含めると 62 個から 1 を引いて 61)。
+	go test ./internal/entitycompat/... -run 'TestSubmodulePinMatchesDoc|TestSubmodulePinTagMatchesTable|TestBundledAssetsPinMatchesDoc|TestAssetsPinScanners' -count=1 -v
+
+.PHONY: secretfield-check
+secretfield-check: ## モデルの秘密フィールドが json:"-" を保っているか検査
+	# モデルをそのまま JSON 化する経路があるので、`json:"-"` が唯一の防波堤に
+	# なっているフィールドがある。実測で model.User.Token のタグを外しても
+	# make gates も全テストも緑のままだった (native token が取れると、その
+	# ユーザーとして API を叩けるので権限ゲートを全て迂回できる)。
+	# 出してよいものは serializableSecretLike に理由付きで登録する。
+	go test ./internal/entitycompat/... -run 'TestScanSecretLikeFields|TestModelSecretFieldsAreNotSerialized|TestSerializableSecretLikeHasNoDeadEntries|TestModelJSONDoesNotContainSecrets|TestModelJSONKeepsAuditedFields' -count=1 -v
+
+.PHONY: ipshape-check
+ipshape-check: ## レスポンス / 連合の shape に IP が出ていないか検査
+	# #3066 の「IP 情報が一般ユーザー向け API や連合へ露出しない」を直接見る。
+	# 担保が shapecheck の golden 照合しか無く、additive な追加は素通りしていた。
+	# **AST で全 struct のタグを読む** — reflect で型を並べる形は `MeDetailed`
+	# (= /api/i) を落とし、入れ子や map の値型も辿れていなかった (実測)。
+	# 走査は entity / activitypub だけでなく api / server / stream も見る
+	# (handler が自分で宣言する response struct もそのまま wire の形になる)。
+	# 判定は語で見る。**切り方を片側に寄せると必ず穴が開く** — 大文字のたびに
+	# 割ると `lastIPs` が、割らないと `IPAddr` が素通りする (両方とも実測)。
+	go test ./internal/entitycompat/... -run 'TestResponseAndFederationShapesHaveNoIPField|TestIPShapeAllowlistMatchesExpected|TestPublicShapesDoNotReferenceIPBearingTypes|TestIPRefAllowlistMatchesExpected|TestIPBearingTypesPinsEveryBranch|TestTypeRefsResolvesNamedTypes|TestAllJSONKeysWalksNestedObjects|TestPublicShapesMarshalWithoutIP|TestScanJSONTagsCollectsWhatEncodingJSONEmits|TestCustomJSONMarshalersAreKnown|TestLooksLikeIPKey' -count=1 -v
+.PHONY: iprecord-check
+iprecord-check: ## 利用者の IP を記録する call site が allowlist の外に増えていないか検査
+	# #3105 の関連アカウント検索は `user_ip` の観測だけを見るので、**失敗した
+	# サインインの IP がそこに入ると第三者が他人の関連候補を作れる**。
+	# 「どこからも呼ばれていない」は構造的な性質で、endpoint ごとの振る舞い
+	# テストは叩いた経路しか見ない (実測で `SigninFlow` と signin-with-passkey に
+	# 記録を足す変異が素通りした)。
+	go test ./internal/entitycompat/... -run 'TestIPRecordCallSitesAreAllowlisted|TestRecordSuccessfulSigninCallSitesAreAllowlisted|TestPasskeyIPRecordComesAfterFailures' -count=1 -v
+
+.PHONY: sqlbind-check
+sqlbind-check: ## 値をクォート内へ差し込まずバインドしているか検査
+	# 列名やテーブル名の解決で fmt.Sprintf は要るので、書式を組むこと自体は残る。
+	# **書式動詞がクォートで開いたリテラルの内側に在る**形だけを禁じる。
+	# **「これは SQL か」は判定しない** — キーワードで判定すると両方向に壊れる。
+	# 普通の英文が部分一致で SQL 扱いされて事実と逆の診断が出る一方、
+	# `'%s'::varchar[]` のような断片はキーワードに当たらず収集すらされない (実測)。
+	# 書式は定数連結を畳んでから見る (折り返すと丸ごと検査対象から消えるため)。
+	# chart の unique 配列は別に名指しで見る。**ApplyDeltas が組む書式集合を
+	# そのまま pin する** — 「プレースホルダが在るか」はダミーの ? 1 つで満たせる。
+	go test ./internal/entitycompat/... -run 'TestSQLBindVerbDetectionShapes|TestSQLBindFoldsConcatenatedFormats|TestSQLBindNoVerbInsideQuotedLiteral|TestSQLBindChartUniqueArrayIsParameterised' -count=1 -v
+
+.PHONY: dockerignore-check
+dockerignore-check: ## .dockerignore がシークレットと利用者データを除外しているか検査
+	# .dockerignore は全 build context 共通なので、1 行落ちると全経路に同時に効く。
+	# #2942 で drive-files (既定の drive の置き場所) と operator-local な設定
+	# (.config/*.yml 等) が抜けていた。**配る image には入らない** (最終 stage が
+	# 明示パスの COPY しか持たないため) が、build context と builder stage の
+	# layer には入り、cache-to を設定していればキャッシュ経由で読める。
+	go test ./internal/entitycompat/... -run 'TestDockerignore' -count=1 -v
+
+.PHONY: pluginembed-check
+pluginembed-check: ## mk-go をビルドする Dockerfile が pluginbuild を go build より前に実行するか検査
+	# 組み込みを忘れた image は **エラーにならない** — plugins/ に置いたのに
+	# 入っていない mk-go が黙って出来る。#2940 で Dockerfile.bundled が実際に
+	# そうなっていた。生成が go build の後でも同じ結果になるので順序も見る。
+	# 検出は動詞 (go build / go install) と対象 (cmd/misskey / cmd/...) の共起で
+	# 行い、行継続は畳んでから判定する。組み込まない Dockerfile は理由付きで
+	# allowlist に登録する。
+	go test ./internal/entitycompat/... -run 'TestDockerfilesEmbedPlugins' -count=1 -v
+
+.PHONY: gaterun-check
+gaterun-check: ## gates の -run が名指しするテストが実在するか検査
+	go test ./internal/entitycompat/... -run 'TestGateRunPatternsResolve' -count=1 -v
+
+.PHONY: testflags-check
+testflags-check: ## make test が CI と同じテスト条件で走るか検査
+	go test ./internal/entitycompat/... -run 'TestMakeTestMatchesCIConditions|TestDocsQuoteTheCIShuffleSeed' -count=1 -v
+
+.PHONY: compose-check
+compose-check: ## 配布する compose にログの上限があるか検査
+	go test ./internal/entitycompat/... -run 'TestComposeServicesHaveLogLimits' -count=1 -v
+
+.PHONY: catalog-check
+catalog-check: ## システムカタログのクエリが schema で絞られているか検査
+	go test ./internal/entitycompat/... -run 'TestCatalogQueriesAreSchemaScoped|TestCatalogQueryGate_Predicates' -count=1 -v
+
+.PHONY: notfound-check
+notfound-check: ## repository の lookup error を種別を見ずに 4xx にしていないか検査
+	go test ./internal/entitycompat/... -run 'TestRepoErrorsAreNotCollapsed|TestScanCollapsedLookups|TestBodyReturnsNotFoundSentinel|TestNotFoundGateWalks' -count=1 -v
+
+.PHONY: nulparam-check
+nulparam-check: ## 列に入らない値 (NUL) が SQL の bind parameter に載らないか検査
+	go test ./internal/entitycompat/... -run 'TestCursorGuardsAreChecked|TestScanCursorGuards|TestCursorParamsAreNormalized|TestScanCursorParamBinders|TestRepositoryLookupsRejectUnstorableValues|TestScanRepoLookupGuards|TestLikePatternsRejectUnmatchableInput|TestScanLikePatternGuards' -count=1 -v

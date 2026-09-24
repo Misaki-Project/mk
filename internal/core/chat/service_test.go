@@ -3,12 +3,14 @@ package chat_test
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 
 	corechat "github.com/shiroha-a/mk/internal/core/chat"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +22,17 @@ import (
 // 呼ぶこと。既存呼び出しも段階的に置換していく方針。
 //
 // Deprecated: use testutil.NewMockChatRepository directly.
+// --- #2994: room は URI で指定する ---
+
+// testRemoteRoomHost is the origin host used by the remote-room fixtures.
+const testRemoteRoomHost = "remote.example"
+
+// remoteRoomURI builds the canonical AP URI a remote instance would use for
+// roomID. AP 経路の引数はすべてこれ (room id ではない)。
+func remoteRoomURI(roomID string) string {
+	return "https://" + testRemoteRoomHost + "/chat/rooms/" + roomID
+}
+
 func newFakeRepo() *testutil.MockChatRepository {
 	return testutil.NewMockChatRepository()
 }
@@ -80,6 +93,14 @@ func newSvc(t *testing.T) (*corechat.Service, *testutil.MockChatRepository, *cap
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechat.NewService(repo, idGen)
 	svc.SetStreamingPublisher(pub)
+	// push の body に fromUser を載せるため (#2840)。production は router が
+	// 同じものを配線する。
+	users := testutil.NewMockUserRepository()
+	for _, u := range []string{"alice", "bob", "carol"} {
+		name := u
+		users.Users[u] = &model.User{ID: u, Username: u, Name: &name}
+	}
+	svc.SetUserRepo(users)
 	return svc, repo, pub
 }
 
@@ -173,7 +194,7 @@ func TestCreateMessageViaAP_BlockedByRecipient(t *testing.T) {
 	svc.SetBlockingRepo(blocks)
 
 	remoteSender := &model.User{ID: "alice"}
-	_, err := svc.CreateMessageViaAP(context.Background(), "https://remote/notes/1", remoteSender, "bob", "hi")
+	_, err := svc.CreateMessageViaAP(context.Background(), "https://remote/notes/1", remoteSender, "bob", "hi", "")
 	assert.ErrorIs(t, err, corechat.ErrChatBlocked)
 	assert.Empty(t, pub.userCalls, "blocked inbound DM must not be persisted/published")
 }
@@ -270,7 +291,7 @@ func TestCreateMessageViaAP_PublishesNewChatMessageToLocalRecipient(t *testing.T
 	// Remote → local DM: fromUser は remote (host set)、toUserID はローカル。
 	remoteHost := "remote.example"
 	fromUser := &model.User{ID: "remote_user", Host: &remoteHost}
-	_, err := svc.CreateMessageViaAP(context.Background(), "https://remote.example/n/1", fromUser, "bob", "hello from remote")
+	_, err := svc.CreateMessageViaAP(context.Background(), "https://remote.example/n/1", fromUser, "bob", "hello from remote", "")
 	require.NoError(t, err)
 
 	main.mu.Lock()
@@ -464,6 +485,49 @@ func TestMarkReadByMessageID_Room(t *testing.T) {
 	assert.Equal(t, corechat.EventRead, pub.roomCalls[0].eventType)
 }
 
+// **当事者でなければ既読にできない。** 検査が無いと、非参加者が他人の reads を
+// 汚したうえ、購読側が閉じている topic に read イベントを注入できる。
+func TestMarkReadByMessageID_RequiresParticipation(t *testing.T) {
+	t.Run("DM の第三者", func(t *testing.T) {
+		svc, _, pub := newSvc(t)
+		msg, _ := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
+		pub.userCalls = nil
+
+		err := svc.MarkReadByMessageID(context.Background(), "carol", msg.ID)
+		assert.ErrorIs(t, err, corechat.ErrNotFound, "存在を秘匿するため not-found に倒す")
+		assert.Empty(t, pub.userCalls, "イベントを注入させない")
+	})
+	t.Run("room の非メンバー", func(t *testing.T) {
+		svc, repo, pub := newSvc(t)
+		seedRoom(t, repo, "r1", "alice", "bob")
+		msg, _ := svc.CreateMessageToRoom(context.Background(), "alice", "r1", "hi", "")
+		pub.roomCalls = nil
+
+		err := svc.MarkReadByMessageID(context.Background(), "carol", msg.ID)
+		assert.ErrorIs(t, err, corechat.ErrNotFound)
+		assert.Empty(t, pub.roomCalls)
+	})
+	t.Run("room の owner は membership 行が無くても既読にできる", func(t *testing.T) {
+		svc, repo, pub := newSvc(t)
+		seedRoom(t, repo, "r1", "alice", "bob")
+		msg, _ := svc.CreateMessageToRoom(context.Background(), "bob", "r1", "hi", "")
+		pub.roomCalls = nil
+
+		require.NoError(t, svc.MarkReadByMessageID(context.Background(), "alice", msg.ID))
+		assert.Len(t, pub.roomCalls, 1)
+	})
+}
+
+func TestLeaveRoom_MemberLeaves(t *testing.T) {
+	svc, repo, _ := newSvc(t)
+	seedRoom(t, repo, "r1", "alice", "bob")
+
+	require.NoError(t, svc.LeaveRoom(context.Background(), "bob", "r1"))
+
+	_, err := repo.FindMembership("bob", "r1")
+	assert.Error(t, err, "自分の membership は消える")
+}
+
 func TestMarkReadByMessageID_NotFound(t *testing.T) {
 	svc, _, _ := newSvc(t)
 	err := svc.MarkReadByMessageID(context.Background(), "bob", "ghost")
@@ -623,10 +687,71 @@ func TestReact_RoomPublishesReact(t *testing.T) {
 func TestUnreact_PublishesUnreact(t *testing.T) {
 	svc, repo, pub := newSvc(t)
 	to := "bob"
-	repo.Messages["m1"] = &model.ChatMessage{ID: "m1", FromUserID: "carol", ToUserID: &to}
-	require.NoError(t, svc.Unreact(context.Background(), "m1", &model.User{ID: "alice"}, "👍"))
+	repo.Messages["m1"] = &model.ChatMessage{
+		ID: "m1", FromUserID: "carol", ToUserID: &to,
+		Reactions: []string{"bob/👍"},
+	}
+	require.NoError(t, svc.Unreact(context.Background(), "m1", &model.User{ID: "bob"}, "👍"))
 	require.Len(t, pub.userCalls, 1)
 	assert.Equal(t, corechat.EventUnreact, pub.userCalls[0].eventType)
+}
+
+// **消えていないなら publish しない (#3037)。**
+//
+// 以前は無条件に publish していたので、**会話と無関係な利用者**が任意の
+// messageId を投げるだけでその DM / 部屋のストリームにイベントを注入でき、
+// `reaction` は利用者が決める文字列なのでそのまま相手の画面へ届いた。
+// `React` は参加者かどうかを 3 通りで検査するのに、こちらは何も見ていなかった。
+func TestUnreact_NonParticipantCannotInjectEvent(t *testing.T) {
+	to := "bob"
+
+	for _, tt := range []struct {
+		name      string
+		reactions []string
+		actor     string
+		reaction  string
+	}{
+		{"会話と無関係な利用者", []string{"bob/👍"}, "mallory", "👍"},
+		// 参加者でも、付けていないリアクションは消えないので publish しない。
+		{"付けていないリアクション", []string{"bob/👍"}, "bob", "🎉"},
+		{"リアクションが 1 つも無い", nil, "bob", "👍"},
+		// **任意の文字列を流し込めない。** 消せるのは実際に保存されている
+		// `<自分の ID>/<reaction>` だけ。
+		{"任意の文字列", []string{"bob/👍"}, "mallory", "<script>alert(1)</script>"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, repo, pub := newSvc(t)
+			repo.Messages["m1"] = &model.ChatMessage{
+				ID: "m1", FromUserID: "carol", ToUserID: &to,
+				Reactions: tt.reactions,
+			}
+
+			require.NoError(t, svc.Unreact(context.Background(), "m1", &model.User{ID: tt.actor}, tt.reaction))
+			assert.Empty(t, pub.userCalls, "何も消えていないのにイベントを流している")
+			assert.Empty(t, pub.roomCalls)
+		})
+	}
+}
+
+// room 側も同じ。
+func TestUnreact_RoomPublishesOnlyWhenRemoved(t *testing.T) {
+	room := "r1"
+
+	svc, repo, pub := newSvc(t)
+	repo.Rooms["r1"] = &model.ChatRoom{ID: "r1", OwnerID: "alice"}
+	repo.Messages["m1"] = &model.ChatMessage{
+		ID: "m1", FromUserID: "carol", ToRoomID: &room,
+		Reactions: []string{"alice/👍"},
+	}
+
+	// 非メンバーが投げても何も起きない。
+	require.NoError(t, svc.Unreact(context.Background(), "m1", &model.User{ID: "mallory"}, "👍"))
+	assert.Empty(t, pub.roomCalls)
+
+	// 自分が付けたものは消せて、そのときだけ publish される。
+	require.NoError(t, svc.Unreact(context.Background(), "m1", &model.User{ID: "alice"}, "👍"))
+	require.Len(t, pub.roomCalls, 1)
+	assert.Equal(t, corechat.EventUnreact, pub.roomCalls[0].eventType)
 }
 
 func TestReact_MessageNotFound(t *testing.T) {
@@ -750,9 +875,19 @@ func TestUnreact_NormalizesVariationSelector(t *testing.T) {
 	// VS 付き ❤️ (raw) で unreact → 正規化されて同じ "bob/❤" key で array_remove。
 	require.NoError(t, svc.Unreact(context.Background(), "m1", &model.User{ID: "bob"}, "❤️"))
 	require.Contains(t, repo.RemovedReactions, "bob/❤", "VS strip した key で array_remove する")
+	// **`unreact` イベントを名指しで取る (#3037 レビュー)。** 末尾を見る形だと、
+	// unreact が publish されなくなっても react の同じ値でアサーションが通り、
+	// 検査が黙って空虚になる。
+	var unreact *userCall
+	for i := range pub.userCalls {
+		if pub.userCalls[i].eventType == corechat.EventUnreact {
+			unreact = &pub.userCalls[i]
+		}
+	}
+	require.NotNil(t, unreact, "unreact が publish されていない")
+	body, ok := unreact.body.(map[string]any)
+	require.True(t, ok)
 	// stream event も正規化済 reaction で publish。
-	last := pub.userCalls[len(pub.userCalls)-1]
-	body := last.body.(map[string]any)
 	assert.Equal(t, "❤", body["reaction"])
 }
 
@@ -773,4 +908,295 @@ func TestCanViewRoomTimeline_ModeratorBypass(t *testing.T) {
 	ok3, err := svc.CanViewRoomTimeline("alice", "r1")
 	require.NoError(t, err)
 	assert.True(t, ok3, "owner は moderator でなくても購読可")
+}
+
+// --- newChatMessage の Web Push (#2840) ---
+
+// stubChatPusher captures PushNewChatMessage calls.
+type stubChatPusher struct {
+	mu    sync.Mutex
+	calls []chatPushCall
+}
+
+type chatPushCall struct {
+	userID string
+	body   map[string]any
+}
+
+func (p *stubChatPusher) PushNewChatMessage(userID string, body map[string]any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, chatPushCall{userID, body})
+}
+
+func (p *stubChatPusher) recipients() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.calls))
+	for _, c := range p.calls {
+		out = append(out, c.userID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mainRecipients returns the users that received a newChatMessage main event.
+func (p *stubMainPublisher) mainRecipients() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.calls))
+	for _, c := range p.calls {
+		if c.eventType == "newChatMessage" {
+			out = append(out, c.userID)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// 1:1 チャットで main stream と Web Push が**対で**飛ぶ (#2840)。
+//
+// upstream ChatService.ts は publish と push を必ず同じ場所で対にしている。
+// 片方だけになると、タブを閉じている利用者に通知が届かない。
+func TestCreateMessageToUser_PushesNewChatMessage(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	main := &stubMainPublisher{}
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(main)
+	svc.SetChatPusher(push)
+
+	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"bob"}, push.recipients(), "recipient にだけ push する")
+	// **publish と push の宛先が一致すること。**
+	assert.Equal(t, main.mainRecipients(), push.recipients())
+
+	// **SW が無条件に参照するフィールドが body に載っていること。**
+	// packages/sw/src/scripts/create-notification.ts の newChatMessage 分岐は
+	// `fromUser.name` / `fromUser.avatarUrl` を読む。無いと TypeError で
+	// **通知が 1 件も出ない** (publish 側は body を読まないので気付けない)。
+	require.Len(t, push.calls, 1)
+	from, ok := push.calls[0].body["fromUser"].(map[string]any)
+	require.True(t, ok, "fromUser が無い: %v", push.calls[0].body)
+	assert.Equal(t, "alice", from["id"])
+	assert.Contains(t, from, "name")
+	assert.Contains(t, from, "avatarUrl")
+	assert.Contains(t, push.calls[0].body, "text")
+}
+
+// room チャットでも sender 以外の全員に対で飛ぶ (#2840)。
+func TestCreateMessageToRoom_PushesNewChatMessage(t *testing.T) {
+	svc, repo, _ := newSvc(t)
+	// owner=alice, members=bob,carol。sender=bob なら alice と carol に届く。
+	seedRoom(t, repo, "r1", "alice", "bob", "carol")
+	main := &stubMainPublisher{}
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(main)
+	svc.SetChatPusher(push)
+
+	_, err := svc.CreateMessageToRoom(context.Background(), "bob", "r1", "hi", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"alice", "carol"}, push.recipients(), "sender (bob) には push しない")
+	assert.Equal(t, main.mainRecipients(), push.recipients())
+
+	// **room では toRoom が要る。** 無いと SW が DM 分岐に落ち、tag が
+	// chat:room:<id> ではなく chat:user:<senderId> になって別 room の通知が
+	// 同じ tag で潰れる。
+	require.NotEmpty(t, push.calls)
+	room, ok := push.calls[0].body["toRoom"].(map[string]any)
+	require.True(t, ok, "toRoom が無い: %v", push.calls[0].body)
+	assert.Equal(t, "r1", room["id"])
+	assert.Contains(t, room, "name")
+	require.Contains(t, push.calls[0].body, "fromUser")
+}
+
+// mute した member には push しない (#2840)。
+//
+// upstream ChatService.ts は `if (membership.isMuted) continue;` で marker を
+// 張らず publish も push も行かない。Web Push を足すと、**利用者が明示的に
+// 切った設定が OS 通知として破られる**。
+func TestCreateMessageToRoom_SkipsMutedMembers(t *testing.T) {
+	svc, repo, _ := newSvc(t)
+	seedRoom(t, repo, "r1", "alice", "bob", "carol")
+	repo.Memberships["carol:r1"].IsMuted = true
+	main := &stubMainPublisher{}
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(main)
+	svc.SetChatPusher(push)
+
+	_, err := svc.CreateMessageToRoom(context.Background(), "bob", "r1", "hi", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"alice"}, push.recipients(), "mute した carol に push している")
+	assert.Equal(t, []string{"alice"}, main.mainRecipients(), "publish も揃えること")
+}
+
+// AP 受信の DM 経路でも push する (#2840)。
+//
+// mk-go は upstream に無い AP 受信経路を持つ (chat 連合は cherrypick 由来)。
+// **ここが抜けると、リモートからの DM だけ通知が来ない。**
+func TestCreateMessageViaAP_PushesNewChatMessage(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	main := &stubMainPublisher{}
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(main)
+	svc.SetChatPusher(push)
+	sender := &model.User{ID: "remote1", Username: "remote1"}
+
+	_, err := svc.CreateMessageViaAP(context.Background(),
+		"https://remote.example/chat-messages/1", sender, "local1", "hi", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"local1"}, push.recipients())
+	assert.Equal(t, main.mainRecipients(), push.recipients())
+	require.Len(t, push.calls, 1)
+	from, ok := push.calls[0].body["fromUser"].(map[string]any)
+	require.True(t, ok, "fromUser が無い: %v", push.calls[0].body)
+	assert.Equal(t, "remote1", from["id"])
+}
+
+// pusher 未配線でも落ちない (テスト構成や read-only 構成)。
+func TestCreateMessageToUser_NoPusherIsNoop(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	svc.SetMainStreamPublisher(&stubMainPublisher{})
+
+	_, err := svc.CreateMessageToUser(context.Background(), "alice", "bob", "hi", "")
+	assert.NoError(t, err)
+}
+
+// owner は membership 行が mute でも受け取る (#2840)。
+//
+// **これは 3 周目のレビューで元に戻した判断。** 2 周目で「mute した owner を
+// 除外する」形にしたが、mk-go の読み取り側と矛盾していた —
+// packRoomDetailed は owner に `isMuted: false` を固定で返し
+// (`api/chat/handler.go` の `meID != r.OwnerID` ガード)、フロントは owner に
+// ミュートのスイッチを出さない (`room.info.vue` の `v-if="!isOwner"`)。
+//
+// owner は membership 行を持たない (#2858 で transfer-ownership も行を入れ替える)
+// ので通常は読む先が無いが、不整合データで行が残っていた場合にここだけ mute を
+// 尊重すると、**API もフロントも「ミュートしていない」と表示するのに通知だけ
+// 来ない**状態になり原因に辿り着けない。
+// upstream も `concat({isMuted: false})` で owner を never-muted 扱いする。
+func TestCreateMessageToRoom_OwnerIsNeverMuted(t *testing.T) {
+	svc, repo, _ := newSvc(t)
+	seedRoom(t, repo, "r1", "alice", "alice", "carol")
+	repo.Memberships["alice:r1"].IsMuted = true
+	main := &stubMainPublisher{}
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(main)
+	svc.SetChatPusher(push)
+
+	_, err := svc.CreateMessageToRoom(context.Background(), "carol", "r1", "hi", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"alice"}, push.recipients(), "owner を mute 扱いで落としている")
+	assert.Equal(t, []string{"alice"}, main.mainRecipients())
+}
+
+// owner が membership 行を持たない通常構成でも届く。
+//
+// **上の OwnerIsNeverMuted と対で意味を持つ。** owner の seed を丸ごと消す
+// 直し方を弾く。
+func TestCreateMessageToRoom_UnmutedOwnerStillReceives(t *testing.T) {
+	svc, repo, _ := newSvc(t)
+	seedRoom(t, repo, "r1", "alice", "carol")
+	main := &stubMainPublisher{}
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(main)
+	svc.SetChatPusher(push)
+
+	_, err := svc.CreateMessageToRoom(context.Background(), "carol", "r1", "hi", "")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"alice"}, push.recipients())
+}
+
+// AP 受信の room 経路でも sender を渡す (#2840)。
+//
+// **remote sender は user 表に居ないことがある** (viaRelay の ephemeral actor は
+// DB に載らない)。repo から引き直す実装だと fromUser が nil になり、push が
+// 丸ごと落ちて「リモートの room メッセージだけ通知が来ない」になる。
+func TestCreateRoomMessageViaAP_PushesNewChatMessage(t *testing.T) {
+	svc, repo, _ := newSvc(t)
+	// 取り込んだリモート room に remote sender が投げる形 (#2994 以降、AP 経路の
+	// room 指定は URI)。
+	roomURI := seedRemoteRoom(t, repo, "r1", "alice")
+	repo.Memberships["carol:r1"] = &model.ChatRoomMembership{UserID: "carol", RoomID: "r1"}
+	repo.Memberships["remote1:r1"] = &model.ChatRoomMembership{UserID: "remote1", RoomID: "r1"}
+	main := &stubMainPublisher{}
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(main)
+	svc.SetChatPusher(push)
+	// **userRepo に居ない** remote actor。
+	sender := &model.User{ID: "remote1", Username: "remote1"}
+
+	require.NoError(t, svc.CreateRoomMessageViaAP(
+		"https://remote.example/chat-messages/2", sender, roomURI, "hi", ""))
+
+	assert.ElementsMatch(t, []string{"alice", "carol"}, push.recipients())
+	require.NotEmpty(t, push.calls)
+	from, ok := push.calls[0].body["fromUser"].(map[string]any)
+	require.True(t, ok, "fromUser が無い: %v", push.calls[0].body)
+	assert.Equal(t, "remote1", from["id"])
+}
+
+// sender を解決できないときは push しない (#2840)。
+//
+// **fromUser の無い body は SW を TypeError で落とす。** 通知が出ないうえに
+// push の枠だけ消費するので、無通知に倒すほうが安全。ここでは userRepo が
+// 未配線の構成と、lookup が error を返す構成の両方を見る。
+func TestCreateMessageToUser_UnresolvedSenderSkipsPush(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		users repository.UserRepository
+	}{
+		{name: "repo unwired", users: nil},
+		{name: "lookup fails", users: &failingUserRepo{MockUserRepository: testutil.NewMockUserRepository()}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _, _ := newSvc(t)
+			svc.SetUserRepo(tt.users)
+			main := &stubMainPublisher{}
+			push := &stubChatPusher{}
+			svc.SetMainStreamPublisher(main)
+			svc.SetChatPusher(push)
+
+			_, err := svc.CreateMessageToUser(context.Background(), "bob", "alice", "hi", "")
+			require.NoError(t, err)
+
+			assert.Empty(t, push.recipients(), "sender 不明でも push している")
+			// **publish は止めない。** アプリ内の未読は body を読まないので出せる。
+			assert.Equal(t, []string{"alice"}, main.mainRecipients())
+		})
+	}
+}
+
+// 添付のみのメッセージでも text キーを落とさない (#2840)。
+//
+// SW は `${name}: ${body.text}` を無条件に組むので、キーが無いと通知本文が
+// 「alice: undefined」になる。upstream は null を送る。
+func TestCreateMessageToUser_PushKeepsNullText(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	push := &stubChatPusher{}
+	svc.SetMainStreamPublisher(&stubMainPublisher{})
+	svc.SetChatPusher(push)
+
+	_, err := svc.CreateMessageToUser(context.Background(), "bob", "alice", "", "f1")
+	require.NoError(t, err)
+
+	require.Len(t, push.calls, 1)
+	text, ok := push.calls[0].body["text"]
+	require.True(t, ok, "text キーが無い: %v", push.calls[0].body)
+	assert.Nil(t, text)
+}
+
+// failingUserRepo makes FindByID fail so senderForPush returns nil.
+type failingUserRepo struct {
+	*testutil.MockUserRepository
+}
+
+func (f *failingUserRepo) FindByID(string) (*model.User, error) {
+	return nil, errors.New("db down")
 }

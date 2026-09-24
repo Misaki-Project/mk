@@ -228,7 +228,7 @@ func (p *InboxProcessor) SetSignatureCapabilityRecorder(r SignatureCapabilityRec
 // Handle dispatches a single inbox task. driver runtime invokes this for
 // every dequeued task.
 //
-// payload decode 失敗は再 retry しても無意味なので driver.SkipRetry で
+// payload decode 失敗は再 retry しても無意味なので driver.ErrSkipRetry で
 // 確定 fail にする。worker 側の verify 失敗 / host block も retry せず
 // silently drop する (sender に retry 要求しても解決しないため)。
 // federation.ErrUnsupportedActivity は handler 不在 (= 受け付けたが何も
@@ -274,7 +274,7 @@ func (p *InboxProcessor) recordInboxTelemetry(host string, class deliveryhealth.
 func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 	payload, err := queue.DecodeInboxPayload(t.Payload())
 	if err != nil {
-		return fmt.Errorf("decode inbox payload: %w: %w", err, driver.SkipRetry)
+		return fmt.Errorf("decode inbox payload: %w: %w", err, driver.ErrSkipRetry)
 	}
 
 	// payload に Headers が含まれている = #565 の fast-write handler から
@@ -308,6 +308,16 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 	activityID := ""
 	if len(payload.Headers) > 0 && p.verifier != nil {
 		actor, keyType, err := p.verifyPayload(payload)
+		if errors.Is(err, federation.ErrLookupUnavailable) {
+			// **「確かめられなかった」は ack しない** (#3121)。署名が合わない body を
+			// retry しても結果は変わらないので既定は ack だが、検証は DB も読むので
+			// **DB 障害のあいだに届いた activity まで同じ ack に落ちる**。相手の
+			// 再送は当てにできない (inbox は enqueue した時点で 202 を返す)。
+			slog.Error("inbox: cannot verify signature (verification unavailable)",
+				"host", host, "err", err)
+			p.recordInboxTelemetry(host, deliveryhealth.ClassProcessingError, started, err.Error())
+			return err
+		}
 		if err != nil {
 			slog.Warn("inbox: signature verification failed in worker",
 				"host", host, "err", err)
@@ -335,6 +345,17 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 		// body actor を認証している場合のみ許可する。LD-Signature の hardening
 		// (forbidden directive 等) も本 gate に集約する。
 		if fields, err := p.authorizeActor(payload.Body, actor); err != nil {
+			if errors.Is(err, federation.ErrLookupUnavailable) {
+				// **ここも ack しない** (#3121)。転送 activity の認可は
+				// LD-Signature の creator を `ResolveActor` で解決し、その鍵を
+				// DB から引くので、**署名検証と同じだけ DB を読む**。理由を
+				// 見ずに drop すると、DB 障害のあいだリレー経由の配送が
+				// まるごと消える。
+				slog.Error("inbox: cannot authorize actor (lookup unavailable)",
+					"host", host, "signer", signerURIOf(actor), "err", err)
+				p.recordInboxTelemetry(host, deliveryhealth.ClassProcessingError, started, err.Error())
+				return err
+			}
 			// **payload.Host を出さない。** これは常に空 (リクエストの Host
 			// ヘッダはこちらのホスト名なので送信元を表さず、handler も設定
 			// しない)。署名の keyId から導いた host は既に上で計算済みなので
@@ -372,6 +393,14 @@ func (p *InboxProcessor) Handle(_ context.Context, t driver.Task) error {
 		// 署名者照合はできないが、body に LD-Signature があれば従来どおり検証して
 		// hardening を効かせる (#1164 Phase D)。fail なら drop。
 		if err := p.ldVerifier.VerifyIfPresent(payload.Body); err != nil {
+			if errors.Is(err, federation.ErrLookupUnavailable) {
+				// 上と同じ (#3121)。creator の鍵は DB から引くので、理由を
+				// 見ずに drop すると DB 障害のあいだ届いた activity が消える。
+				slog.Error("inbox: cannot verify LD-Signature (lookup unavailable)",
+					"host", host, "err", err)
+				p.recordInboxTelemetry(host, deliveryhealth.ClassProcessingError, started, err.Error())
+				return err
+			}
 			slog.Warn("inbox: LD-Signature verification failed, dropping activity",
 				"host", host, "err", err)
 			p.recordInboxTelemetry(host, deliveryhealth.ClassLDSignatureFailed, started, err.Error())
@@ -551,6 +580,20 @@ func (p *InboxProcessor) authorizeActor(body []byte, signer *model.User) (federa
 	}
 	if ldURI == "" || ldURI != bodyActor {
 		return fields, fmt.Errorf("ld-signature signer %q != activity.actor %q", ldURI, bodyActor)
+	}
+	// **転送された actor 側の連合可否も見る。**
+	//
+	// ブロック判定 (`isBlocked`) は HTTP 署名者にしか掛かっていなかった。
+	// 第三者 (リレー等) が転送すると、`blockedHosts` に入れたホストの actor でも
+	// LD-Signature が有効なら処理される。`Announce` / `Like` / `Follow` /
+	// `Block` / `Flag` / `Move` / chat がそのまま通り、defederation が素通りする。
+	// `resolveActorOnceWithID` は DB に行があれば連合ゲートの手前で返すので、
+	// 「一度連合してから defederate した」相手には届く。
+	//
+	// upstream は署名者側 (`InboxProcessorService.ts:76-80`) と LD-Signature 側
+	// (`:207-211`) の 2 箇所で `isFederationAllowedHost` を見る。
+	if p.isBlocked(ldUser) {
+		return fields, fmt.Errorf("blocked ld-signature actor host: %q", ldURI)
 	}
 	return fields, nil
 }

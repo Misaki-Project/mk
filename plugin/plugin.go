@@ -23,6 +23,7 @@ package plugin
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"sync"
 )
@@ -75,7 +76,39 @@ type Definition struct {
 	// **宣言したものだけが nodeinfo に出る。** 入れているプラグインを全部
 	// 晒すと、運営者がどんな拡張を使っているかが攻撃面の情報になる。
 	// 連合しないプラグインは名前も出さない。
+	//
+	// **[Definition.Routes] は要らない。** 受信の受け口は Peered だけで張る
+	// ので、ジョブしか持たないプラグインでも受け取れる (#2822)。
 	Peered bool
+
+	// Peer registers the plugin's peer handlers. Called in every process,
+	// regardless of role. May be nil.
+	//
+	// **ここで登録する (#2819)。** 送信の再送はキューに載るので、実際に POST
+	// するのは queue ロールのプロセスになる。[Peer.OnReply] を Routes の中で
+	// 登録していると、ロールを分割した構成で応答が届かない。[Peer.Handle] も
+	// 同じ理由でここへ置く。
+	//
+	// 呼ばれる順は Migrations の後、EffectivePolicies / Routes / Jobs より前。
+	// Routes / Jobs とは別の (ロールを見ない) 段階で呼ばれる。
+	Peer func(Context, Peer) error
+
+	// PeerMaxBody caps the peer request and reply body this plugin accepts,
+	// in bytes. 0 uses the host default.
+	//
+	// **上限はプラグインごとに決める。** 小さな値をやりとりするプラグインの
+	// ために、インスタンス全体で大きな本文を受けられる状態にしておく理由が
+	// 無い。ここで宣言した値が「読む前」の上限になるので、宣言を小さくした
+	// 分だけ外から押し込める量が減る。
+	//
+	// **本文はエンベロープ込みで測る。** payload に使えるのはこの値から
+	// 相関 ID の分 (aidx なら 36 バイト) を引いた残り。
+	//
+	// **単独で広げられるのは既定値まで。** それより大きい宣言は、運営者が
+	// 設定で許可したときだけ有効になる (許可が無ければ既定値に丸めて warn を
+	// 出す)。プラグインを 1 つ足しただけでインスタンスの露出が広がる形に
+	// しないため。詳細は docs/plugin-peer-protocol.md。
+	PeerMaxBody int64
 
 	// EffectivePolicies declares effective-policy contributions. The host calls
 	// it after Migrations and before any Routes or Jobs callback.
@@ -94,8 +127,19 @@ func (d Definition) Validate() error {
 		return fmt.Errorf("plugin %q: APIVersion %d はこの mk-go (APIVersion %d) と互換がありません",
 			d.Name, d.APIVersion, APIVersion)
 	}
-	if d.Routes == nil && d.Jobs == nil && d.EffectivePolicies == nil {
-		return fmt.Errorf("plugin %q: Routes も Jobs も EffectivePolicies も設定されていません", d.Name)
+	if d.PeerMaxBody < 0 {
+		return fmt.Errorf("plugin %q: PeerMaxBody が負の値です", d.Name)
+	}
+	if d.PeerMaxBody > 0 && !d.Peered {
+		// 宣言しても効かない組み合わせ。黙って無視すると「上限を設定した
+		// つもり」で通ってしまう。
+		return fmt.Errorf("plugin %q: PeerMaxBody を指定するなら Peered も立てること", d.Name)
+	}
+	if d.Peer != nil && !d.Peered {
+		return fmt.Errorf("plugin %q: Peer を指定するなら Peered も立てること", d.Name)
+	}
+	if d.Routes == nil && d.Jobs == nil && d.EffectivePolicies == nil && d.Peer == nil {
+		return fmt.Errorf("plugin %q: Routes も Jobs も EffectivePolicies も Peer も設定されていません", d.Name)
 	}
 	return nil
 }
@@ -175,11 +219,35 @@ type Context interface {
 	// Config returns this plugin's settings from the instance configuration.
 	Config() Config
 
+	// Queue enqueues jobs onto this plugin's own queue.
+	//
+	// [Jobs.Handle] で登録した名前を使う。**Routes からも Jobs からも呼べる**
+	// ので、HTTP ハンドラの中で重い処理を後回しにできる。
+	Queue() Queue
+
 	// Peer returns the channel to the same plugin on other mk-go instances.
 	//
 	// [Definition.Peered] を立てていない場合、呼び出しはエラーを返す
 	// (nil は返さないので、nil チェックは要らない)。
 	Peer() Peer
+
+	// HTTP returns an HTTP client wired with the instance's outbound policy.
+	//
+	// **自分で `&http.Client{}` を作らないこと。** この client は
+	//
+	//   - SSRF ガード (プライベート IP / 非 http(s) への接続を落とす)
+	//   - 運営者の `proxy` / `outgoingAddress` / `outgoingAddressFamily`
+	//   - 送信の timeout
+	//
+	// を既に持っている。素の client を使うと、運営者が proxy を設定していても
+	// **そのプラグインだけがサーバーの素の IP で外へ出る**。
+	//
+	// **Transport を差し替えないこと。** 差し替えると上の 2 つが消える。
+	// per-request の timeout は `http.NewRequestWithContext` で付ける。
+	//
+	// これはセキュリティ境界ではない (パッケージの doc を参照) — プラグインは
+	// `net/http` を直接使えるので、これは「間違えにくい既定」を配るもの。
+	HTTP() *http.Client
 
 	// Go runs fn in a new goroutine, recovering panics.
 	//

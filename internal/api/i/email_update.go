@@ -3,12 +3,15 @@ package i
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	coreemail "github.com/shiroha-a/mk/internal/core/email"
+	"github.com/shiroha-a/mk/internal/l10n"
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -56,11 +59,23 @@ func (h *Handler) UpdateEmail(c echo.Context) error {
 	// なら token 必須。mk-go では旧来 password だけで通っていたため、
 	// password 漏洩 = 2FA bypass で email 乗っ取り → password reset で
 	// account takeover まで到達可能だった (drop-in regression、認証強度
-	// として最も影響が大きい経路の 1 つ)。verify2FAToken 経由なので
+	// として最も影響が大きい経路の 1 つ)。check2FAToken 経由なので
 	// replay 保護も自動で効く。
-	if profile.TwoFactorEnabled && !h.verify2FAToken(c.Request().Context(), profile, req.Token) {
-		return c.JSON(http.StatusForbidden, apierr.InvalidToken())
+	// **消費は password が通ってから確定させる** (#2852)。検証と同時に焼くと、
+	// password を打ち間違えるだけでバックアップコードが 1 枚減る。
+	var use twoFAUse
+	if profile.TwoFactorEnabled {
+		var ok bool
+		if use, ok = h.check2FAToken(c.Request().Context(), profile, req.Token); !ok {
+			return c.JSON(http.StatusForbidden, apierr.InvalidToken())
+		}
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			use.Rollback()
+		}
+	}()
 
 	// パスワード検証。upstream Misskey TS は ApiError(meta.errors.incorrectPassword)
 	// を framework が 400 (= client error) に変換する (#885)。mk-go も
@@ -96,6 +111,21 @@ func (h *Handler) UpdateEmail(c echo.Context) error {
 				}
 			}
 		}
+		// **確認済みの重複を弾く。** 他人が確認済みのアドレスを設定できると、
+		// 確認メールがその相手に飛び、相手が (自分宛だと思って) リンクを踏むと
+		// `/api/verify-email` は未認証・コードのみで照合するため**こちら側の
+		// プロフィール**が確認済みになる。以後そのアドレスに攻撃者アカウントの
+		// 通知が届き、アビューズ調査でアドレスが一意識別子として使えなくなる。
+		if h.userRepo != nil {
+			inUse, ierr := h.userRepo.EmailVerifiedInUse(addr)
+			if ierr != nil {
+				slog.Error("i/update-email: cannot check whether the email is in use", "err", ierr)
+				return apierr.JSONInternalError(c)
+			}
+			if inUse {
+				return c.JSON(http.StatusBadRequest, apierr.Error("UNAVAILABLE", "Email is not available.", "a2defefb-f220-8849-0af6-17f816099323"))
+			}
+		}
 		fields["email"] = addr
 
 		// 確認コード生成 + メール送信
@@ -103,16 +133,24 @@ func (h *Handler) UpdateEmail(c echo.Context) error {
 		fields["emailVerifyCode"] = code
 
 		if h.emailSender != nil {
-			lead := "Click the link to verify your email:"
-			text, bodyHTML := coreemail.LinkText(lead, "Verify email", h.verifyURL(code))
+			var metaLangs []string
+			if h.metaRepo != nil {
+				if m, err := h.metaRepo.Fetch(); err == nil {
+					metaLangs = l10n.LangsFromMeta(m)
+				}
+			}
+			lang := l10n.Resolve(profile.Lang, metaLangs)
+			subject, lead, linkLabel := l10n.VerifyEmail(lang)
+			text, bodyHTML := coreemail.LinkText(lead, linkLabel, h.verifyURL(code))
 			html := coreemail.WrapHTML(coreemail.HTMLWrapInput{
-				SiteURL:          h.serverURL,
-				Subject:          "Verify your email",
-				EmailSettingsURL: h.serverURL + "/settings/email",
-				BodyHTML:         bodyHTML,
+				SiteURL:            h.serverURL,
+				Subject:            subject,
+				EmailSettingsURL:   h.serverURL + "/settings/email",
+				EmailSettingsLabel: l10n.EmailSettingsLabel(lang),
+				BodyHTML:           bodyHTML,
 			})
 			go h.emailSender(addr, miscsmtp.Message{
-				Subject: "Verify your email",
+				Subject: subject,
 				Text:    text,
 				HTML:    html,
 			})
@@ -123,6 +161,9 @@ func (h *Handler) UpdateEmail(c echo.Context) error {
 		return apierr.JSONInternalError(c)
 	}
 
+	// **profile を書き換えられてから確定する** (#2852)。
+	_ = use.Commit()
+	committed = true
 	return h.Me(c)
 }
 
@@ -137,6 +178,10 @@ func (h *Handler) VerifyEmail(c echo.Context) error {
 	}
 
 	profile, err := h.userService.FindProfileByVerifyCode(req.Code)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_CODE", "No such code.", "97c1f576-e4b8-4b8a-a6dc-9cb65e7f6f85"))
 	}

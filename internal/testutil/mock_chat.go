@@ -48,6 +48,18 @@ type MockChatRepository struct {
 	DeleteErr error
 	// ListMembershipsErr forces ListMembershipsByUser to return this error.
 	ListMembershipsErr error
+	// TransferOwnershipErr forces TransferRoomOwnership to return this error
+	// without touching the store.
+	TransferOwnershipErr error
+	// FindRoomErr / FindMembershipErr / ListMembersErr force the corresponding
+	// lookup to fail. Used to cover the "DB 障害を not-found に丸めない" branches
+	// (#2792), which are otherwise unreachable against an in-memory store.
+	FindRoomErr       error
+	FindMembershipErr error
+	ListMembersErr    error
+	// FindInvitationErr は FindInvitation と FindInvitationByID の両方に効く
+	// (どちらも同じ「招待を引く」経路で、#2792 の判断も同じであるべきなため)。
+	FindInvitationErr error
 }
 
 // NewMockChatRepository constructs an empty MockChatRepository ready for use.
@@ -100,8 +112,27 @@ func (m *MockChatRepository) CreateRoom(room *model.ChatRoom) error {
 func (m *MockChatRepository) FindRoomByID(id string) (*model.ChatRoom, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.FindRoomErr != nil {
+		return nil, m.FindRoomErr
+	}
 	if r, ok := m.Rooms[id]; ok {
 		return r, nil
+	}
+	return nil, ErrNotFound
+}
+
+// FindRoomByURI looks a room up by its canonical AP URI (#2994). ローカル room は
+// `uri` が NULL なので一致しない (本物の SQL と同じ)。
+func (m *MockChatRepository) FindRoomByURI(uri string) (*model.ChatRoom, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.FindRoomErr != nil {
+		return nil, m.FindRoomErr
+	}
+	for _, r := range m.Rooms {
+		if r.URI != nil && *r.URI == uri {
+			return r, nil
+		}
 	}
 	return nil, ErrNotFound
 }
@@ -110,6 +141,48 @@ func (m *MockChatRepository) UpdateRoom(room *model.ChatRoom) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.Rooms[room.ID] = room
+	return nil
+}
+
+// TransferRoomOwnership mirrors the real repository: it moves ownership only
+// when the room is still owned by oldOwnerID, and swaps the membership rows so
+// that the owner never holds one (see repository.TransferRoomOwnership).
+//
+// **意味論を実装に揃えておくこと。** ここが単なる ownerId 代入だと、
+// membership 行の入れ替えを検証しているつもりのテストが素通りする。
+func (m *MockChatRepository) TransferRoomOwnership(roomID, oldOwnerID, newOwnerID, oldOwnerMembershipID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.TransferOwnershipErr != nil {
+		return m.TransferOwnershipErr
+	}
+	room, ok := m.Rooms[roomID]
+	if !ok || room.OwnerID != oldOwnerID {
+		return ErrNotFound
+	}
+	// **引数で渡されたオブジェクトを書き換えない。** 実 repository は DB 行を
+	// 更新するだけなので、呼び出し元が握っている room は旧 owner のまま残る。
+	// ここで同じポインタを書き換えると、その差が test では見えなくなる。
+	updated := *room
+	updated.OwnerID = newOwnerID
+	m.Rooms[roomID] = &updated
+	if oldOwnerID == newOwnerID {
+		return nil
+	}
+	delete(m.Memberships, membershipKey(newOwnerID, roomID))
+	// 譲渡は保留中の招待も消す (残ると新 owner が accept して行を作り直せる)。
+	for id, inv := range m.Invitations {
+		if inv.RoomID == roomID && inv.UserID == newOwnerID {
+			delete(m.Invitations, id)
+		}
+	}
+	if _, exists := m.Memberships[membershipKey(oldOwnerID, roomID)]; !exists {
+		m.Memberships[membershipKey(oldOwnerID, roomID)] = &model.ChatRoomMembership{
+			ID:     oldOwnerMembershipID,
+			UserID: oldOwnerID,
+			RoomID: roomID,
+		}
+	}
 	return nil
 }
 
@@ -333,6 +406,9 @@ func (m *MockChatRepository) CreateMembership(mem *model.ChatRoomMembership) err
 func (m *MockChatRepository) FindMembership(userID, roomID string) (*model.ChatRoomMembership, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.FindMembershipErr != nil {
+		return nil, m.FindMembershipErr
+	}
 	if mem, ok := m.Memberships[membershipKey(userID, roomID)]; ok {
 		return mem, nil
 	}
@@ -356,6 +432,9 @@ func (m *MockChatRepository) DeleteMembership(userID, roomID string) error {
 func (m *MockChatRepository) ListMembersByRoom(roomID string) ([]*model.ChatRoomMembership, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ListMembersErr != nil {
+		return nil, m.ListMembersErr
+	}
 	out := make([]*model.ChatRoomMembership, 0)
 	for _, mem := range m.Memberships {
 		if mem.RoomID == roomID {
@@ -436,6 +515,9 @@ func (m *MockChatRepository) UpdateInvitation(inv *model.ChatRoomInvitation) err
 func (m *MockChatRepository) FindInvitationByID(id string) (*model.ChatRoomInvitation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.FindInvitationErr != nil {
+		return nil, m.FindInvitationErr
+	}
 	if inv, ok := m.Invitations[id]; ok {
 		return inv, nil
 	}
@@ -445,6 +527,9 @@ func (m *MockChatRepository) FindInvitationByID(id string) (*model.ChatRoomInvit
 func (m *MockChatRepository) FindInvitation(userID, roomID string) (*model.ChatRoomInvitation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.FindInvitationErr != nil {
+		return nil, m.FindInvitationErr
+	}
 	for _, inv := range m.Invitations {
 		if inv.UserID == userID && inv.RoomID == roomID {
 			return inv, nil
@@ -545,12 +630,41 @@ func (m *MockChatRepository) ListRoomHistory(_ string, _ int) ([]*model.ChatMess
 
 // --- Reactions ---
 
-func (m *MockChatRepository) AddReaction(_, key string) error {
+// AddReaction records the attempt and updates the stored message.
+//
+// **状態を更新するのが要点 (#3037 レビュー)。** 更新しないと、`RemoveReaction`
+// が「消えたか」を返すようになったこと (#3037) と噛み合わず、
+// `React` → `Unreact` を通すテストで unreact が一度も publish されなくなる。
+// それでもテストが緑になる形があり (最後のイベントが react なので同じ
+// アサーションを満たす)、**有効だった検査が黙って空虚になっていた**。
+func (m *MockChatRepository) AddReaction(messageID, key string) error {
 	m.AddedReactions = append(m.AddedReactions, key)
+	msg := m.Messages[messageID]
+	if msg == nil {
+		return nil
+	}
+	for _, r := range msg.Reactions {
+		if r == key {
+			return nil // 重複は足さない (本番の重複ガードと同じ)
+		}
+	}
+	msg.Reactions = append(msg.Reactions, key)
 	return nil
 }
 
-func (m *MockChatRepository) RemoveReaction(_, key string) error {
+func (m *MockChatRepository) RemoveReaction(messageID, key string) (bool, error) {
 	m.RemovedReactions = append(m.RemovedReactions, key)
-	return nil
+	// **実データに合わせて「消えたか」を返す。** 常に true を返すと、
+	// publish の条件 (#3037) を検査するテストが空虚になる。
+	msg := m.Messages[messageID]
+	if msg == nil {
+		return false, nil
+	}
+	for i, r := range msg.Reactions {
+		if r == key {
+			msg.Reactions = append(append([]string{}, msg.Reactions[:i]...), msg.Reactions[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
 }

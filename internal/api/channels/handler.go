@@ -50,6 +50,39 @@ type Handler struct {
 	noteRepo       notesfilter.RenoteLookup
 	// relationReload は channel mute 変更を streaming connection へ通知する (#2400)。
 	relationReload RelationReloadPublisher
+	// userFollowingRepo は pinnedNotes の可視性判定に使う。**`followingRepo` とは
+	// 別物** — あちらはチャンネルのフォロー、こちらは利用者間のフォローで、
+	// followers 限定ノートを見せてよい相手かの判定に要る。未配線なら
+	// `CanSeeNote` が fail-closed に倒れる (followers / specified は投稿者本人
+	// 以外に見せない)。
+	userFollowingRepo repository.FollowingRepository
+	// metaRepo は channels/timeline の blocked-host filter で meta.blockedHosts
+	// を引く (upstream generateBlockedHostQueryForNote)。
+	metaRepo repository.MetaRepository
+}
+
+// HasMetaRepo reports whether the blocked-host filter can read meta.
+//
+// 未配線だと `blockedHosts` の除外が黙って no-op になる (ブロックしたはずの
+// インスタンスのノートが一覧に出続ける)。起動時の critical wiring 検査で落とす。
+func (h *Handler) HasMetaRepo() bool {
+	return h != nil && h.metaRepo != nil
+}
+
+// SetMetaRepo wires a MetaRepository used for the blocked-host filter on
+// channels/timeline (upstream generateBlockedHostQueryForNote)。
+func (h *Handler) SetMetaRepo(r repository.MetaRepository) {
+	h.metaRepo = r
+}
+
+// SetUserFollowingRepo wires the user-following lookup used by the pinnedNotes
+// visibility gate.
+//
+// **チャンネルのフォロー (`SetFollowingRepo`) とは別。** 名前が似ているので
+// 取り違えると「チャンネルをフォローしていれば他人の followers 限定ノートが
+// 見える」という別の穴になる。
+func (h *Handler) SetUserFollowingRepo(r repository.FollowingRepository) {
+	h.userFollowingRepo = r
 }
 
 // SetMuteBlockRepos wires the repositories used by the channels/timeline
@@ -280,6 +313,22 @@ func (h *Handler) packPinnedNotes(ctx context.Context, ch *model.Channel, viewer
 	if err != nil || len(notes) == 0 {
 		return out
 	}
+	// **可視性ゲート。** `channels/update` は `pinnedNoteIds` を検証しない
+	// (所有者もチャンネル所属も見ない) ので、ここに他人のノートの ID を書ける。
+	// `channels/show` は未認証で叩けるため、ゲートが無いと **followers 限定
+	// ノートが全文で公開される**。
+	//
+	// **`HideEmbeds` では止まらない。** あちらの top-level 判定
+	// (`HideNoteByPrefsDecision`) は著者設定による降格しか見ず、元から
+	// followers の note は「intrinsic ゲート任せ」と明記して素通しする
+	// (`internal/core/note/hide_embed.go`)。その intrinsic ゲートがこれ。
+	//
+	// 同じ「ピン留めを展開する」経路である `users/show` と `antennas/notes` は
+	// 既に `FilterVisible` を通しており、ここだけが抜けていた。
+	notes = notesfilter.FilterVisible(viewer, notes, h.userFollowingRepo)
+	if len(notes) == 0 {
+		return out
+	}
 	entities := entity.PackNotes(ctx, notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	if h.fieldRes != nil {
 		h.fieldRes.Apply(entities, viewer)
@@ -430,7 +479,10 @@ func (h *Handler) Followed(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 5, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -450,7 +502,10 @@ func (h *Handler) Owned(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 5, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -504,7 +559,10 @@ func (h *Handler) Search(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 5, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -552,7 +610,10 @@ func (h *Handler) Timeline(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	viewer := middleware.GetUser(c)
 	viewerID := ""
 	if viewer != nil {
@@ -597,6 +658,14 @@ func (h *Handler) Timeline(c echo.Context) error {
 		}
 	}
 	notes = notesfilter.ApplyHardMute(h.userRepo, viewer, notes)
+	// **ブロック済みインスタンスのノートを落とす** (upstream
+	// generateBlockedHostQueryForNote)。チャンネルは連合先からも投稿されるので、
+	// ブロック後も既存のノートがタイムラインに出続けていた。
+	blockedHosts, err := notesfilter.LoadBlockedHosts(h.metaRepo)
+	if err != nil {
+		return apierr.JSONInternalError(c)
+	}
+	notes = notesfilter.ApplyBlockedHosts(notes, blockedHosts)
 	entities := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(entities, viewer)
 	notehide.HideEmbeds(viewer, entities)

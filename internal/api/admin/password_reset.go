@@ -4,12 +4,13 @@ import (
 	"net/http"
 
 	"github.com/labstack/echo/v4"
+
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/core/moderationlog"
 	"github.com/shiroha-a/mk/internal/misc"
 	"github.com/shiroha-a/mk/internal/misc/password"
 	"github.com/shiroha-a/mk/internal/model"
-	"github.com/shiroha-a/mk/internal/server/middleware"
+	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // ResetPassword handles POST /api/admin/reset-password.
@@ -38,6 +39,12 @@ func (h *Handler) ResetPassword(c echo.Context) error {
 	var target *model.User
 	if h.userRepo != nil {
 		user, err := h.userRepo.FindByID(req.UserID)
+		// **DB 障害を not-found に丸めない** (#2792)。管理者によるパスワード
+		// リセットで障害を 400 にすると、対象が居ないのか DB が落ちているのか
+		// 区別できない。
+		if err != nil && !repository.IsNotFound(err) {
+			return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+		}
 		if err != nil || user == nil {
 			// #2106 L2: upstream reset-password.ts:26 固有の UUID に揃える。
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "ccafc7fe-5074-4edd-9dc0-8ef9ef6a701d"))
@@ -47,11 +54,15 @@ func (h *Handler) ResetPassword(c echo.Context) error {
 		// (CANNOT_RESET_PASSWORD_OF_ROOT_USER) は廃止され、「対象が administrator
 		// かつ実行者 != 対象」を ACCESS_DENIED で弾く。IsAdministrator は root を
 		// 含むため root 保護は維持される。
-		if h.roleService != nil {
-			me := middleware.GetUser(c)
-			if h.roleService.IsAdministrator(user.ID) && (me == nil || me.ID != user.ID) {
-				return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Access denied.", "cda8f8ce-89a6-4f92-8055-33bbe0c1464d"))
-			}
+		// **system アカウントと他のモデレーターも塞ぐ (#3037)。** この
+		// endpoint は新しいパスワードを応答に載せて返すので、対象として
+		// 選べる相手はそのままサインインできる相手になる。
+		denied, undetermined := h.credentialTakeoverDenied(c, user)
+		if undetermined {
+			return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+		}
+		if denied {
+			return c.JSON(http.StatusBadRequest, apierr.Error("ACCESS_DENIED", "Access denied.", "cda8f8ce-89a6-4f92-8055-33bbe0c1464d"))
 		}
 		target = user
 	}

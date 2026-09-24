@@ -2,6 +2,7 @@ package mkqdriver_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -301,7 +302,7 @@ func TestEnqueue_UnknownQueueRejects(t *testing.T) {
 }
 
 // TestEnqueue_DuplicateUniqueDropsSilently confirms WithUnique TTL
-// matches asynq's silent-drop behaviour.
+// 重複は黙って捨てる (unique TTL の窓の中なので成功扱い)。
 func TestEnqueue_DuplicateUniqueDropsSilently(t *testing.T) {
 	d := newDriver(t)
 	for i := 0; i < 3; i++ {
@@ -318,7 +319,7 @@ func TestEnqueue_DuplicateUniqueDropsSilently(t *testing.T) {
 }
 
 // TestServer_HandleSkipRetryConvertsToUnrecoverable ensures the
-// driver-level SkipRetry sentinel reaches mkq as ErrUnrecoverable
+// driver-level ErrSkipRetry sentinel reaches mkq as ErrUnrecoverable
 // (which mkq surfaces as a permanent failure rather than a retry).
 func TestServer_HandleSkipRetryConvertsToUnrecoverable(t *testing.T) {
 	d := newDriver(t)
@@ -327,7 +328,7 @@ func TestServer_HandleSkipRetryConvertsToUnrecoverable(t *testing.T) {
 	wg.Add(1)
 	srv.Handle("test:skip", func(_ context.Context, _ driver.Task) error {
 		defer wg.Done()
-		return fmt.Errorf("decode boom: %w", driver.SkipRetry)
+		return fmt.Errorf("decode boom: %w", driver.ErrSkipRetry)
 	})
 	require.NoError(t, srv.Start())
 	t.Cleanup(srv.Shutdown)
@@ -541,7 +542,7 @@ func TestInspector_GetQueueInfo_IncludesRepeatSchedules(t *testing.T) {
 }
 
 // TestInspector_RunTaskPromotesDelayed verifies that RunTask pulls a
-// scheduled task back to wait, mirroring asynq's "Run scheduled".
+// scheduled task back to wait (admin の「今すぐ実行」)。
 func TestInspector_RunTaskPromotesDelayed(t *testing.T) {
 	d := newDriver(t)
 
@@ -565,7 +566,7 @@ func TestInspector_RunTaskPromotesDelayed(t *testing.T) {
 }
 
 // TestInspector_GetQueueInfo_FailedReportedAsFailedNotRetry verifies the
-// post-#1187 semantic: SkipRetry / permanent failures land in the failed
+// post-#1187 semantic: ErrSkipRetry / permanent failures land in the failed
 // bucket and are reported via `Failed`. They no longer leak into `Retry`
 // — Retry is reserved for delayed bucket entries with `atm > 0`.
 //
@@ -580,10 +581,10 @@ func TestInspector_GetQueueInfo_FailedReportedAsFailedNotRetry(t *testing.T) {
 	wg.Add(1)
 	srv.Handle("ins:permanent-fail", func(_ context.Context, _ driver.Task) error {
 		defer wg.Done()
-		// SkipRetry sentinel = immediate failure into the failed bucket
+		// ErrSkipRetry sentinel = immediate failure into the failed bucket
 		// (mkq's ErrUnrecoverable). retry-backoff 経路を回さない fast
 		// path だが、行き着くのは failed bucket (= permanent failure)。
-		return fmt.Errorf("intentional fail: %w", driver.SkipRetry)
+		return fmt.Errorf("intentional fail: %w", driver.ErrSkipRetry)
 	})
 	require.NoError(t, srv.Start())
 	t.Cleanup(srv.Shutdown)
@@ -763,7 +764,7 @@ func TestClient_Enqueue_WithKeepFailed_BoundsFailedBucket(t *testing.T) {
 	wg.Add(total)
 	srv.Handle("keepfailed:burst", func(_ context.Context, _ driver.Task) error {
 		defer wg.Done()
-		return fmt.Errorf("intentional fail: %w", driver.SkipRetry)
+		return fmt.Errorf("intentional fail: %w", driver.ErrSkipRetry)
 	})
 	require.NoError(t, srv.Start())
 	t.Cleanup(srv.Shutdown)
@@ -793,7 +794,7 @@ func TestClient_Enqueue_WithKeepFailed_BoundsFailedBucket(t *testing.T) {
 
 // TestInspector_RunTask_FallsBackToRetryJobForFailedBucket verifies that
 // RunTask succeeds against a job in the failed bucket, by falling back
-// from PromoteJob (delayed-only) to RetryJob. asynq's Inspector.RunTask
+// from PromoteJob (delayed-only) to RetryJob. admin の RunTask
 // transparently handles both buckets; this test pins the equivalent
 // behaviour for the mkq driver (#1181).
 //
@@ -805,7 +806,7 @@ func TestInspector_RunTask_FallsBackToRetryJobForFailedBucket(t *testing.T) {
 	srv := d.Server()
 	var wg sync.WaitGroup
 	wg.Add(1)
-	// fail-once-then-succeed: 初回は SkipRetry で failed bucket に落とし、RunTask
+	// fail-once-then-succeed: 初回は ErrSkipRetry で failed bucket に落とし、RunTask
 	// 後の再処理では成功させる。常に再失敗する handler だと RunTask が failed から
 	// 出した job が wait→active→再失敗で failed に戻り、「failed を出た瞬間」を
 	// 観測する後段の Eventually が CI 負荷下で毎 poll「まだ failed」と見えて flaky
@@ -814,7 +815,7 @@ func TestInspector_RunTask_FallsBackToRetryJobForFailedBucket(t *testing.T) {
 	srv.Handle("ins:fail-then-retry", func(_ context.Context, _ driver.Task) error {
 		if calls.Add(1) == 1 {
 			wg.Done()
-			return fmt.Errorf("intentional fail: %w", driver.SkipRetry)
+			return fmt.Errorf("intentional fail: %w", driver.ErrSkipRetry)
 		}
 		return nil
 	})
@@ -845,7 +846,7 @@ func TestInspector_RunTask_FallsBackToRetryJobForFailedBucket(t *testing.T) {
 		"job should have landed in the failed bucket")
 
 	// RunTask must succeed via RetryJob fallback even though the job is
-	// not in mkq's delayed bucket. asynq's parity contract: callers only
+	// not in mkq's delayed bucket. 呼び出し側の契約: callers only
 	// pass a task ID and the driver routes to the right move primitive.
 	require.NoError(t, ins.RunTask("deliver", failedTaskID),
 		"RunTask should fall back to RetryJob for failed bucket jobs")
@@ -946,8 +947,14 @@ func TestNewDriver_BadAddressFails(t *testing.T) {
 }
 
 // TestDriver_Resize_BeforeStartReturnsNotSupported verifies the
-// pre-Start contract — Resize called before Server.Start returns
-// ErrResizeNotSupported (there is no pool to resize yet).
+// pre-Server() contract — Resize called before Driver.Server() returns
+// ErrResizeNotSupported (there is no Server object to resize through).
+//
+// **`Server()` 済みで `Start()` 前は別のエラーになる** — pool map が空なので
+// Server.Resize の `unknown queue` 枝に落ちる。そちらは
+// TestServer_Resize_UnknownQueueReturnsError が固定している。この違いを
+// 取り違えると「Start 前は ErrResizeNotSupported」という誤った前提が
+// 配線側へ伝播する (#2985 で実際に踏んだ)。
 func TestDriver_Resize_BeforeStartReturnsNotSupported(t *testing.T) {
 	d := newDriver(t)
 	// No call to d.Server() yet.
@@ -1640,11 +1647,11 @@ func TestResize_ScaleDownDoesNotHang(t *testing.T) {
 	t.Logf("8 → 2 の scale-down が %v", elapsed.Round(time.Millisecond))
 }
 
-// **PendingCount が GetQueueInfo.Pending と一致すること。**
+// **DispatchableCount が (pause していなければ) GetQueueInfo.Pending と一致すること。**
 //
 // autoscaler の読み取りを集計 API から切り替えた (#2605)。両者がずれると
 // スケール判断が変わってしまうので、同じ値であることを固定する。
-func TestPendingCount_MatchesQueueInfo(t *testing.T) {
+func TestDispatchableCount_MatchesQueueInfo(t *testing.T) {
 	testutil.SkipIfNoDocker(t)
 	flushRedis(t)
 
@@ -1657,7 +1664,7 @@ func TestPendingCount_MatchesQueueInfo(t *testing.T) {
 	ins := d.Inspector()
 
 	// 空のとき。
-	n, err := ins.PendingCount("deliver")
+	n, err := ins.DispatchableCount("deliver")
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
 
@@ -1672,16 +1679,103 @@ func TestPendingCount_MatchesQueueInfo(t *testing.T) {
 
 	info, err := ins.GetQueueInfo("deliver")
 	require.NoError(t, err)
-	n, err = ins.PendingCount("deliver")
+	n, err = ins.DispatchableCount("deliver")
 	require.NoError(t, err)
 
 	assert.Equal(t, 5, n)
-	assert.Equal(t, info.Pending, n, "PendingCount が GetQueueInfo.Pending とずれている")
+	assert.Equal(t, info.Pending, n, "DispatchableCount が GetQueueInfo.Pending とずれている")
 }
 
-// 未知の queue はエラーにする。**0 を返さない。** autoscaler が 0 と
-// 受け取ると「捌けている」と誤認して縮めにかかる。
-func TestPendingCount_UnknownQueue(t *testing.T) {
+// **今回登録しなかった cron の旧スケジューラを撤去する (#3173)。** #2818 で
+// プラグインの cron を専用キューへ移したとき、maintenance 側の旧スケジューラが
+// 残って二重実行と handler 無しの失敗を続けていた。
+//
+// 1 つ目の driver が「前回の起動」、2 つ目が「今回の起動」。Scheduler は
+// driver ごとに登録の記録を持つので、別の driver で再現できる。
+func TestScheduler_PruneUnregistered(t *testing.T) {
+	testutil.SkipIfNoDocker(t)
+	flushRedis(t)
+	ctx := context.Background()
+	newD := func() driver.Driver {
+		d, err := mkqdriver.New(ctx, mkqdriver.Config{
+			Redis: redis.UniversalOptions{Addrs: []string{testRedis.Addr}},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = d.Close() })
+		return d
+	}
+	repeat := func(queue string) []string {
+		ids, err := testRedis.Client.ZRange(ctx, "bull:"+queue+":repeat", 0, -1).Result()
+		require.NoError(t, err)
+		return ids
+	}
+
+	// 前回の起動: 3 本登録していた。
+	prev := newD().Scheduler()
+	for _, id := range []string{"kept", "moved", "flaky"} {
+		require.NoError(t, prev.Register("0 * * * *", id, nil, driver.WithQueue("maintenance")))
+	}
+	require.NoError(t, prev.Register("0 * * * *", "other-queue", nil, driver.WithQueue("export")))
+
+	cur := newD().Scheduler()
+
+	// **何も登録していないうちは何も消さない。**
+	removed, err := cur.PruneUnregistered()
+	require.NoError(t, err)
+	assert.Empty(t, removed)
+	assert.ElementsMatch(t, []string{"kept", "moved", "flaky"}, repeat("maintenance"))
+
+	// 今回の起動: kept と flaky は登録し、moved と other-queue は登録しない。
+	require.NoError(t, cur.Register("0 * * * *", "kept", nil, driver.WithQueue("maintenance")))
+	require.NoError(t, cur.Register("0 * * * *", "flaky", nil, driver.WithQueue("maintenance")))
+
+	removed, err = cur.PruneUnregistered()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"maintenance/moved", "export/other-queue"}, removed)
+	assert.ElementsMatch(t, []string{"kept", "flaky"}, repeat("maintenance"))
+	assert.Empty(t, repeat("export"))
+
+	exists, err := testRedis.Client.Exists(ctx, "bull:maintenance:repeat:moved").Result()
+	require.NoError(t, err)
+	assert.Zero(t, exists, "template の HASH も消える (次を積まない)")
+}
+
+// **登録が 1 件でも失敗したら撤去しない。** 最初の失敗で return する呼び出し側
+// (`RegisterChartJobs`) では、失敗の後ろの cron が「試みなかった」ことになる。
+// そのまま消すと、一時的な失敗で正当な cron が再起動まで止まる。
+func TestScheduler_PruneSkippedAfterRegistrationFailure(t *testing.T) {
+	testutil.SkipIfNoDocker(t)
+	flushRedis(t)
+	ctx := context.Background()
+	newD := func() driver.Driver {
+		d, err := mkqdriver.New(ctx, mkqdriver.Config{
+			Redis: redis.UniversalOptions{Addrs: []string{testRedis.Addr}},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = d.Close() })
+		return d
+	}
+	prev := newD().Scheduler()
+	for _, id := range []string{"first", "after-failure"} {
+		require.NoError(t, prev.Register("0 * * * *", id, nil, driver.WithQueue("maintenance")))
+	}
+
+	// 今回の起動: first の登録に失敗し、呼び出し側がそこで打ち切った。
+	cur := newD().Scheduler()
+	require.Error(t, cur.Register("not a cron", "first", nil, driver.WithQueue("maintenance")))
+
+	removed, err := cur.PruneUnregistered()
+	require.Error(t, err)
+	assert.Empty(t, removed)
+	ids, err := testRedis.Client.ZRange(ctx, "bull:maintenance:repeat", 0, -1).Result()
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"first", "after-failure"}, ids)
+}
+
+// **scheduler の retention は template に載る (mkq v1.2.0 / #3171)。** 件数と
+// 期限の両方を渡したときに completed / failed を取り違えず、両方が 1 つの
+// object にまとまることを見る。件数 0 は渡らない (driver では「制限なし」)。
+func TestScheduler_RetentionReachesTemplate(t *testing.T) {
 	testutil.SkipIfNoDocker(t)
 	flushRedis(t)
 
@@ -1691,7 +1785,122 @@ func TestPendingCount_UnknownQueue(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
 
-	_, err = d.Inspector().PendingCount("does-not-exist")
+	require.NoError(t, d.Scheduler().Register("0 * * * *", "retained", nil,
+		driver.WithQueue("maintenance"),
+		driver.WithKeepCompleted(30), driver.WithKeepCompletedAge(time.Hour),
+		driver.WithKeepFailed(0), driver.WithKeepFailedAge(2*time.Hour),
+	))
+
+	raw, err := testRedis.Client.HGet(context.Background(), "bull:maintenance:repeat:retained", "opts").Result()
+	require.NoError(t, err)
+	var tmpl map[string]any
+	require.NoError(t, json.Unmarshal([]byte(raw), &tmpl))
+	assert.Equal(t, map[string]any{"count": float64(30), "age": float64(3600)}, tmpl["removeOnComplete"])
+	assert.Equal(t, map[string]any{"age": float64(7200)}, tmpl["removeOnFail"], "件数 0 は渡らない")
+}
+
+// **一覧は新しい順で返す (#3167)。** upstream の admin/queue/jobs は
+// `queue.getJobs(types, 0, 100)` (asc=false) なので、wait は最後に積んだもの、
+// delayed は発火予定が遅いものが先頭に来る。古い順だと、完了済みが数万件
+// 溜まったキューで何か月も前の job しか見えなかった。
+func TestInspectorLists_NewestFirst(t *testing.T) {
+	testutil.SkipIfNoDocker(t)
+	flushRedis(t)
+
+	d, err := mkqdriver.New(context.Background(), mkqdriver.Config{
+		Redis: redis.UniversalOptions{Addrs: []string{testRedis.Addr}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	ctx := context.Background()
+	ins := d.Inspector()
+
+	types := func(rows []*driver.TaskSummary) []string {
+		out := make([]string, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, r.Type)
+		}
+		return out
+	}
+
+	// worker を起動していないので wait に積まれたまま残る。
+	for _, typ := range []string{"w1", "w2", "w3"} {
+		require.NoError(t, d.Client().Enqueue(ctx, typ, []byte(`{}`), driver.WithQueue("deliver")))
+	}
+	pending, err := ins.ListPendingTasks("deliver", 1, 10)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"w3", "w2", "w1"}, types(pending), "wait は最後に積んだものが先頭")
+
+	// 積んだ順と発火予定の順をずらす。
+	for _, j := range []struct {
+		typ string
+		in  time.Duration
+	}{{"d2", 2 * time.Hour}, {"d3", 3 * time.Hour}, {"d1", time.Hour}} {
+		require.NoError(t, d.Client().Enqueue(ctx, j.typ, []byte(`{}`),
+			driver.WithQueue("deliver"), driver.WithProcessIn(j.in)))
+	}
+	delayed, err := ins.ListDelayedTasks("deliver", 1, 10)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"d3", "d2", "d1"}, types(delayed), "delayed は発火予定が遅いものが先頭")
+
+	scheduled, err := ins.ListScheduledTasks("deliver", 1, 10)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"d3", "d2", "d1"}, types(scheduled), "Scheduled も同じ並び")
+
+	// page は新しい側から切る。
+	page2, err := ins.ListDelayedTasks("deliver", 2, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"d1"}, types(page2))
+}
+
+// **pause 中は 0 を返す (#3166)。** BullMQ 6 では pause してもジョブは wait に
+// 残るので、Pending には backlog が見えたままになる。オートスケーラがそれを
+// 深さと読むと、ジョブを取れないキューの worker を最大数まで増やす。
+// 再開したら元の深さに戻ることも見る (0 を返し続けると再開後に増やせない)。
+func TestDispatchableCount_ZeroWhilePaused(t *testing.T) {
+	testutil.SkipIfNoDocker(t)
+	flushRedis(t)
+
+	d, err := mkqdriver.New(context.Background(), mkqdriver.Config{
+		Redis: redis.UniversalOptions{Addrs: []string{testRedis.Addr}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+
+	ins := d.Inspector()
+	for range 3 {
+		require.NoError(t, d.Client().Enqueue(context.Background(), "noop", []byte(`{}`),
+			driver.WithQueue("deliver")))
+	}
+
+	require.NoError(t, ins.PauseQueue("deliver"))
+	info, err := ins.GetQueueInfo("deliver")
+	require.NoError(t, err)
+	require.Equal(t, 3, info.Pending, "前提: pause 中もジョブは wait に残る (BullMQ 6)")
+
+	n, err := ins.DispatchableCount("deliver")
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "pause 中は取れるジョブが無い")
+
+	require.NoError(t, ins.UnpauseQueue("deliver"))
+	n, err = ins.DispatchableCount("deliver")
+	require.NoError(t, err)
+	assert.Equal(t, 3, n, "再開後は wait の長さに戻る")
+}
+
+// 未知の queue はエラーにする。**0 を返さない。** autoscaler が 0 と
+// 受け取ると「捌けている」と誤認して縮めにかかる。
+func TestDispatchableCount_UnknownQueue(t *testing.T) {
+	testutil.SkipIfNoDocker(t)
+	flushRedis(t)
+
+	d, err := mkqdriver.New(context.Background(), mkqdriver.Config{
+		Redis: redis.UniversalOptions{Addrs: []string{testRedis.Addr}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+
+	_, err = d.Inspector().DispatchableCount("does-not-exist")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown queue")
 }

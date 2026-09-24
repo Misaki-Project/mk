@@ -22,8 +22,8 @@ import (
 	"gorm.io/datatypes"
 )
 
-// stubError is a sentinel error for repository failures in tests.
-var stubError = errors.New("stub error")
+// errStub is a sentinel error for repository failures in tests.
+var errStub = errors.New("stub error")
 
 // failingUserRepo wraps MockUserRepository and forces counter operations to fail.
 // This produces errors from the service that bubble up to the handler's default
@@ -32,8 +32,8 @@ type failingUserRepo struct {
 	*testutil.MockUserRepository
 }
 
-func (f *failingUserRepo) IncrementFollowingCount(_ string, _ int) error { return stubError }
-func (f *failingUserRepo) IncrementFollowersCount(_ string, _ int) error { return stubError }
+func (f *failingUserRepo) IncrementFollowingCount(_ string, _ int) error { return errStub }
+func (f *failingUserRepo) IncrementFollowersCount(_ string, _ int) error { return errStub }
 
 // failingFollowRequestRepo wraps MockFollowRequestRepository and forces Delete
 // to fail.
@@ -41,7 +41,7 @@ type failingFollowRequestRepo struct {
 	*testutil.MockFollowRequestRepository
 }
 
-func (f *failingFollowRequestRepo) Delete(_ *model.FollowRequest) error { return stubError }
+func (f *failingFollowRequestRepo) Delete(_ *model.FollowRequest) error { return errStub }
 
 // failingListReqRepo wraps MockFollowRequestRepository and makes ListReceived fail.
 type failingListReqRepo struct {
@@ -49,7 +49,7 @@ type failingListReqRepo struct {
 }
 
 func (f *failingListReqRepo) ListReceived(_ string, _ int, _, _ string) ([]*model.FollowRequest, error) {
-	return nil, stubError
+	return nil, errStub
 }
 
 // newHandlerWithFailingCounters builds a handler whose user-counter increments fail.
@@ -446,6 +446,36 @@ func TestAcceptRequest_InvalidParam(t *testing.T) {
 
 	rec := postJSON(h.AcceptRequest, `{}`, bob)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// bob (承認する側) が alice (申請者) を block している状況で承認しようとすると
+// BLOCKING (Create の #1562 と同じ code、occurrence が別なので id は別)。block
+// 時の申請取り消しが best-effort で失敗し申請が残っているケースの多層防御。
+func TestAcceptRequest_Blocking(t *testing.T) {
+	h, repo, _, frRepo := newTestHandlerWithRepos(t)
+	addUser(repo, "alice", false)
+	bob := addUser(repo, "bob", true)
+	frRepo.Requests["r"] = &model.FollowRequest{ID: "r", FollowerID: "alice", FolloweeID: "bob"}
+	h.followingService.SetBlockingChecker(&stubBlockedChecker{blockerID: "bob", blockeeID: "alice"})
+
+	rec := postJSON(h.AcceptRequest, `{"userId": "alice"}`, bob)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"BLOCKING"`)
+	assert.Contains(t, rec.Body.String(), "b155c6b3-83e9-400a-89c1-4a521da65240")
+}
+
+// alice (申請者) が bob (承認する側) を block している状況では BLOCKED。
+func TestAcceptRequest_Blocked(t *testing.T) {
+	h, repo, _, frRepo := newTestHandlerWithRepos(t)
+	addUser(repo, "alice", false)
+	bob := addUser(repo, "bob", true)
+	frRepo.Requests["r"] = &model.FollowRequest{ID: "r", FollowerID: "alice", FolloweeID: "bob"}
+	h.followingService.SetBlockingChecker(&stubBlockedChecker{blockerID: "alice", blockeeID: "bob"})
+
+	rec := postJSON(h.AcceptRequest, `{"userId": "alice"}`, bob)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"code":"BLOCKED"`)
+	assert.Contains(t, rec.Body.String(), "25d1906c-9e73-49c0-85d1-f48d2520cd60")
 }
 
 func TestRejectRequest_Success(t *testing.T) {

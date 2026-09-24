@@ -53,7 +53,7 @@ type ed25519SignerEntry struct {
 }
 
 // DeliverService computes recipient inboxes and enqueues HTTP-signed delivery
-// jobs onto the asynq queue.
+// jobs onto the deliver queue.
 //
 // 配信先計算と enqueue を分離するため、実際のHTTP送信は queue/processors の
 // DeliverProcessor が担当する。
@@ -66,7 +66,7 @@ type DeliverService struct {
 	publickeyExtraRepo repository.UserPublickeyExtraRepository // optional: recipient capability 判定
 	urls               *activitypub.URLBuilder
 	hostBlocker        HostBlockChecker
-	// syncDeliverHook, when non-nil, replaces the asynq enqueue with an
+	// syncDeliverHook, when non-nil, replaces the queue enqueue with an
 	// inline call to the hook. test 専用で federation deliver の queue 経路
 	// を bypass し、sign + HTTP POST を同期実行する e2e_federation 用。
 	// production code から SetSyncDeliverHook を呼ばないこと (#780)。
@@ -133,7 +133,7 @@ func (s *DeliverService) SetPublickeyExtraRepo(r repository.UserPublickeyExtraRe
 	s.publickeyExtraRepo = r
 }
 
-// SetSyncDeliverHookForTest replaces the asynq enqueue with an inline
+// SetSyncDeliverHookForTest replaces the queue enqueue with an inline
 // synchronous call. Used by e2e_federation tests to bypass the queue layer
 // and exercise the sign + POST + inbox handling path directly. Not for
 // production use (#780).
@@ -196,18 +196,29 @@ func (s *DeliverService) deliverInternal(signerUserID string, body []byte, inbox
 		seen[inbox] = struct{}{}
 		isShared := sharedInboxes[inbox] ||
 			(recipient != nil && recipient.SharedInbox != nil && *recipient.SharedInbox != "" && inbox == *recipient.SharedInbox)
+		// **署名鍵は payload に詰めない。** queue の job は
+		// `admin/queue/jobs` が moderator へ返すので、詰めると鍵がそこから
+		// 読める。worker は `SignerUserID` から配送時に引く。
+		//
+		// `keyID` / `edKeyID` は署名ヘッダに載る公開の識別子なので残す。
+		// 鍵の存在確認は上の `signerCredentials` が enqueue 前に済ませて
+		// いるので、鍵の無いユーザーの配送はここへ来ない。
 		payload := queue.DeliverPayload{
-			Inbox:          inbox,
-			Body:           body,
-			KeyID:          keyID,
-			KeyPEM:         keyPEM,
-			Ed25519KeyID:   edKeyID,
-			Ed25519PrivPEM: edPrivPEM,
-			IsSharedInbox:  isShared,
+			Inbox:         inbox,
+			Body:          body,
+			KeyID:         keyID,
+			Ed25519KeyID:  edKeyID,
+			IsSharedInbox: isShared,
+			SignerUserID:  signerUserID,
 		}
 		if s.syncDeliverHook != nil {
 			// test 経路 (#780): queue を経由せず inline で sign + POST。
-			if err := s.syncDeliverHook(payload); err != nil {
+			// **こちらにだけ鍵を詰める** — queue を通らないので Redis にも
+			// admin API にも出ない。hook 側が DB を引く必要も無くなる。
+			inline := payload
+			inline.KeyPEM = keyPEM
+			inline.Ed25519PrivPEM = edPrivPEM
+			if err := s.syncDeliverHook(inline); err != nil {
 				return fmt.Errorf("sync deliver to %s: %w", inbox, err)
 			}
 			continue
@@ -295,14 +306,19 @@ func (s *DeliverService) isBlockedInbox(inbox string) bool {
 	if s.hostBlocker == nil {
 		return false
 	}
+	// **既定ポートを剥がした形で判定する。** 生の `u.Host` を渡していた頃は
+	// `https://blocked.example:443/inbox` が `blocked.example:443` として
+	// `HostMatchesAny` の suffix 一致から外れ、defederation した相手への配送が
+	// 続いていた。取り込み側 (`hostFromURI`) と同じ `punyHostPort` を通す。
 	u, err := url.Parse(inbox)
 	if err != nil || u.Host == "" {
 		return false
 	}
-	if s.hostBlocker.IsBlocked(u.Host) {
+	host := punyHostPort(u)
+	if s.hostBlocker.IsBlocked(host) {
 		return true
 	}
-	return !s.hostBlocker.IsAllowed(u.Host)
+	return !s.hostBlocker.IsAllowed(host)
 }
 
 // DeliverToFollowers enqueues delivery to all remote followers of signerUserID.
@@ -386,20 +402,65 @@ func (s *DeliverService) signerCredentials(userID string) (string, string, error
 	}
 	kp, err := s.keypairRepo.FindByUserID(userID)
 	if err != nil {
+		// **DB 障害を「鍵が無い」にしない** (#2799)。この経路は enqueue の
+		// 前 (producer 側) なので job のリトライ判定は変わらないが、呼び出し元は
+		// これを `slog.Warn` で握り潰すため、**接続断が「署名鍵が無い」として
+		// ログに残る**。原因から遠い症状になるので種別は保つ。
+		if !repository.IsNotFound(err) {
+			return "", "", err
+		}
 		return "", "", ErrSignerKeyMissing
 	}
 	keyID := s.urls.UserKeyURI(userID)
 	return keyID, kp.PrivateKey, nil
 }
 
-// preferredInbox returns the sharedInbox of u when present, otherwise the
-// individual inbox.
-func preferredInbox(u *model.User) string {
+// fanoutInbox returns the inbox URL that the FOLLOWER fan-out would use for u.
+//
+// **フォロワー配信と重ねる経路はこちらを使う。** `ListRemoteFollowerInboxes` は
+// 「sharedInbox が空なら inbox」を返すので、direct 側が個別 inbox を
+// 使うと `DeliverToFollowersExcluding` の exclude (inbox URL の完全一致) が
+// 効かず、**同じ activity が同じインスタンスへ 2 通届く** (#2567 / #2575 が
+// 塞いだ形)。
+//
+// **exclude に両方入れる形では駄目。** sharedInbox はそのインスタンスの
+// 全フォロワーを表す 1 エントリなので、そこを除外すると**同じインスタンスの
+// 他のフォロワー全員に届かなくなる**。
+//
+// 1:1 だけで完結する経路 (`DeliverToUser`、specified なアンケートの
+// Update(Question)) は `preferredInbox` を使う — あちらは exclude と揃える
+// 必要が無く、個別 inbox のほうが確実に届く (`preferredInbox` の GoDoc 参照)。
+func fanoutInbox(u *model.User) string {
 	if u.SharedInbox != nil && *u.SharedInbox != "" {
 		return *u.SharedInbox
 	}
 	if u.Inbox != nil {
 		return *u.Inbox
+	}
+	return ""
+}
+
+// preferredInbox returns the inbox to use for a 1:1 (direct) delivery.
+//
+// **個別 inbox を優先する。** upstream の `ApDeliverManagerService.execute` は
+// direct recipe に対して `inboxes.set(recipe.to.inbox, false)` と**必ず個別
+// inbox** を使い、`sharedInbox` はフォロワー配信で既に積んだ inbox との重複
+// 判定にしか使わない。sharedInbox へ送ると 2 つ壊れる:
+//
+//   - shared inbox で非公開 activity を扱わない実装では、DM や Follow が
+//     **黙って落ちる** (エラーも返らない)
+//   - 410 Gone が返ると `IsSharedInbox` 経由で host 単位の gone 判定
+//     (`MarkGoneSuspended`) に届き、**DM 1 通の失敗でインスタンス全体を
+//     suspend** しうる
+//
+// 個別 inbox を持たない行だけ sharedInbox へ倒す。upstream はその場合
+// 配送を skip するが、送れるなら送る方が利用者の意図に近い。
+func preferredInbox(u *model.User) string {
+	if u.Inbox != nil && *u.Inbox != "" {
+		return *u.Inbox
+	}
+	if u.SharedInbox != nil {
+		return *u.SharedInbox
 	}
 	return ""
 }

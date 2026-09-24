@@ -15,7 +15,7 @@ import (
 )
 
 // recordingEnqueuer captures DeliverPayloads enqueued via DeliverActivity so
-// hook tests can assert what was scheduled without a real asynq server. The
+// hook tests can assert what was scheduled without a real queue server. The
 // non-deliver methods are no-ops to satisfy queue.Enqueuer.
 type recordingEnqueuer struct {
 	delivers []queue.DeliverPayload
@@ -41,10 +41,17 @@ func (r *recordingEnqueuer) EnqueuePostScheduledNote(queue.PostScheduledNotePayl
 	return nil
 }
 func (r *recordingEnqueuer) ClearScheduledNote(string) error { return nil }
-func (r *recordingEnqueuer) SupportsScheduledNote() bool     { return true }
 func (r *recordingEnqueuer) Close() error                    { return nil }
 
 func newHookSetup(t *testing.T) (*PollDeliveryHook, *recordingEnqueuer, *testutil.MockUserRepository, *testutil.MockUserKeypairRepository, id.Generator) {
+	t.Helper()
+	hook, enq, userRepo, keypairRepo, _, idGen := newHookSetupWithFollowing(t)
+	return hook, enq, userRepo, keypairRepo, idGen
+}
+
+// newHookSetupWithFollowing also exposes the following repository so tests can
+// seed remote followers and assert that they are NOT used as the recipient set.
+func newHookSetupWithFollowing(t *testing.T) (*PollDeliveryHook, *recordingEnqueuer, *testutil.MockUserRepository, *testutil.MockUserKeypairRepository, *testutil.MockFollowingRepository, id.Generator) {
 	t.Helper()
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
@@ -56,7 +63,7 @@ func newHookSetup(t *testing.T) (*PollDeliveryHook, *recordingEnqueuer, *testuti
 	followingRepo := testutil.NewMockFollowingRepository()
 	deliver := NewDeliverService(enq, userRepo, followingRepo, keypairRepo, urls)
 	hook := NewPollDeliveryHook(renderer, deliver, userRepo, urls, idGen)
-	return hook, enq, userRepo, keypairRepo, idGen
+	return hook, enq, userRepo, keypairRepo, followingRepo, idGen
 }
 
 func seedSigner(t *testing.T, userRepo *testutil.MockUserRepository, keypairRepo *testutil.MockUserKeypairRepository, userID string) {
@@ -186,4 +193,114 @@ func TestPollDeliveryHook_OnLocalPollUpdated_DeliverErrorLogged(t *testing.T) {
 	hook.OnLocalPollUpdated(&model.Note{
 		ID: "n1", UserID: "author", HasPoll: true, Visibility: model.NoteVisibilityPublic,
 	})
+}
+
+// seedRemoteUser registers a remote user with an inbox so recipient lookups can
+// resolve it.
+func seedRemoteUser(userRepo *testutil.MockUserRepository, id, host, inbox string) *model.User {
+	h := host
+	in := inbox
+	u := &model.User{ID: id, Username: id, Host: &h, Inbox: &in}
+	userRepo.Users[id] = u
+	return u
+}
+
+// Update(Question) は RenderNote をそのまま包むので content / cw / attachment が
+// 丸ごと入る。specified (DM) なアンケートに票が入るたびにフォロワー全員へ
+// 配送してはいけない。
+func TestPollDeliveryHook_OnLocalPollUpdated_SpecifiedGoesToRecipientsOnly(t *testing.T) {
+	hook, enq, userRepo, keypairRepo, followingRepo, _ := newHookSetupWithFollowing(t)
+	seedSigner(t, userRepo, keypairRepo, "author")
+	// 宛先ではないリモートフォロワー。
+	followerInbox := "https://follower.example/inbox"
+	followingRepo.RemoteInboxes["author"] = []string{followerInbox}
+	// DM の宛先 (フォロワーではない)。
+	dmInbox := "https://dmpeer.example/users/bob/inbox"
+	seedRemoteUser(userRepo, "dmpeer", "dmpeer.example", dmInbox)
+
+	secret := "secret DM body"
+	hook.OnLocalPollUpdated(&model.Note{
+		ID: "n1", UserID: "author", HasPoll: true, Text: &secret,
+		Visibility:     model.NoteVisibilitySpecified,
+		VisibleUserIDs: model.StringArray{"dmpeer"},
+	})
+
+	require.Len(t, enq.delivers, 1, "宛先 1 件のみへ配送する")
+	assert.Equal(t, dmInbox, enq.delivers[0].Inbox)
+	for _, d := range enq.delivers {
+		assert.NotEqual(t, followerInbox, d.Inbox, "DM 本文をフォロワーへ配送しない")
+	}
+}
+
+// 宛先がローカルユーザーだけなら配送先は無い (フォロワーへ落とさない)。
+func TestPollDeliveryHook_OnLocalPollUpdated_SpecifiedLocalOnlyRecipients(t *testing.T) {
+	hook, enq, userRepo, keypairRepo, followingRepo, _ := newHookSetupWithFollowing(t)
+	seedSigner(t, userRepo, keypairRepo, "author")
+	followingRepo.RemoteInboxes["author"] = []string{"https://follower.example/inbox"}
+	// inbox 列を持たせても送らない (local user は Host == nil で判定する)。
+	// 本番のローカル user は inbox が NULL だが、判定を host ではなく inbox の
+	// 有無に寄せた実装だと連合先でない自分自身へ配送してしまう。
+	localInbox := "https://local.example/users/localpeer/inbox"
+	userRepo.Users["localpeer"] = &model.User{ID: "localpeer", Username: "localpeer", Inbox: &localInbox}
+
+	hook.OnLocalPollUpdated(&model.Note{
+		ID: "n1", UserID: "author", HasPoll: true,
+		Visibility:     model.NoteVisibilitySpecified,
+		VisibleUserIDs: model.StringArray{"localpeer"},
+	})
+	assert.Empty(t, enq.delivers, "ローカル宛先だけなら配送しない")
+}
+
+// public / home / followers は従来どおり follower fanout。
+func TestPollDeliveryHook_OnLocalPollUpdated_NonSpecifiedFansOutToFollowers(t *testing.T) {
+	for _, vis := range []model.NoteVisibility{
+		model.NoteVisibilityPublic,
+		model.NoteVisibilityHome,
+		model.NoteVisibilityFollowers,
+	} {
+		t.Run(string(vis), func(t *testing.T) {
+			hook, enq, userRepo, keypairRepo, followingRepo, _ := newHookSetupWithFollowing(t)
+			seedSigner(t, userRepo, keypairRepo, "author")
+			followerInbox := "https://follower.example/inbox"
+			followingRepo.RemoteInboxes["author"] = []string{followerInbox}
+
+			hook.OnLocalPollUpdated(&model.Note{
+				ID: "n1", UserID: "author", HasPoll: true, Visibility: vis,
+			})
+			require.Len(t, enq.delivers, 1)
+			assert.Equal(t, followerInbox, enq.delivers[0].Inbox)
+		})
+	}
+}
+
+// **メンション先にも票数の Update を送る (2 周目レビュー H1)。** mk-go は
+// upstream と同じく mention を `visibleUserIds` に入れない (一方向) ので、
+// 宛先だけに送ると**メンションされたリモート利用者はノート本文は受け取るのに
+// 票数の Update を一度も受け取らない** — 票が永久に初期値のまま見える。
+// `Create` も `Delete` も宛先 + メンション先へ送っている。
+func TestPollDeliveryHook_OnLocalPollUpdated_SpecifiedReachesMentioned(t *testing.T) {
+	hook, enq, userRepo, keypairRepo, followingRepo, _ := newHookSetupWithFollowing(t)
+	seedSigner(t, userRepo, keypairRepo, "author")
+	followerInbox := "https://follower.example/inbox"
+	followingRepo.RemoteInboxes["author"] = []string{followerInbox}
+	dmInbox := "https://dmpeer.example/users/bob/inbox"
+	seedRemoteUser(userRepo, "dmpeer", "dmpeer.example", dmInbox)
+	mentionedInbox := "https://mentioned.example/users/carol/inbox"
+	seedRemoteUser(userRepo, "mentioned", "mentioned.example", mentionedInbox)
+
+	secret := "secret DM body @carol@mentioned.example"
+	hook.OnLocalPollUpdated(&model.Note{
+		ID: "n1", UserID: "author", HasPoll: true, Text: &secret,
+		Visibility:     model.NoteVisibilitySpecified,
+		VisibleUserIDs: model.StringArray{"dmpeer"},
+		Mentions:       model.StringArray{"mentioned"},
+	})
+
+	got := make([]string, 0, len(enq.delivers))
+	for _, d := range enq.delivers {
+		got = append(got, d.Inbox)
+		assert.NotEqual(t, followerInbox, d.Inbox, "DM 本文をフォロワーへ配送しない")
+	}
+	assert.ElementsMatch(t, []string{dmInbox, mentionedInbox}, got,
+		"メンション先に票数の Update が届いていない")
 }

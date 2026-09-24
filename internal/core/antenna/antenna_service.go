@@ -64,6 +64,10 @@ func (s *Service) validateUserList(ownerID string, userListID *string) error {
 		return nil
 	}
 	list, err := s.userListRepo.FindByID(*userListID)
+	// **DB 障害を not-found に丸めない** (#2799)。
+	if err != nil && !repository.IsNotFound(err) {
+		return err
+	}
 	if err != nil || list == nil || list.UserID != ownerID {
 		return ErrNoSuchUserList
 	}
@@ -313,6 +317,10 @@ func (s *Service) Create(in CreateInput) (*model.Antenna, error) {
 func (s *Service) Show(ownerID, antennaID string) (*model.Antenna, error) {
 	a, err := s.repo.FindByID(antennaID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrAntennaNotFound
 	}
 	if a.UserID != ownerID {
@@ -343,6 +351,10 @@ type UpdateInput struct {
 func (s *Service) Update(ownerID, antennaID string, in UpdateInput) (*model.Antenna, error) {
 	a, err := s.repo.FindByID(antennaID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrAntennaNotFound
 	}
 	if a.UserID != ownerID {
@@ -434,6 +446,10 @@ func (s *Service) Update(ownerID, antennaID string, in UpdateInput) (*model.Ante
 func (s *Service) Delete(ownerID, antennaID string) error {
 	a, err := s.repo.FindByID(antennaID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrAntennaNotFound
 	}
 	if a.UserID != ownerID {
@@ -613,6 +629,10 @@ func (s *Service) PruneDangling(ctx context.Context, antennaID string, ids []str
 func (s *Service) RemoveNote(ownerID, antennaID, noteID string) error {
 	a, err := s.repo.FindByID(antennaID)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrAntennaNotFound
 	}
 	if a.UserID != ownerID {
@@ -637,7 +657,7 @@ func (s *Service) ListByUser(userID string) ([]*model.Antenna, error) {
 // limit <= 0 ならデフォルト 10、上限 100。
 //
 // ZSET は score を 0 に揃えてあるので、範囲指定は member (= note id) の
-// 辞書順に対する `ZRangeByLex` で行う。aidx は時刻順に単調増加するため、
+// 辞書順に対する `ZRangeArgs` (`BYLEX`) で行う。aidx は時刻順に単調増加するため、
 // untilID / sinceID をそのまま排他境界 (`(<id>`) に使える (#2465)。
 //
 // untilID / sinceID が空なら全 range を見て最新 N 件を返す (旧挙動互換)。
@@ -707,16 +727,21 @@ func (s *Service) Notes(ctx context.Context, ownerID, antennaID string, limit in
 	// 無指定) は降順 (newest-first)。常に newest-first だと sinceId 単独ページの
 	// 並びと集合が逆になる (#1778)。
 	key := streamKey(antennaID)
-	by := &redis.ZRangeBy{Min: min, Max: max, Count: int64(limit)}
-	var (
-		out []string
-		err error
-	)
-	if sinceID != "" && untilID == "" {
-		out, err = s.client.ZRangeByLex(ctx, key, by).Result()
-	} else {
-		out, err = s.client.ZRevRangeByLex(ctx, key, by).Result()
+	// **`ZRangeByLex` / `ZRevRangeByLex` は Redis 6.2 で非推奨** になったので
+	// `ZRangeArgs` へ寄せる。**`Rev` のときは Start に大きい方を置く** — Redis の
+	// `ZRANGE ... BYLEX REV` は `start > stop` を要求する (逆にすると範囲が空になる)。
+	//
+	// **go-redis v9.21.0 で契約が逆になった** (redis/go-redis#3751)。v9.18.0 までは
+	// `appendArgs` が Rev のとき `Stop, Start` の順に並べ替えていたので、呼び出し側は
+	// 常に「小さい方が Start」で渡していた。v9.22.0 へ上げたときに、この入れ替えを
+	// 呼び出し側へ移した (mkq v1.1.1 への更新で依存が上がり、`TestNotes_*` が
+	// 実 Redis で空を返して落ちた)。go-redis を上げるときはここを見直すこと。
+	args := redis.ZRangeArgs{Key: key, Start: min, Stop: max, ByLex: true, Count: int64(limit)}
+	if sinceID == "" || untilID != "" {
+		args.Rev = true
+		args.Start, args.Stop = max, min
 	}
+	out, err := s.client.ZRangeArgs(ctx, args).Result()
 	if err != nil {
 		if isWrongType(err) {
 			// 旧 Stream が残っている環境。次の push で張り替わるので、

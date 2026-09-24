@@ -66,7 +66,7 @@ func TestRun_ContinuesAfterFailure(t *testing.T) {
 
 	report := Run(context.Background(), NewChecker(srv.URL), LocalDeps{})
 	assert.False(t, report.OK)
-	assert.Len(t, report.Results, 7, "全項目ぶんの結果が返る")
+	assert.Len(t, report.Results, 8, "全項目ぶんの結果が返る")
 }
 
 // warn だけなら OK は落とさない。「見ておくべき」と「壊れている」を区別する。
@@ -76,4 +76,62 @@ func TestReport_WarnDoesNotFailOverall(t *testing.T) {
 
 	r = newReport([]Result{okResult("a", ""), failResult("b", "", "hint")})
 	assert.False(t, r.OK)
+}
+
+// meta.rootUserId が未設定なら fail を返す。
+//
+// **未設定だと `admin/accounts/create` の初回セットアップ判定が、ローカル利用者数の
+// ガードだけに依存する状態になる。** 運用者がそれに気付ける手段が他に無い。
+func TestCheckRootUser(t *testing.T) {
+	t.Run("DB 未配線は skip", func(t *testing.T) {
+		got := CheckRootUser(context.Background(), LocalDeps{})
+		assert.Equal(t, StatusSkip, got.Status)
+	})
+
+	// **クエリ本体まで実 DB で踏む。** skip 枝しか通らないテストだと、
+	// 壊れても誰も気付かない部分が未実行のまま残る (同パッケージの
+	// `TestCheckDatabase_OK` は既に実 DB を使っている)。
+	db := testutil.MustOpenTestDB()
+	testutil.ApplyMigrations(db)
+	// **meta 行が無いと全部 fail になってしまう。** migration は行を作らず、
+	// 本番では `EnsureInitial` が起動時に作る。
+	require.NoError(t, db.Exec(`INSERT INTO meta (id) VALUES ('x') ON CONFLICT DO NOTHING`).Error)
+
+	t.Run("rootUserId 未設定なら fail", func(t *testing.T) {
+		require.NoError(t, db.Exec(`UPDATE meta SET "rootUserId" = NULL`).Error)
+		got := CheckRootUser(context.Background(), LocalDeps{DB: db})
+		assert.Equal(t, StatusFail, got.Status)
+		assert.Contains(t, got.Hint, "update-meta")
+	})
+
+	t.Run("空文字も fail", func(t *testing.T) {
+		require.NoError(t, db.Exec(`UPDATE meta SET "rootUserId" = ''`).Error)
+		assert.Equal(t, StatusFail, CheckRootUser(context.Background(), LocalDeps{DB: db}).Status)
+	})
+
+	t.Run("設定済みなら ok", func(t *testing.T) {
+		require.NoError(t, db.Exec(`UPDATE meta SET "rootUserId" = 'someroot'`).Error)
+		t.Cleanup(func() { db.Exec(`UPDATE meta SET "rootUserId" = NULL`) })
+		got := CheckRootUser(context.Background(), LocalDeps{DB: db})
+		assert.Equal(t, StatusOK, got.Status)
+		assert.Contains(t, got.Detail, "rootUserId")
+	})
+
+	// **読めないときは fail。** 「未設定」と区別が付かないので、判定できない
+	// ことを ok に倒さない。
+	//
+	// **DDL で再現しない (#3037 レビュー)。** `ALTER TABLE meta RENAME` は
+	// このパッケージの schema を書き換えるので、テストが途中で死ぬと
+	// `meta` の無い schema が残る。`ApplyMigrations` は台帳を見て作り直さない
+	// ため、以後このパッケージは永久に落ちる (CLAUDE.md §4 / #2756)。
+	// 閉じた接続を渡せば同じ枝を踏めて、共有状態に触らない。
+	t.Run("meta を読めないなら fail", func(t *testing.T) {
+		closed := testutil.MustOpenTestDB()
+		sqlDB, err := closed.DB()
+		require.NoError(t, err)
+		require.NoError(t, sqlDB.Close())
+
+		got := CheckRootUser(context.Background(), LocalDeps{DB: closed})
+		assert.Equal(t, StatusFail, got.Status)
+	})
 }

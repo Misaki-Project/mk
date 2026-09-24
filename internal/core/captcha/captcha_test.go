@@ -21,7 +21,7 @@ func newSiteVerifyServer(t *testing.T, wantSecret string, respond func(secret, t
 		_ = r.ParseForm()
 		resp := respond(r.FormValue("secret"), r.FormValue("response"))
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 }
 
@@ -72,11 +72,11 @@ func TestSiteVerify_EmptyToken(t *testing.T) {
 func TestMcaptcha_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]string
-		json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body["key"] == "site" && body["secret"] == "sec" && body["token"] == "good" {
-			json.NewEncoder(w).Encode(map[string]any{"valid": true})
+			_ = json.NewEncoder(w).Encode(map[string]any{"valid": true})
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"valid": false})
+			_ = json.NewEncoder(w).Encode(map[string]any{"valid": false})
 		}
 	}))
 	defer srv.Close()
@@ -87,7 +87,7 @@ func TestMcaptcha_Success(t *testing.T) {
 
 func TestMcaptcha_InvalidToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"valid": false})
+		_ = json.NewEncoder(w).Encode(map[string]any{"valid": false})
 	}))
 	defer srv.Close()
 
@@ -235,7 +235,7 @@ func TestSiteVerify_ServerDown(t *testing.T) {
 
 func TestSiteVerify_InvalidJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("not json"))
+		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
 
@@ -246,7 +246,7 @@ func TestSiteVerify_InvalidJSON(t *testing.T) {
 
 func TestSiteVerify_NoErrorCodes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"success": false})
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false})
 	}))
 	defer srv.Close()
 
@@ -258,7 +258,7 @@ func TestSiteVerify_NoErrorCodes(t *testing.T) {
 
 func TestMcaptcha_InvalidJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("broken"))
+		_, _ = w.Write([]byte("broken"))
 	}))
 	defer srv.Close()
 
@@ -273,7 +273,7 @@ func TestMcaptcha_InvalidJSON(t *testing.T) {
 func TestMcaptcha_ResponseTooLarge(t *testing.T) {
 	oversized := make([]byte, 2<<20) // 2 MiB > 1 MiB cap
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(oversized)
+		_, _ = w.Write(oversized)
 	}))
 	defer srv.Close()
 
@@ -285,7 +285,7 @@ func TestMcaptcha_ResponseTooLarge(t *testing.T) {
 func TestTurnstile_ResponseTooLarge(t *testing.T) {
 	oversized := make([]byte, 2<<20)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Write(oversized)
+		_, _ = w.Write(oversized)
 	}))
 	defer srv.Close()
 
@@ -294,4 +294,166 @@ func TestTurnstile_ResponseTooLarge(t *testing.T) {
 	// Mcaptcha と同じく ErrRequestFailed が返ることを明示 (TestMcaptcha_ResponseTooLarge
 	// と揃える、Devin #404 指摘)。
 	assert.ErrorIs(t, err, captcha.ErrRequestFailed)
+}
+
+// testcaptcha は実 provider として数えない (#2806)。数えると「マジック文字列
+// 一致だけが効いていて、フォームトークンは要求されない」という最悪の組み合わせに
+// なる。
+func TestService_HasRealProvider(t *testing.T) {
+	secret := "s"
+	url := "https://mcaptcha.example"
+	empty := ""
+	tests := []struct {
+		name string
+		meta *model.Meta
+		want bool
+	}{
+		{name: "none", meta: &model.Meta{}, want: false},
+		{name: "testcaptcha only", meta: &model.Meta{EnableTestcaptcha: true}, want: false},
+		{name: "hcaptcha", meta: &model.Meta{EnableHcaptcha: true, HcaptchaSecretKey: &secret}, want: true},
+		{name: "recaptcha", meta: &model.Meta{EnableRecaptcha: true, RecaptchaSecretKey: &secret}, want: true},
+		{name: "turnstile", meta: &model.Meta{EnableTurnstile: true, TurnstileSecretKey: &secret}, want: true},
+		{name: "mcaptcha", meta: &model.Meta{EnableMcaptcha: true, McaptchaSecretKey: &secret, McaptchaSiteKey: &secret, McaptchaInstanceURL: &url}, want: true},
+		{
+			// **upstream `SignupApiService.ts:86` は sitekey も要求する
+			// (#3037 レビュー 2 周目)。** 見ないと、sitekey が NULL の meta 行で
+			// トークンを要求するのにウィジェットが描画されず、signup /
+			// signin / 申請が全滅する。
+			name: "mcaptcha without sitekey",
+			meta: &model.Meta{EnableMcaptcha: true, McaptchaSecretKey: &secret, McaptchaInstanceURL: &url},
+			want: false,
+		},
+		{
+			// **空文字は upstream では falsy。** `nil` だけを見ていると、
+			// `admin/update-meta` で空文字を書くだけで provider を有効にでき、
+			// 検証が必ず失敗する = 登録とサインインを止められる。
+			name: "hcaptcha with an empty secret",
+			meta: &model.Meta{EnableHcaptcha: true, HcaptchaSecretKey: &empty},
+			want: false,
+		},
+		{
+			name: "hcaptcha + testcaptcha",
+			meta: &model.Meta{EnableHcaptcha: true, HcaptchaSecretKey: &secret, EnableTestcaptcha: true},
+			want: true,
+		},
+		{
+			// 有効フラグだけで secret が無いものは provider が組み立たない。
+			name: "hcaptcha without secret",
+			meta: &model.Meta{EnableHcaptcha: true},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, captcha.NewService(tt.meta).HasRealProvider())
+		})
+	}
+	var nilSvc *captcha.Service
+	assert.False(t, nilSvc.HasRealProvider())
+}
+
+// Reload が provider 集合を差し替えること。
+//
+// **起動時のスナップショットのままだと、運営者が管理画面で captcha を有効に
+// しても再起動まで一切検証されない。** `/api/meta` は DB を読むのでフロントは
+// captcha を描画し、**運営者からは ON に見える**。provider が 1 つも無いときの
+// `Verify` は成功を返すので、有効化したつもりのまま signup / signin が素通りする。
+func TestService_Reload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("無効から有効へ", func(t *testing.T) {
+		s := captcha.NewService(&model.Meta{})
+		require.NoError(t, s.Verify(ctx, captcha.CaptchaTokens{}), "provider が無ければ成功")
+		assert.False(t, s.IsEnabled())
+
+		s.Reload(&model.Meta{EnableTestcaptcha: true})
+		assert.True(t, s.IsEnabled())
+		assert.Error(t, s.Verify(ctx, captcha.CaptchaTokens{}), "有効化後はトークン無しを拒否")
+		assert.NoError(t, s.Verify(ctx, captcha.CaptchaTokens{Testcaptcha: "testcaptcha-passed"}))
+	})
+
+	t.Run("有効から無効へ", func(t *testing.T) {
+		s := captcha.NewService(&model.Meta{EnableTestcaptcha: true})
+		assert.Error(t, s.Verify(ctx, captcha.CaptchaTokens{}))
+
+		s.Reload(&model.Meta{})
+		assert.False(t, s.IsEnabled())
+		assert.NoError(t, s.Verify(ctx, captcha.CaptchaTokens{}))
+	})
+
+	// **nil は据え置く。** 読めなかったことを理由に運営者の設定を消さない。
+	t.Run("nil meta は無視", func(t *testing.T) {
+		s := captcha.NewService(&model.Meta{EnableTestcaptcha: true})
+		s.Reload(nil)
+		assert.True(t, s.IsEnabled(), "設定が消えている")
+	})
+
+	t.Run("nil レシーバでも落ちない", func(t *testing.T) {
+		var s *captcha.Service
+		assert.NotPanics(t, func() { s.Reload(&model.Meta{EnableTestcaptcha: true}) })
+	})
+}
+
+// **有効な provider は全部検証する (#3037)。**
+//
+// 以前は最初の 1 つで return していたので、運営者が 2 つ有効にすると
+// **後ろの 1 つは素通り**だった。設定画面は両方を「有効」と表示し、フォームも
+// 両方のウィジェットを出すので、効いていない側があることに気付けない。
+// upstream (`SignupApiService.ts:80-108`) は `if` を 5 つ並べて全部検証する。
+//
+// mcaptcha と testcaptcha を使うのは、**外部 URL を差し替えられる provider が
+// この 2 つだけ**のため (他の 3 つは verify URL が定数)。判定の形は共通なので、
+// この組で足りる。
+func TestVerify_ChecksEveryEnabledProvider(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":true}`))
+	}))
+	defer srv.Close()
+
+	svc := captcha.NewServiceWithClient(mcaptchaAndTestcaptchaMeta(srv.URL), srv.Client())
+
+	// 両方正しいときは通る。
+	require.NoError(t, svc.Verify(context.Background(), captcha.CaptchaTokens{
+		Mcaptcha: "m", Testcaptcha: "testcaptcha-passed",
+	}))
+	assert.Equal(t, 1, hits, "mcaptcha が検証されていない")
+
+	// **testcaptcha だけ間違っている。** mcaptcha (先に評価される) が成功する
+	// ので、最初の 1 つで return する実装ではここが通ってしまう。
+	err := svc.Verify(context.Background(), captcha.CaptchaTokens{
+		Mcaptcha: "m", Testcaptcha: "wrong",
+	})
+	assert.Error(t, err, "2 つ目の provider が素通りしている")
+}
+
+// **手前の provider が失敗したら、その時点で落とす。** 後ろが成功しても
+// 結果は失敗。
+func TestVerify_FailsOnTheFirstRejectingProvider(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":false}`))
+	}))
+	defer srv.Close()
+
+	svc := captcha.NewServiceWithClient(mcaptchaAndTestcaptchaMeta(srv.URL), srv.Client())
+
+	err := svc.Verify(context.Background(), captcha.CaptchaTokens{
+		Mcaptcha: "m", Testcaptcha: "testcaptcha-passed",
+	})
+	assert.Error(t, err)
+}
+
+func mcaptchaAndTestcaptchaMeta(instanceURL string) *model.Meta {
+	secret := "s"
+	site := "sk"
+	return &model.Meta{
+		EnableMcaptcha:      true,
+		McaptchaSecretKey:   &secret,
+		McaptchaSiteKey:     &site,
+		McaptchaInstanceURL: &instanceURL,
+		EnableTestcaptcha:   true,
+	}
 }

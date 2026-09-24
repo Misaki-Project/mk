@@ -93,6 +93,16 @@ func TestWrapHTML_EmailSettingsFooter(t *testing.T) {
 	}
 }
 
+func TestWrapHTML_EmailSettingsLabelLocalized(t *testing.T) {
+	got := coreemail.WrapHTML(coreemail.HTMLWrapInput{
+		Subject:            "Hi",
+		BodyHTML:           "x",
+		EmailSettingsURL:   "https://example.test/settings/email",
+		EmailSettingsLabel: "メール設定",
+	})
+	assert.Contains(t, got, ">メール設定</a>")
+}
+
 // EmailSettingsURL 未指定なら footer 自体省略
 func TestWrapHTML_NoFooterWhenSettingsAbsent(t *testing.T) {
 	got := coreemail.WrapHTML(coreemail.HTMLWrapInput{

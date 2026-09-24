@@ -12,6 +12,9 @@ import (
 // Handler handles emoji-related API endpoints.
 type Handler struct {
 	emojiRepo repository.EmojiRepository
+	// exportQueue は export-custom-emojis 用 (#2791 で router.go の inline
+	// closure から移設)。
+	exportQueue ExportEnqueuer
 }
 
 // NewHandler creates a new emojis Handler.
@@ -73,6 +76,10 @@ func (h *Handler) Emoji(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
 	}
 	e, err := h.emojiRepo.FindByNameAndHost(req.Name, nil)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_EMOJI", "No such emoji.", "14141e4b-dea8-41f0-9ba1-1721a6b5b92c"))
 	}

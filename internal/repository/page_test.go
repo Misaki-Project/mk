@@ -280,3 +280,66 @@ func TestPageRepository_ListFeatured_QueryError(t *testing.T) {
 	_, err := repo.ListFeatured("", "", 10, 0)
 	assert.Error(t, err)
 }
+
+// **jsonb 列は `string` で渡す (#3037)。**
+//
+// `[]byte` のまま `Updates` に載せると driver が bytea として送り、jsonb 列への
+// 代入が SQLSTATE 22P02 で落ちる。`pages/update` の `content` / `variables` は
+// **どんな値でも 500** だった。モック repository ではこの罠が出ないので、
+// 実 DB に対して固定する。
+func TestPageRepository_UpdateFieldsAcceptsJSONBColumns(t *testing.T) {
+	repo := NewPageRepository(testDB)
+	user := insertTestUser(t, "u_page_jsonb", "pagejsonb")
+	defer cleanupUser(t, user.ID)
+
+	p := &model.Page{
+		ID: "pg_jsonb_1", UserID: user.ID, Name: "n", Title: "t",
+		Content: datatypes.JSON([]byte(`[]`)), Variables: datatypes.JSON([]byte(`[]`)),
+	}
+	require.NoError(t, repo.Create(p))
+	defer testDB.Exec(`DELETE FROM page WHERE id = ?`, p.ID)
+
+	// **`string` を渡す経路が通ること。** core/page が組み立てる形と同じ。
+	require.NoError(t, repo.UpdateFields(p.ID, map[string]any{
+		"content":   string([]byte(`[{"x":1}]`)),
+		"variables": string([]byte(`[{"v":"a"}]`)),
+	}), "jsonb 列の UPDATE が通らない")
+
+	got, err := repo.FindByID(p.ID)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[{"x":1}]`, string(got.Content))
+	assert.JSONEq(t, `[{"v":"a"}]`, string(got.Variables))
+
+	// **`[]byte` は落ちる**ことも固定しておく。これが無いと「どちらでも
+	// 通る」と誤解して core 側のキャストが外れる。
+	err = repo.UpdateFields(p.ID, map[string]any{"content": []byte(`[{"y":2}]`)})
+	assert.Error(t, err, "[]byte が bytea として通ってしまっている")
+}
+
+// **空文字は enum 列に入らない。**
+//
+// `page_visibility_enum` は `”` を受け付けないので、handler がそこを弾き
+// 損ねると `UpdateFields` でクエリごと落ちて 500 になる。認証済みの一般
+// 利用者が `{"visibility":""}` を送るだけで起こせた。
+//
+// mock repository は値を素通しするので handler テストでは再現しない。
+// 「列が受け付けない」という事実はここで固定する。
+func TestPageRepository_UpdateFields_EmptyVisibilityIsRejectedByColumn(t *testing.T) {
+	repo := NewPageRepository(testDB)
+	user := insertTestUser(t, "u_pr_vis", "pagevisuser")
+	defer cleanupUser(t, user.ID)
+
+	p := newTestPage("pg_vis_1", user.ID, "visalpha")
+	require.NoError(t, repo.Create(p))
+	defer cleanupPage(t, p.ID)
+
+	err := repo.UpdateFields(p.ID, map[string]any{"visibility": ""})
+	require.Error(t, err, "空文字が enum 列に入ってはいけない (入るなら handler の検証を緩められる)")
+	assert.Contains(t, err.Error(), "page_visibility_enum")
+
+	// 対照: 正しい値は通ること。
+	require.NoError(t, repo.UpdateFields(p.ID, map[string]any{"visibility": "followers"}))
+	got, err := repo.FindByID(p.ID)
+	require.NoError(t, err)
+	assert.Equal(t, model.PageVisibilityFollowers, got.Visibility)
+}

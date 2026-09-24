@@ -27,6 +27,21 @@ type EndpointLimit struct {
 	// 429 for this endpoint. nil なら汎用 RateLimitExceeded。signin 系は
 	// TOO_MANY_AUTHENTICATION_FAILURES を返すために使う (#1829)。
 	RejectResponse func() map[string]any
+	// UserBucketOnly drops the IP bucket for this endpoint (#3106).
+	//
+	// **未認証のリクエストで管理者を締め出せる経路を作らないため。** limiter は
+	// route の権限検査より前に走るので、403 になるリクエストでも bucket を消費する。
+	// 認証済みの利用者は user と IP の**両方**を消費するので、同じ出口 IP
+	// (CGNAT・社内 NAT・`trustProxy` の誤設定) から未認証で叩き続けられると、
+	// **正当なモデレーターの照会が窓のあいだ 429 になる**。
+	//
+	// IP 照会の上限が守りたいのは「認証済みの利用者による濫用」で、そちらは
+	// user bucket が押さえる。未認証は権限検査が 403 で落として何も開示しないので、
+	// IP bucket はこの endpoint 群では**守るものが無く、締め出しだけを生む**。
+	//
+	// 既定 (false) では今までどおり両方を見る — auth 系のように**未認証の試行
+	// そのもの**を抑えたい endpoint では IP bucket が本体なので、一律には外さない。
+	UserBucketOnly bool
 }
 
 // LimitInfo holds the result of a rate limit check.
@@ -106,7 +121,11 @@ func (s *RedisRateLimitStore) Check(ctx context.Context, key string, duration ti
 // Redis の ZRANGE は member を文字列で返すため。
 func parseIntFromString(s string) int64 {
 	var v int64
-	fmt.Sscanf(s, "%d", &v)
+	// 読めない値は 0 を返す。呼び出し側は Redis のカウンタを読む経路で、
+	// 0 と「未設定」を区別していない。
+	if _, err := fmt.Sscanf(s, "%d", &v); err != nil {
+		return 0
+	}
 	return v
 }
 
@@ -151,8 +170,15 @@ func (rl *RateLimiter) Disable() {
 }
 
 // SetPolicyProvider wires a PolicyProvider so authenticated user の
-// rateLimitFactor が反映される。trusted user に factor=2.0 を割り当てて
-// 実効 Max を 2 倍にする等の運用が可能 (#606 item 4)。
+// rateLimitFactor が反映される。
+//
+// **`rateLimitFactor` は除数 (#3037 レビュー 2 周目で実測)。** `scaledMax` は
+// `base / factor` なので、**値が大きいほど実効 Max は小さくなる** — trusted
+// user を緩めるなら 0.5 のような 1 未満の値を割り当てる。以前ここには
+// 「factor=2.0 で実効 Max を 2 倍にする」と書いてあったが逆で、そのとおりに
+// 設定すると半分に締まる (倒れる向きは安全側だが、設定の効き方の記述が
+// 実装と食い違っていた)。upstream `RateLimiterService.limit()` の
+// `max: limitation.max / factor` と同じ。
 func (rl *RateLimiter) SetPolicyProvider(p PolicyProvider) {
 	rl.policyProvider = p
 }
@@ -178,6 +204,9 @@ func (rl *RateLimiter) Middleware() echo.MiddlewareFunc {
 			}
 
 			actors := rl.resolveActors(c)
+			if limit.UserBucketOnly {
+				actors = dropIPActors(actors)
+			}
 			if len(actors) == 0 {
 				return next(c)
 			}
@@ -251,7 +280,10 @@ func (rl *RateLimiter) resolveActors(c echo.Context) []rateLimitActor {
 		// 同一 IP で複数 user として扱われるが、auth 系 endpoint は 1h/60 程度
 		// と緩いので実害は小さい (個別 user の rate-limit は userID bucket で
 		// 守られる)。
-		if rl.enableIPRateLimit {
+		// **プロセス内の呼び出しは IP バケットを使わない。** プラグインの
+		// `AsUser` は実在しない `127.0.0.1` を名乗るので、そのままだと全利用者が
+		// 単一のバケットを取り合い、1 人の操作で他の全員が 429 になる。
+		if rl.enableIPRateLimit && !IsInternalCall(c.Request().Context()) {
 			actors = append(actors, rateLimitActor{
 				key:    ipHash(c.RealIP()),
 				factor: 1.0, // IP 由来 bucket は user 単位の factor を適用しない
@@ -259,10 +291,29 @@ func (rl *RateLimiter) resolveActors(c echo.Context) []rateLimitActor {
 		}
 		return actors
 	}
-	if !rl.enableIPRateLimit {
+	if !rl.enableIPRateLimit || IsInternalCall(c.Request().Context()) {
+		// 未認証のプロセス内呼び出し (プラグインの `Anonymous()`) も同じ理由で
+		// 共有バケットから外す。利用者単位のバケットが無いので、ここを外すと
+		// 該当経路は事実上無制限になるが、呼び出せるのは自分が同梱した
+		// プラグインだけ (外部からの入力は元のリクエストの側で既に制限を受ける)。
 		return nil
 	}
 	return []rateLimitActor{{key: ipHash(c.RealIP()), factor: 1.0}}
+}
+
+// dropIPActors removes IP-derived buckets, leaving only user buckets.
+//
+// **`ipHash` が付ける `ip-` prefix で判別する。** user bucket は ULID をそのまま
+// key にしており (`resolveActors` の注記)、`ip-` で始まらないことが保証されている。
+func dropIPActors(actors []rateLimitActor) []rateLimitActor {
+	out := actors[:0:0]
+	for _, a := range actors {
+		if strings.HasPrefix(a.key, ipBucketPrefix) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // userFactor returns the rateLimitFactor from the user's role policies.
@@ -339,23 +390,34 @@ func (rl *RateLimiter) rejectRequest(c echo.Context, info LimitInfo, limit *Endp
 
 // ipHash computes a rate-limit key for an IP address.
 // TS版 getIpHash 互換: IPv6は/64マスク、IPv4はフルアドレスをハッシュ。
+// IPHash exposes the bucket key derivation to callers outside this package.
+//
+// **同じ丸め方を使うため。** プラグインの peer 経路 (#2537) も IP を key に
+// するが、生のアドレスを使うと IPv6 では /64 の中でアドレスを回すだけで
+// いくらでも新しい枠が取れる。
+func IPHash(ipStr string) string { return ipHash(ipStr) }
+
+// ipBucketPrefix marks IP-derived bucket keys. user bucket は ULID をそのまま
+// key にするのでこの prefix と衝突しない (`resolveActors` の注記)。
+const ipBucketPrefix = "ip-"
+
 func ipHash(ipStr string) string {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		// パース不能な場合はSHA256フォールバック
 		h := sha256.Sum256([]byte(ipStr))
 		n := new(big.Int).SetBytes(h[:8])
-		return "ip-" + n.Text(36)
+		return ipBucketPrefix + n.Text(36)
 	}
 
 	if ip4 := ip.To4(); ip4 != nil {
 		// IPv4: フルアドレスをそのまま使用
 		n := new(big.Int).SetBytes(ip4)
-		return "ip-" + n.Text(36)
+		return ipBucketPrefix + n.Text(36)
 	}
 
 	// IPv6: /64マスク（先頭8バイトのみ）
 	ip16 := ip.To16()
 	n := new(big.Int).SetBytes(ip16[:8])
-	return "ip-" + n.Text(36)
+	return ipBucketPrefix + n.Text(36)
 }

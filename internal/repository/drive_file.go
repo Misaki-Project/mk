@@ -91,11 +91,19 @@ type DriveFileRepository interface {
 	// (see orphanRemoteAttachmentWhere). afterID は keyset cursor で、空なら
 	// 先頭から。
 	ListOrphanRemoteAttachmentCandidates(cutoffID, afterID string, limit int) ([]string, error)
-	// DeleteRemoteCache removes cached remote files (isLink=false with host set)
-	// — the rows whose actual bytes are cached locally / in object storage.
-	// Returns affected count. Used as the DB-only fallback for
-	// admin/drive/clean-remote-files when no storage backend is wired.
-	DeleteRemoteCache() (int64, error)
+	// ExpireRemoteCache turns cached remote files (isLink=false with host set)
+	// into link rows instead of deleting them (#3102).
+	//
+	// **upstream と同じ動作にしてある。** `CleanRemoteFilesProcessorService` は
+	// `deleteFileSync(file, true)` を呼び、`deletePostProcess` の `isExpired`
+	// 分岐が**行を残して link に倒す**。行ごと消すと `note.fileIds` の指す先が
+	// 無くなり、packer が引けない ID を捨てるので**過去の投稿から添付が黙って
+	// 消える**。実体 (object storage / ローカル FS) は呼び出し側が先に消すので、
+	// 容量はどちらでも空く。
+	//
+	// `uri` を持たない行だけは倒せないので削除する (upstream の else 枝と同じ)。
+	// 戻り値は倒した行と消した行の合計。
+	ExpireRemoteCache() (int64, error)
 	// ListRemoteCache returns up to limit cached remote files (isLink=false with
 	// host set) so the caller can delete their object-storage objects before the
 	// DB rows. Order is unspecified.
@@ -103,6 +111,9 @@ type DriveFileRepository interface {
 	// ListByUserAll returns up to limit files owned by userID across all folders
 	// (admin/delete-all-files-of-a-user storage cleanup).
 	ListByUserAll(userID string, limit int) ([]*model.DriveFile, error)
+	// ExpireByIDs turns the given rows into link rows (#3102)。ExpireRemoteCache
+	// と同じ変換を id 指定で行う (storage を先に消すバッチ経路が使う)。
+	ExpireByIDs(ids []string) (int64, error)
 	// DeleteByIDs removes the given rows in one statement. Returns affected count.
 	DeleteByIDs(ids []string) (int64, error)
 	// DeleteByUser removes every drive_file owned by userID. Returns affected
@@ -132,6 +143,9 @@ func (r *driveFileRepository) Create(f *model.DriveFile) error {
 }
 
 func (r *driveFileRepository) FindByID(id string) (*model.DriveFile, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var f model.DriveFile
 	if err := r.db.First(&f, "id = ?", id).Error; err != nil {
 		return nil, err
@@ -140,6 +154,7 @@ func (r *driveFileRepository) FindByID(id string) (*model.DriveFile, error) {
 }
 
 func (r *driveFileRepository) FindByIDs(ids []string) ([]*model.DriveFile, error) {
+	ids = storableIDs(ids)
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -152,6 +167,9 @@ func (r *driveFileRepository) FindByIDs(ids []string) ([]*model.DriveFile, error
 
 // FindByMD5 returns the user's most recent file with the given md5 hash.
 func (r *driveFileRepository) FindByMD5(userID, md5 string) (*model.DriveFile, error) {
+	if !storable(userID) || !storable(md5) {
+		return nil, ErrNotFound
+	}
 	var f model.DriveFile
 	if err := r.db.
 		Where("\"userId\" = ? AND md5 = ?", userID, md5).
@@ -166,6 +184,11 @@ func (r *driveFileRepository) FindByMD5(userID, md5 string) (*model.DriveFile, e
 // oldest first (id ASC). upstream find-by-hash の findBy({md5, userId}) は
 // order 未指定だが、決定的な応答のため id 昇順に固定する。
 func (r *driveFileRepository) FindAllByMD5(userID, md5 string) ([]*model.DriveFile, error) {
+	// 列に入らない値はどの行とも一致しえない (#3025)。**引く前に弾く** —
+	// 比較の右辺に載せるとクエリごと落ちて 500 になる。
+	if !storable(userID) || !storable(md5) {
+		return nil, nil
+	}
 	var files []*model.DriveFile
 	if err := r.db.
 		Where("\"userId\" = ? AND md5 = ?", userID, md5).
@@ -181,6 +204,9 @@ func (r *driveFileRepository) FindAllByMD5(userID, md5 string) ([]*model.DriveFi
 // OR 3 条件は migration 000059-000061 (#1625) の各列 index を BitmapOr で
 // 束ねて解決される (seq scan 回避)。
 func (r *driveFileRepository) FindByAnyURL(url string) (*model.DriveFile, error) {
+	if !storable(url) {
+		return nil, ErrNotFound
+	}
 	if url == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -195,6 +221,9 @@ func (r *driveFileRepository) FindByAnyURL(url string) (*model.DriveFile, error)
 }
 
 func (r *driveFileRepository) FindByURI(uri string) (*model.DriveFile, error) {
+	if !storable(uri) {
+		return nil, ErrNotFound
+	}
 	if uri == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -215,6 +244,9 @@ func (r *driveFileRepository) FindByURI(uri string) (*model.DriveFile, error) {
 // ため、それらの match は dead clause だった。primary 単独 + unique index
 // で planner も最短経路に落とせる (#637 review UR-014)。
 func (r *driveFileRepository) FindByAccessKey(accessKey string) (*model.DriveFile, error) {
+	if !storable(accessKey) {
+		return nil, ErrNotFound
+	}
 	if accessKey == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -231,6 +263,9 @@ func (r *driveFileRepository) FindByAccessKey(accessKey string) (*model.DriveFil
 // 引く必要がある (#1414)。3 列とも unique index 付きで planner は bitmap-or
 // に落とせる。primary のみで充足する mediaproxy.swapToVariant とは別経路。
 func (r *driveFileRepository) FindByAnyAccessKey(accessKey string) (*model.DriveFile, error) {
+	if !storable(accessKey) {
+		return nil, ErrNotFound
+	}
 	if accessKey == "" {
 		return nil, gorm.ErrRecordNotFound
 	}
@@ -257,6 +292,34 @@ func (r *driveFileRepository) Delete(f *model.DriveFile) error {
 
 // ListByUser returns the user's drive files filtered/sorted per the
 // interface doc (#1564).
+// driveTypeFilter applies upstream files.ts の `type` 絞り込みを 1 箇所に集める。
+//
+// upstream `admin/drive/files.ts` と `drive/files.ts` は `/*` 終端を
+// `type.replace('/*','/') + '%'` の prefix LIKE にし、それ以外は完全一致にする。
+//
+// **LIKE のパターンは escape する (#3037)。** upstream は生のまま載せるので、
+// `image/_` のような値が 1 文字 wildcard として働く。MIME の subtype に
+// `_` は稀だが使えるので、escape しないと「その型だけ」を指定したつもりの
+// 絞り込みが別の型まで拾う。mk-go は #1054 から LIKE を必ず escape する方針で、
+// ここだけ通っていなかった (docs/divergence.md)。
+//
+// ok=false は「一致しえない値」= 呼び出し側は空を返す。列に入らない値
+// (NUL / 不正な UTF-8) がそれで、比較の右辺に置くだけで PostgreSQL が
+// クエリごと落とす (#3025 と同じ判断)。
+func driveTypeFilter(q *gorm.DB, fileType string) (*gorm.DB, bool) {
+	if fileType == "" {
+		return q, true
+	}
+	if !storable(fileType) {
+		return q, false
+	}
+	if strings.HasSuffix(fileType, "/*") {
+		return q.Where(`"type" LIKE ? ESCAPE '\'`,
+			escapeSQLLikePattern(strings.TrimSuffix(fileType, "*"))+"%"), true
+	}
+	return q.Where(`"type" = ?`, fileType), true
+}
+
 func (r *driveFileRepository) ListByUser(userID string, folderID *string, anyFolder bool, fileType, sort, untilID, sinceID string, limit int) ([]*model.DriveFile, error) {
 	var rows []*model.DriveFile
 	q := r.db.Where("\"userId\" = ?", userID)
@@ -267,14 +330,9 @@ func (r *driveFileRepository) ListByUser(userID string, folderID *string, anyFol
 			q = q.Where("\"folderId\" = ?", *folderID)
 		}
 	}
-	if fileType != "" {
-		// upstream files.ts: `/*` 終端は `type.replace('/*','/') + '%'` の
-		// prefix LIKE、それ以外は完全一致。
-		if strings.HasSuffix(fileType, "/*") {
-			q = q.Where(`"type" LIKE ?`, strings.TrimSuffix(fileType, "*")+"%")
-		} else {
-			q = q.Where(`"type" = ?`, fileType)
-		}
+	var typeOK bool
+	if q, typeOK = driveTypeFilter(q, fileType); !typeOK {
+		return nil, nil
 	}
 	if untilID != "" {
 		q = q.Where("id < ?", untilID)
@@ -391,16 +449,9 @@ func (r *driveFileRepository) ListForAdmin(userID, origin, host, fileType, until
 			q = q.Where(`"userHost" = ?`, host)
 		}
 	}
-	if fileType != "" {
-		// upstream admin/drive/files.ts:78-84: `/*` 終端は prefix LIKE
-		// (type.replace('/*','/')+'%')、それ以外は完全一致 (#1772、ListByUser と
-		// 同 semantics)。以前は無条件 prefix LIKE で image/* がほぼ 0 件、
-		// image/png が過剰マッチしていた。
-		if strings.HasSuffix(fileType, "/*") {
-			q = q.Where(`"type" LIKE ?`, strings.TrimSuffix(fileType, "*")+"%")
-		} else {
-			q = q.Where(`"type" = ?`, fileType)
-		}
+	var typeOK bool
+	if q, typeOK = driveTypeFilter(q, fileType); !typeOK {
+		return nil, nil
 	}
 	if untilID != "" {
 		q = q.Where("id < ?", untilID)
@@ -438,14 +489,9 @@ func (r *driveFileRepository) ListSystemFiles(fileType, untilID, sinceID string,
 	// (host が表示され、操作者に文脈がある側)。host 単独では出ない —
 	// handler が origin 未指定を local に倒すため (#1545)。
 	q := r.db.Model(&model.DriveFile{}).Where(`"userId" IS NULL AND "userHost" IS NULL`)
-	if fileType != "" {
-		// upstream files.ts と同じく `/*` 終端は prefix LIKE、それ以外は完全一致
-		// (#1772、ListForAdmin と semantics 統一)。
-		if strings.HasSuffix(fileType, "/*") {
-			q = q.Where(`"type" LIKE ?`, strings.TrimSuffix(fileType, "*")+"%")
-		} else {
-			q = q.Where(`"type" = ?`, fileType)
-		}
+	var typeOK bool
+	if q, typeOK = driveTypeFilter(q, fileType); !typeOK {
+		return nil, nil
 	}
 	if untilID != "" {
 		q = q.Where("id < ?", untilID)
@@ -604,12 +650,67 @@ func (r *driveFileRepository) ListOrphanRemoteAttachmentCandidates(cutoffID, aft
 	return ids, nil
 }
 
-func (r *driveFileRepository) DeleteRemoteCache() (int64, error) {
-	// upstream CleanRemoteFilesProcessorService は userHost IS NOT NULL AND
-	// isLink=false (= 実体をキャッシュしているリモートファイル) を消す。旧実装は
-	// isLink=true (= 実体を持たない link-only proxy) を消しており条件が逆だった。
-	tx := r.db.Where(`"isLink" = false AND "userHost" IS NOT NULL`).Delete(&model.DriveFile{})
-	return tx.RowsAffected, tx.Error
+// remoteCacheWhere は「実体をキャッシュしているリモートファイル」の条件。
+// upstream `CleanRemoteFilesProcessorService` の絞りと同じ。
+const remoteCacheWhere = `"isLink" = false AND "userHost" IS NOT NULL`
+
+// linkifyUpdates は実体つきの行を link 行へ倒すときの列の値。
+//
+// **mk-go が普段作る link 行と同じ形にする** (`upsertAttachments` は
+// `isLink: true` / `size: 0` / `storedInternal: false` / access key なしで作る)。
+// 倒した後の行が mk-go 生まれの行と見分けが付かないので、`admin/drive/usage` の
+// 「件数は積み上がるのに使用量は 0」(§5.5) もそのまま成り立つ。
+//
+// **size を 0 にするのは upstream と違う。** あちらは据え置くが、据え置くと
+// 実体が無いのに使用量に乗り続ける (`admin/drive/usage` が嘘をつく)。upstream 自身
+// も集計では `isLink = FALSE` で絞るので、link 行の size は読まれない。
+//
+// **access key は NULL に落とす。** 実体が消えた以上、古い `/files/<key>` の URL を
+// 生かしておく意味が無い (upstream は新しい UUID を振り直して同じ効果を得ている)。
+// `accessKey` の UNIQUE index は NULL を複数許すので衝突しない。
+var linkifyUpdates = map[string]any{
+	"isLink":             true,
+	"url":                gorm.Expr(`"uri"`),
+	"thumbnailUrl":       nil,
+	"webpublicUrl":       nil,
+	"storedInternal":     false,
+	"size":               0,
+	"accessKey":          nil,
+	"thumbnailAccessKey": nil,
+	"webpublicAccessKey": nil,
+}
+
+func (r *driveFileRepository) ExpireRemoteCache() (int64, error) {
+	return r.expireWhere(remoteCacheWhere)
+}
+
+func (r *driveFileRepository) ExpireByIDs(ids []string) (int64, error) {
+	// **列に入らない値は引く前に落とす** (#3025)。DeleteByIDs と同じ扱い。
+	ids = storableIDs(ids)
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return r.expireWhere(`id IN ?`, ids)
+}
+
+// expireWhere link-ifies the matching rows, deleting the ones without a uri.
+//
+// **`uri` が無い行は倒せない** — link 行の `url` は `uri` から作るので、NULL を
+// 入れると NOT NULL 制約に当たるか、当たらなくても表示できない行が残る。upstream も
+// `file.uri != null` を条件にして、満たさない行は削除する。
+func (r *driveFileRepository) expireWhere(where string, args ...any) (int64, error) {
+	var total int64
+	tx := r.db.Model(&model.DriveFile{}).
+		Where(where, args...).Where(`"uri" IS NOT NULL`).Updates(linkifyUpdates)
+	if tx.Error != nil {
+		return 0, tx.Error
+	}
+	total += tx.RowsAffected
+	del := r.db.Where(where, args...).Where(`"uri" IS NULL`).Delete(&model.DriveFile{})
+	if del.Error != nil {
+		return total, del.Error
+	}
+	return total + del.RowsAffected, nil
 }
 
 func (r *driveFileRepository) ListRemoteCache(limit int) ([]*model.DriveFile, error) {
@@ -636,6 +737,7 @@ func (r *driveFileRepository) ListByUserAll(userID string, limit int) ([]*model.
 }
 
 func (r *driveFileRepository) DeleteByIDs(ids []string) (int64, error) {
+	ids = storableIDs(ids)
 	if len(ids) == 0 {
 		return 0, nil
 	}

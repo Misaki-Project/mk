@@ -338,8 +338,7 @@ func monotonicNanos() int64 { return int64(time.Since(processStart)) }
 
 // ErrResizeAfterShutdown is returned by Resize when the pool's owning
 // Server has already shut down. Callers (auto-scale controller) should
-// treat this as "stop trying to scale, the server is gone" — same
-// semantics as driver.ErrResizeNotSupported on asynq.
+// treat this as "stop trying to scale, the server is gone".
 var ErrResizeAfterShutdown = errors.New("mkqdriver: pool already shut down")
 
 // Handle registers a handler for the given task type. Must be called
@@ -1296,14 +1295,14 @@ var ErrHandlerAbandoned = errors.New("mkqdriver: handler did not return before i
 // mutated after the closure is created (Server.Start enforces this
 // by snapshotting via maps.Clone before the call).
 //
-// driver.SkipRetry → mkq.ErrUnrecoverable conversion lives here so
+// driver.ErrSkipRetry → mkq.ErrUnrecoverable conversion lives here so
 // processors can keep their existing %w-wrap idiom unchanged.
 func newDispatchHandler(handlers map[string]driver.HandlerFunc, qname string, obs driver.Observer, deadline time.Duration, ab abandonSink) mkq.Handler[framedPayload] {
 	return func(ctx context.Context, job *mkq.Job[framedPayload]) (any, error) {
 		taskType := job.Data.Type
 		h := handlers[taskType]
 		if h == nil {
-			// 未登録 task type は SkipRetry 相当 (再 enqueue しても処理者が
+			// 未登録 task type は ErrSkipRetry 相当 (再 enqueue しても処理者が
 			// いないので無限ループになる)。
 			return nil, fmt.Errorf("mkqdriver: no handler for %q: %w", taskType, mkq.ErrUnrecoverable)
 		}
@@ -1316,7 +1315,7 @@ func newDispatchHandler(handlers map[string]driver.HandlerFunc, qname string, ob
 		// observer 未配線なら clock も触らない (hot path、#2277)。
 		if obs == nil {
 			err := run(ctx)
-			if err != nil && errors.Is(err, driver.SkipRetry) {
+			if err != nil && errors.Is(err, driver.ErrSkipRetry) {
 				return nil, fmt.Errorf("%w: %w", err, mkq.ErrUnrecoverable)
 			}
 			return nil, err
@@ -1332,7 +1331,7 @@ func newDispatchHandler(handlers map[string]driver.HandlerFunc, qname string, ob
 		started := time.Now()
 		err := run(ctx)
 		obs.ObserveProcessing(qname, time.Since(started), err != nil)
-		if err != nil && errors.Is(err, driver.SkipRetry) {
+		if err != nil && errors.Is(err, driver.ErrSkipRetry) {
 			return nil, fmt.Errorf("%w: %w", err, mkq.ErrUnrecoverable)
 		}
 		return nil, err

@@ -65,9 +65,9 @@ func (i *fakeInspector) GetQueueInfo(qname string) (*driver.InspectorInfo, error
 	return &driver.InspectorInfo{Queue: qname, Pending: pending}, nil
 }
 
-// PendingCount mirrors GetQueueInfo. この fake は Prometheus 経路の検証用で
+// DispatchableCount mirrors GetQueueInfo. この fake は Prometheus 経路の検証用で
 // autoscaler は通らないが、driver.Inspector を満たすために要る。
-func (i *fakeInspector) PendingCount(qname string) (int, error) {
+func (i *fakeInspector) DispatchableCount(qname string) (int, error) {
 	if err, ok := i.errByQueue[qname]; ok {
 		return 0, err
 	}
@@ -95,6 +95,9 @@ func (i *fakeInspector) ListScheduledTasks(qname string, page, pageSize int) ([]
 	return nil, nil
 }
 func (i *fakeInspector) ListRetryTasks(qname string, page, pageSize int) ([]*driver.TaskSummary, error) {
+	return nil, nil
+}
+func (i *fakeInspector) ListDelayedTasks(qname string, page, pageSize int) ([]*driver.TaskSummary, error) {
 	return nil, nil
 }
 func (i *fakeInspector) GetTaskInfo(qname, taskID string) (*driver.TaskSummary, error) {
@@ -227,7 +230,7 @@ func TestBindDriver_ReplacesPreviousBinding(t *testing.T) {
 // accumulated scrape_errors_total counter survives a BindDriver re-bind
 // (driver swap mid-life), because scrapeErrs lives on Metrics not the
 // per-bind driverCollector. Without this, an operator hot-swapping
-// drivers (e.g. asynq → mkq via config reload) would silently lose
+// drivers (via config reload) would silently lose
 // alerting history reachable via Metrics.ScrapeErrorCount (#1136
 // follow-up).
 //
@@ -372,7 +375,7 @@ func TestCollect_QuarantinedGauge(t *testing.T) {
 }
 
 func TestCollect_QuarantinedGaugeZeroWithoutSupport(t *testing.T) {
-	// asynq のように追跡しない driver では常に 0。scrape が落ちたり
+	// quarantine を追跡しない driver では常に 0。scrape が落ちたり
 	// gauge ごと消えたりしないこと。
 	m := New()
 	m.BindDriver(&fakeDriver{workers: map[string]int{"inbox": 4}, inspector: &fakeInspector{}})

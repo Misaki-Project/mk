@@ -254,18 +254,29 @@ func TestVerifyInboxAdmission_DateSkew(t *testing.T) {
 	})
 }
 
-// X-Date が Date より優先されること (upstream parser と同じ)。
+// **X-Date は署名されているときだけ Date より優先される (#3037)。**
+//
+// 無条件に優先すると、捕まえたリクエストに新しい `X-Date` を足すだけで
+// clockSkew 検査を迂回できる (署名は元の `Date` に対して作られているので
+// そのまま通る) = 一度盗聴できた配送を永久に再投函できる。
 func TestInboxDateHeader(t *testing.T) {
 	tests := []struct {
-		name  string
-		date  string
-		xDate string
-		want  string
+		name   string
+		date   string
+		xDate  string
+		signed []string
+		want   string
 	}{
-		{name: "Date のみ", date: "d", want: "d"},
-		{name: "X-Date のみ", xDate: "x", want: "x"},
-		{name: "両方あれば X-Date", date: "d", xDate: "x", want: "x"},
-		{name: "どちらも無い", want: ""},
+		{name: "Date のみ", date: "d", signed: []string{"date"}, want: "d"},
+		{name: "どちらも無い", signed: []string{"date"}, want: ""},
+		// 署名されていない X-Date は無視する (= 再投函の穴を塞ぐ)。
+		{name: "X-Date が未署名なら Date", date: "d", xDate: "x", signed: []string{"date"}, want: "d"},
+		{name: "X-Date が未署名で Date が無い", xDate: "x", signed: []string{"date"}, want: ""},
+		// 署名している peer には従来どおり。
+		{name: "X-Date が署名済みなら優先", date: "d", xDate: "x", signed: []string{"date", "x-date"}, want: "x"},
+		{name: "署名済み X-Date のみ", xDate: "x", signed: []string{"x-date"}, want: "x"},
+		// 署名ヘッダ名の大小は揃っていない peer がいる。
+		{name: "大文字の署名ヘッダ名", date: "d", xDate: "x", signed: []string{"Date", "X-Date"}, want: "x"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -276,7 +287,7 @@ func TestInboxDateHeader(t *testing.T) {
 			if tt.xDate != "" {
 				h.Set("X-Date", tt.xDate)
 			}
-			if got := InboxDateHeader(h); got != tt.want {
+			if got := InboxDateHeader(h, tt.signed); got != tt.want {
 				t.Fatalf("InboxDateHeader() = %q, want %q", got, tt.want)
 			}
 		})
@@ -304,4 +315,91 @@ func TestSplitDigestHeader(t *testing.T) {
 			t.Errorf("splitDigestHeader(%q) = (%q,%q,%v), want (%q,%q,%v)", tt.in, algo, value, ok, tt.algo, tt.value, tt.ok)
 		}
 	}
+}
+
+// **JS が読めて Go が読めない書式で skew 検査が丸ごと飛んでいた。**
+// `http.ParseTime` が扱うのは RFC1123 (GMT) / RFC850 / ANSIC だけで、
+// RFC1123Z と ISO8601 は失敗する。読めない値は upstream に合わせて通す設計
+// なので、そういう Date を出す peer は**30 日前のリクエストでも通っていた** —
+// replay guard の TTL が切れた後は同じ activity を無期限に再投函できる。
+func TestVerifyInboxAdmission_DateFormatsJSAccepts(t *testing.T) {
+	body := []byte(`{"type":"Follow"}`)
+	digest := SHA256Digest(body)
+	const host = "example.com"
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	restore := nowFuncForAdmission
+	nowFuncForAdmission = func() time.Time { return base }
+	t.Cleanup(func() { nowFuncForAdmission = restore })
+
+	admit := func(date string) error {
+		return VerifyInboxAdmission(sig("(request-target)", "date", "host", "digest"),
+			host, host, date, digest, body)
+	}
+	stale := base.Add(-30 * 24 * time.Hour).UTC()
+
+	t.Run("窓の外は書式によらず弾く", func(t *testing.T) {
+		for name, layout := range map[string]string{
+			"RFC1123Z":    time.RFC1123Z,
+			"RFC3339":     time.RFC3339,
+			"RFC3339Nano": time.RFC3339Nano,
+		} {
+			t.Run(name, func(t *testing.T) {
+				if err := admit(stale.Format(layout)); !errors.Is(err, ErrInboxDateSkew) {
+					t.Fatalf("30 日前の Date が通った (%s): %v", layout, err)
+				}
+			})
+		}
+		// HTTP-date の GMT 形は元から `http.ParseTime` が読む。
+		t.Run("HTTP-date", func(t *testing.T) {
+			if err := admit(stale.Format(http.TimeFormat)); !errors.Is(err, ErrInboxDateSkew) {
+				t.Fatalf("30 日前の Date が通った: %v", err)
+			}
+		})
+		// **`UTC` の綴りも読む (2 周目レビュー H1)。** Go の
+		// `t.UTC().Format(time.RFC1123)` や Python の `%Z` はこれを出す。
+		// 読めないと、その peer からの署名付き POST を無期限に再投函できる。
+		t.Run("RFC1123 UTC", func(t *testing.T) {
+			if err := admit(stale.Format(time.RFC1123)); !errors.Is(err, ErrInboxDateSkew) {
+				t.Fatalf("30 日前の Date が通った (UTC 綴り): %v", err)
+			}
+		})
+	})
+
+	t.Run("窓の中は書式によらず通る", func(t *testing.T) {
+		for name, layout := range map[string]string{
+			"RFC1123Z":    time.RFC1123Z,
+			"RFC3339":     time.RFC3339,
+			"RFC3339Nano": time.RFC3339Nano,
+			"RFC1123 UTC": time.RFC1123,
+		} {
+			t.Run(name, func(t *testing.T) {
+				if err := admit(base.Format(layout)); err != nil {
+					t.Fatalf("通るはずが %v", err)
+				}
+			})
+		}
+	})
+
+	// 本当に解釈できない値は従来どおり通す (upstream も Invalid Date は素通し)。
+	t.Run("解釈できない値は通す", func(t *testing.T) {
+		if err := admit("not a date at all"); err != nil {
+			t.Fatalf("通るはずが %v", err)
+		}
+	})
+
+	// **ゾーン略称は読まない (レビュー M2)。** Go は未知の略称をオフセット 0 の
+	// 捏造ゾーンとして受けるので、絶対時刻がサーバーの TZ 設定に依存してずれる。
+	// ずれた瞬間に skew の窓から外れて 401 になり、**これまで検査を skip して
+	// 通っていた peer を落とす**方向の退行になる。読めない値として扱う。
+	t.Run("ゾーン略称は読まない", func(t *testing.T) {
+		for _, raw := range []string{
+			"Mon, 14 Sep 2026 09:00:00 JST",
+			"Sun, 13 Sep 2026 20:00:00 EST",
+			"Mon, 14 Sep 2026 09:00:00 MST",
+		} {
+			if err := admit(raw); err != nil {
+				t.Fatalf("ゾーン略称の Date を解釈して弾いている (%s): %v", raw, err)
+			}
+		}
+	})
 }

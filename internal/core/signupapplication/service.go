@@ -18,12 +18,14 @@
 package signupapplication
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -62,7 +64,13 @@ type Service struct {
 	idGen id.Generator
 	clock func() time.Time
 	ttl   time.Duration
+	// receivedNotifier は申請の受付をモデレーターへ知らせる (#2987)。
+	// 未配線なら通知を出さない (既存の挙動)。
+	receivedNotifier ReceivedNotifier
 }
+
+// SetReceivedNotifier wires the moderator notification emitted on Apply (#2987).
+func (s *Service) SetReceivedNotifier(n ReceivedNotifier) { s.receivedNotifier = n }
 
 // NewService constructs a Service.
 func NewService(repo repository.SignupApplicationRepository, idGen id.Generator) *Service {
@@ -119,6 +127,14 @@ func (s *Service) Apply(answers []Answer) (*model.SignupApplication, string, err
 		err = s.repo.Create(app)
 		switch {
 		case err == nil:
+			// **申請は永続化済みなので、通知の失敗で申請を失わせない。**
+			// 呼び出し元の ctx も使わない — 申請者のブラウザが切断しても
+			// モデレーターへの通知は出す (abuseReport #2868 と同じ判断)。
+			if s.receivedNotifier != nil {
+				if nerr := s.receivedNotifier.NotifySignupApplicationReceived(context.Background(), app); nerr != nil {
+					slog.Warn("signup-application: notify moderators failed", "application", app.ID, "err", nerr)
+				}
+			}
 			return app, code, nil
 		case errors.Is(err, repository.ErrSignupApplicationCodeCollision):
 			_ = attempt // 採り直す
@@ -168,7 +184,8 @@ func (s *Service) ByClaimCode(code string) (*model.SignupApplication, error) {
 //
 // **ここでは registration_ticket を発行しない。** 発行を承認時にすると、登録
 // までの数日間、利用者に渡していない bearer 相当の credential が DB に置き
-// っぱなしになる。チケットは登録経路 (#2556) で発行して即消費する。
+// っぱなしになる。チケットは登録経路のうち**メール確認を挟むときだけ**
+// (#2556 / #2813) 発行する。
 func (s *Service) Approve(applicationID, moderatorID string) error {
 	return s.review(applicationID, moderatorID, true)
 }

@@ -7,7 +7,7 @@ import (
 )
 
 // HandlerFunc processes a single task. Returning an error wrapping
-// SkipRetry tells the driver not to retry even if attempts remain.
+// ErrSkipRetry tells the driver not to retry even if attempts remain.
 type HandlerFunc func(ctx context.Context, t Task) error
 
 // Client enqueues tasks. Drivers translate the (taskType, payload,
@@ -27,8 +27,8 @@ type Server interface {
 }
 
 // InspectorInfo is the per-queue summary returned by Inspector.GetQueueInfo.
-// Field names mirror asynq.QueueInfo so the admin UI mapping stays
-// straightforward.
+// Field names are the driver-neutral counts the admin/queue endpoints map
+// onto the BullMQ shape the frontend expects.
 type InspectorInfo struct {
 	Queue     string
 	Size      int
@@ -90,8 +90,8 @@ type TaskSummary struct {
 	CompletedAt time.Time
 	// ProcessedBy is the worker name that most recently dequeued the job
 	// (BullMQ job.processedBy / mkq `pb`). Empty for never-run jobs and for
-	// drivers without the concept (asynq). Surfaced as the upstream
-	// optional QueueJob.processedBy field.
+	// drivers without the concept. Surfaced as the upstream optional
+	// QueueJob.processedBy field.
 	ProcessedBy string
 
 	// 以下は BullMQ の job HASH をそのまま運ぶ (#2689)。admin の job 詳細は
@@ -127,8 +127,15 @@ type Inspector interface {
 	Queues() ([]string, error)
 	GetQueueInfo(qname string) (*InspectorInfo, error)
 
-	// PendingCount returns just InspectorInfo.Pending for the named
-	// queue, without computing the rest of the summary.
+	// DispatchableCount returns how many jobs a worker could dequeue from
+	// the named queue right now: the pending (wait) count, or 0 while the
+	// queue is paused. It skips the rest of the summary.
+	//
+	// **pause 中は 0 を返す (#3166)。** BullMQ 6 (mkq v1.1.0) では pause しても
+	// ジョブは wait に残るので、InspectorInfo.Pending には backlog が見える。
+	// オートスケーラがそれを深さと読むと、ジョブを取れないキューの worker を
+	// 最大数まで増やし、pause が続く限り減らさない。だから Pending とは
+	// pause 中だけ値が違う。
 	//
 	// **オートスケーラは 1Hz x 管理キュー数で回るので、集計 API を使わせない。**
 	// GetQueueInfo は admin パネル向けに wait/active/delayed/completed/failed の
@@ -140,7 +147,7 @@ type Inspector interface {
 	// delayed が federation 障害で数千件に膨らむと GetQueueInfo の
 	// ZRANGE + N x HGETALL もそれに比例する。admin パネルを開いている間だけ
 	// なら許容でも、常時 1Hz で走らせる先ではない。
-	PendingCount(qname string) (int, error)
+	DispatchableCount(qname string) (int, error)
 
 	DeleteTask(qname, taskID string) error
 	DeleteAllPendingTasks(qname string) (int, error)
@@ -157,6 +164,14 @@ type Inspector interface {
 	ListActiveTasks(qname string, page, pageSize int) ([]*TaskSummary, error)
 	ListScheduledTasks(qname string, page, pageSize int) ([]*TaskSummary, error)
 	ListRetryTasks(qname string, page, pageSize int) ([]*TaskSummary, error)
+	// ListDelayedTasks returns the whole delayed bucket (scheduled and
+	// retry-backoff jobs together), latest fire time first.
+	//
+	// upstream の admin/queue/jobs は Bull の state 名 `delayed` を受け取り、
+	// delayed ZSET を新しい順に返す。Scheduled / Retry を後から混ぜると、retry で
+	// delayed に戻った job の予定時刻 (ZSET の score) を HASH から復元できず、
+	// 並びが崩れる (#3167)。
+	ListDelayedTasks(qname string, page, pageSize int) ([]*TaskSummary, error)
 	// ListCompletedTasks / ListFailedTasks return finished jobs retained in
 	// the completed / failed buckets. Drivers without finished-job retention
 	// return an empty slice.
@@ -184,10 +199,21 @@ type Inspector interface {
 }
 
 // Scheduler registers cron-driven recurring tasks. cronspec follows
-// the underlying driver's cron syntax (asynq accepts standard 5-field
-// cron expressions).
+// the underlying driver's cron syntax (mkq accepts standard 5-field cron
+// expressions and the `@daily` style descriptors).
 type Scheduler interface {
 	Register(cronspec, taskType string, payload []byte, opts ...EnqueueOption) error
+	// PruneUnregistered removes the schedules stored for the driver's
+	// queues that this process did not try to Register, and returns them
+	// as "<queue>/<scheduleID>". It does nothing when nothing was
+	// registered, and returns an error without removing anything when any
+	// registration failed.
+	//
+	// **登録先や名前を変えた cron の旧スケジューラを消すため (#3173)。** 消さないと
+	// 永久に発火し続ける — #2818 でプラグインの cron を専用キューへ移したとき、
+	// maintenance 側の 6 本が残って二重実行と handler 無しの失敗を続けていた。
+	// 全ての Register の後に 1 回呼ぶこと。
+	PruneUnregistered() ([]string, error)
 	Start() error
 	Shutdown()
 }
@@ -207,9 +233,9 @@ type Driver interface {
 	Close() error
 
 	// WorkerCount returns the number of workers currently **able to take
-	// work** for qname. Drivers that share a single worker
-	// pool across queues (e.g. asynq) return the pool-wide Concurrency for
-	// every qname. Drivers that have not started their Server yet return 0.
+	// work** for qname. Drivers that share a single worker pool across
+	// queues return the pool-wide Concurrency for every qname. Drivers
+	// that have not started their Server yet return 0.
 	//
 	// Used by the Prometheus metrics layer (`mk_job_workers_active`) and
 	// by the auto-scale controller (#1120 tracker) to read the current
@@ -218,8 +244,7 @@ type Driver interface {
 	// **mkq driver では帳簿上の本数ではない。** handler が閾値を超えて戻って
 	// こない worker を除外して数える (#2657)。詰まった worker を健全として
 	// 数えると autoscale の scale-up 閾値 (本数 x 4) だけが上がり、実際に
-	// 働ける worker が 0 本でも scale-up しない。asynq driver は動的な pool を
-	// 持たないので従来どおり静的な Concurrency を返す。
+	// 働ける worker が 0 本でも scale-up しない。
 	//
 	// mkq driver では Resize も同じ勘定で動くので、「WorkerCount が返した値
 	// + n」を Resize に渡すと n 本増える。ただし総数の上限に当たっている
@@ -230,8 +255,8 @@ type Driver interface {
 	WorkerCount(qname string) int
 
 	// Resize changes the worker pool size for qname to n at runtime.
-	// Returns ErrResizeNotSupported on backends without dynamic resize
-	// support (= asynq today). On supported backends:
+	// Returns ErrResizeNotSupported when there is no pool to resize
+	// (mkq before Server.Start). Otherwise:
 	//
 	//   - n > current: spawn up to (n - current) new worker goroutines.
 	//   - n < current: stop up to (current - n) workers. **In-flight jobs are

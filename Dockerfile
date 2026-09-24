@@ -6,12 +6,12 @@
 
 # Stage 1: Build Go binary
 #
-# patch version まで固定する。`golang:1.26-alpine` のような floating tag は
+# patch version まで固定する。`golang:1.27-alpine` のような floating tag は
 # 「いつ pull したか」でリリースに入る標準ライブラリの patch が変わるため、
 # 「この image は stdlib の既知脆弱性を含まない」を再現可能な形で言えない。
 # go.mod の `go` directive と揃えること (govulncheck は go.mod 側を見るので、
 # ここだけ古いと CI が緑のまま脆弱な binary が出る)。
-FROM golang:1.26.6-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 
 # Step 2 (#618) で chai2010/webp → gen2brain/webp (libwebp on wazero/WASM) に
 # 切替えたので cgo 依存はゼロ。build-base (gcc + musl libc) は不要になった。
@@ -57,16 +57,27 @@ RUN test -f third_party/misskey/packages/backend/node_modules/@misskey-dev/emoji
 # videoThumbnailGenerator API) への HTTP/UDS 呼び出しで実現するので、ここに
 # ffmpeg バイナリを同梱する必要は無い (#637 M2)。
 #
+# ビルドした revision と同梱 frontend の版を埋め込む (#2700)。**Dockerfile の
+# 中では git を呼べない** — `.dockerignore` が `.git` を落とすのでコンテキストに
+# リポジトリが入らない。渡し忘れたときは空のまま埋まり、/about-mkgo 側が
+# 「不明」として表示を省く。
+#
 # plugins/ に置かれたプラグインをビルドに取り込む (#2480)。生成物は gitignore
 # されているので、ここで生成しないと **image だけプラグイン無しになる** (手元で
 # make plugins を実行済みなら COPY で入るが、それに依存すると再現性が無い)。
 # プラグインが 1 つも無ければ何も生成せず、素の go build と同じになる。
+ARG MKGO_COMMIT=
+ARG MKGO_FRONTEND_VERSION=
+ENV REVISION_LDFLAGS="-X github.com/shiroha-a/mk/internal/config.MkGoCommit=${MKGO_COMMIT} -X github.com/shiroha-a/mk/internal/config.MkGoFrontendVersion=${MKGO_FRONTEND_VERSION}"
+
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     GOWORK=off go run ./tools/pluginbuild && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/misskey ./cmd/misskey && \
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w $REVISION_LDFLAGS" -o /app/built/misskey ./cmd/misskey && \
     CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/migrate ./cmd/migrate && \
-    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-remote-host ./cmd/backfill-remote-host
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-remote-host ./cmd/backfill-remote-host && \
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-emoji-system-file ./cmd/backfill-emoji-system-file && \
+    CGO_ENABLED=0 go build -tags nodynamic -trimpath -ldflags="-s -w" -o /app/built/backfill-avatar-public-url ./cmd/backfill-avatar-public-url
 
 # Stage 2: Runtime
 #
@@ -89,6 +100,8 @@ COPY --from=builder /app/built/migrate /app/migrate
 # 使い捨てコンテナで流す (#2706)。
 #   docker compose run --rm --entrypoint /app/backfill-remote-host app -dry-run
 COPY --from=builder /app/built/backfill-remote-host /app/backfill-remote-host
+COPY --from=builder /app/built/backfill-emoji-system-file /app/backfill-emoji-system-file
+COPY --from=builder /app/built/backfill-avatar-public-url /app/backfill-avatar-public-url
 COPY --from=builder /app/migration /app/migration
 
 # 本家のpackages/backend/assets (favicon / icons等) をimageに焼き込む。

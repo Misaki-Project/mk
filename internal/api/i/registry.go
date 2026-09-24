@@ -7,6 +7,8 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/entity"
+	"github.com/shiroha-a/mk/internal/misc/colfit"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 )
 
@@ -14,15 +16,60 @@ import (
 // ^[a-zA-Z0-9_]+$ (#1546)。各 registry endpoint で scope 要素を検証する。
 var registryScopeElemRe = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
+// registry の列幅 (`internal/model/registry_item.go`)。**幅を超えた値は
+// SQLSTATE 22001 でクエリごと落ちる**ので、列に届く前に弾く (#3037)。
+// `i/registry/*` は**任意の認証ユーザー**が叩けるので、長い文字列 1 つで
+// 500 を起こせていた。
+const (
+	registryKeyMaxRunes    = 1024 // key varchar(1024)
+	registryDomainMaxRunes = 512  // domain varchar(512)
+	registryScopeMaxRunes  = 1024 // scope varchar(1024)[]
+)
+
 // validRegistryScope reports whether every scope element matches the upstream
-// pattern. Empty scope ([]) is valid.
+// pattern and fits its column. Empty scope ([]) is valid.
+//
+// **正規表現だけでは足りない。** `^[a-zA-Z0-9_]+$` は文字種しか見ないので、
+// 同じ文字を 1025 個並べるだけで列に入らない値が通っていた。
+//
+// **scope は読み取り側でも弾いてよい。** 元から `INVALID_PARAM` を返す述語
+// (upstream の paramDef 相当) で、長すぎる要素も同じ「形が違う」の一種。
+// `key` / `domain` のように「無い」を返す述語ではない。
 func validRegistryScope(scope []string) bool {
 	for _, s := range scope {
-		if !registryScopeElemRe.MatchString(s) {
+		if !registryScopeElemRe.MatchString(s) || !colfit.Fits(s, registryScopeMaxRunes) {
 			return false
 		}
 	}
 	return true
+}
+
+// storableRegistryValue reports whether a registry key / domain can be stored.
+//
+// **scope だけ検証していた (#3025)。** `key` と `domain` は無検証のまま
+// `key = ?` / `domain = ?` の bind parameter に載るので、NUL を 1 文字入れると
+// クエリごと落ちて 500 になる (`i/registry/get-all` などは**任意の認証
+// ユーザー**が叩ける)。scope と同じ場所で弾く。
+//
+// **幅を見るのは書き込み側だけ (#3037)。** NUL は比較の右辺に置いただけで
+// クエリごと落ちるのでどちらにも要るが、**幅は落ちない** — `varchar(10)` の列に
+// 対する `WHERE v = repeat('a', 2000)` は 0 行を返すだけ (実測)。読み取り側にも
+// 掛けると、1025 文字の key に対する応答が従来の `NO_SUCH_KEY` から
+// `INVALID_PARAM` に変わってしまう。
+//
+// 書き込み側は 22001 で 500 になるので、#3022 と同じく**既存の述語に畳んで
+// 既存の 400 に落とす** — 利用者にできることは変わらないので新しいエラー
+// コードを足さない。
+func storableRegistryValue(key string, domain *string) bool {
+	return colfit.Storable(key) && (domain == nil || colfit.Storable(*domain))
+}
+
+// storableRegistryWrite is storableRegistryValue plus the column widths.
+//
+// `i/registry/set` だけが使う。読み取り側の応答コードを変えないための分離。
+func storableRegistryWrite(key string, domain *string) bool {
+	return colfit.Fits(key, registryKeyMaxRunes) &&
+		(domain == nil || colfit.Fits(*domain, registryDomainMaxRunes))
 }
 
 // registryEffectiveDomain returns the domain a registry request operates on.
@@ -73,10 +120,16 @@ func (h *Handler) RegistryGetDetail(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	req.Scope = normalizeRegistryScope(req.Scope)
-	if !validRegistryScope(req.Scope) {
+	if !validRegistryScope(req.Scope) || !storableRegistryValue(req.Key, req.Domain) {
 		return apierr.JSONInvalidParam(c)
 	}
 	item, err := h.registryRepo.Get(u.ID, req.Key, req.Scope, registryEffectiveDomain(c, req.Domain))
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を「そんなキーは無い」にしない** (#2792)。registry は
+		// クライアントの設定同期に使うので、障害を 400 で返すと「消えた」と
+		// 判断して既定値で上書きしうる。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_KEY", "No such key.", "97a1e8e7-c0f7-47d2-957a-92e61256e01a"))
 	}
@@ -99,7 +152,7 @@ func (h *Handler) RegistryKeys(c echo.Context) error {
 	var req registryScopeDomainRequest
 	_ = c.Bind(&req)
 	req.Scope = normalizeRegistryScope(req.Scope)
-	if !validRegistryScope(req.Scope) {
+	if !validRegistryScope(req.Scope) || !storableRegistryValue("", req.Domain) {
 		return apierr.JSONInvalidParam(c)
 	}
 	keysMap, err := h.registryRepo.KeysWithType(u.ID, req.Scope, registryEffectiveDomain(c, req.Domain))

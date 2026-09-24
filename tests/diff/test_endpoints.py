@@ -29,10 +29,39 @@ META_IGNORE = DEFAULT_IGNORE_KEYS | {
     # バージョンを返す契約なので、mk-go の実装版は別 field にしている (#2274)。
     # TS 側に存在しないのが仕様。
     "mkGoVersion",
+    # ビルドした revision と同梱 fork frontend の版 (#2700)。/about-mkgo が
+    # 「mk-go 1.3.0 (abc1234)」「Misskey 2026.9.0-mk.3」として出す。TS 側に
+    # 対応物が無い。docs/divergence.md に additive field として記載済み。
+    # **埋め込みの無いビルドでは空文字**になるので、値ではなくキーごと無視する
+    # (CI の diff harness は build-arg を渡さないので必ず空になる)。
+    "mkGoCommit", "mkGoFrontendVersion",
+    # 新規登録の username の最小文字数 (#3015)。upstream には対応する設定が
+    # 無い (`preservedUsernames` は名前を 1 つずつ列挙する仕組みなので
+    # 「2 文字以下を全部」を表現できない)。登録フォームが判定に使うので公開
+    # meta に出している。docs/divergence.md に additive field として記載済み。
+    "minimumUsernameLength",
     # 分割アップロード (#2313) は mk-go 独自機能なので policies に TS 側の
     # 対応キーが無い。docs/divergence.md に additive field として記載済み。
     "canUseChunkedUpload", "chunkedUploadMaxConcurrentSessions",
     "chunkedUploadMaxPendingMb",
+    # ロール単位の通知 opt-out (#2898) も mk-go 独自 policy。TS 側に対応キーが
+    # 無い。docs/divergence.md に additive field として記載済み。
+    "optOutNotificationTypes",
+    # カスタム絵文字の登録申請 (#2934) も mk-go 独自 policy。upstream には申請
+    # という概念自体が無いので TS 側にキーが無い。docs/divergence.md に
+    # additive field として記載済み。
+    "canRequestCustomEmojis",
+    # 申請のロール別の期間上限 (#2958) と審査待ち上限 (#2977)。同上。
+    "emojiApplicationMaxPerDay", "emojiApplicationMaxPerWeek",
+    "emojiApplicationMaxPerMonth", "emojiApplicationMaxPending",
+    # カスタム絵文字をアバターデコレーションにできるか (#2975) も mk-go 独自
+    # policy。upstream の avatar decoration は管理者が登録した素材しか使えない
+    # ので TS 側にキーが無い。docs/divergence.md に additive field として記載済み。
+    "canUseEmojiAsAvatarDecoration",
+    # IP から関連アカウントを引けるか (#3104) も mk-go 独自 policy。upstream の
+    # admin/get-user-ips は requireAdmin で policy を持たないため TS 側にキーが
+    # 無い。docs/divergence.md に additive field として記載済み。
+    "canSearchIpHistory",
     # 承認制の登録 (#2554 / #2555) は mk-go 独自機能なので TS 側にキーが無い。
     # meta 直下と features の両方に出る (frontend は features を feature
     # detection に使うため片方だけだと検出できない)。docs/divergence.md に
@@ -83,6 +112,21 @@ USER_IGNORE = DEFAULT_IGNORE_KEYS | {
     # users/show は policies を含むので META_IGNORE と同じ除外が要る。
     "canUseChunkedUpload", "chunkedUploadMaxConcurrentSessions",
     "chunkedUploadMaxPendingMb",
+    # ロール単位の通知 opt-out (#2898)。同上。
+    "optOutNotificationTypes",
+    # カスタム絵文字の登録申請 (#2934)。同上。
+    "canRequestCustomEmojis",
+    # 申請のロール別の期間上限 (#2958) と審査待ち上限 (#2977)。同上。
+    "emojiApplicationMaxPerDay", "emojiApplicationMaxPerWeek",
+    "emojiApplicationMaxPerMonth", "emojiApplicationMaxPending",
+    # カスタム絵文字をアバターデコレーションにできるか (#2975) も mk-go 独自
+    # policy。upstream の avatar decoration は管理者が登録した素材しか使えない
+    # ので TS 側にキーが無い。docs/divergence.md に additive field として記載済み。
+    "canUseEmojiAsAvatarDecoration",
+    # IP から関連アカウントを引けるか (#3104) も mk-go 独自 policy。upstream の
+    # admin/get-user-ips は requireAdmin で policy を持たないため TS 側にキーが
+    # 無い。docs/divergence.md に additive field として記載済み。
+    "canSearchIpHistory",
 }
 
 
@@ -160,7 +204,11 @@ def test_note_state_parity(mkgo, ts):
     assert not diffs, format_diffs(diffs)
 
 
-# /api/i (authoritative MeDetailed). 自己固有 / role 依存 / version-gap を吸収する。
+# /api/i (authoritative MeDetailed). 自己固有 / role 依存 / mk-go 独自の additive を
+# 吸収する。**版ずれ由来の除外は 1 つも無い** — #2303 で 3 件 (app192IconUrl /
+# app512IconUrl / singleUserMode) を整理して以降、下の各項目はすべて版に依存しない
+# 理由で入っている。TS image を上げたときにここを読み直す運用は続けること
+# (docs/upstream-catch-up.md の checklist)。
 I_IGNORE = META_IGNORE | {
     "policies",  # role policy 依存 (instance role 設定で変わる)
     "avatarId", "bannerId", "achievements", "loggedInDays", "signupReason",
@@ -566,13 +614,10 @@ def test_drive_folders_since_id_parity(mkgo, ts):
 
 
 def test_drive_files_since_id_parity(mkgo, ts):
-    # drive/files は **mock からは順序回帰が見えない** 経路。
-    # `internal/testutil/mock_drive.go` の `MockDriveFileRepository.ListByUser` は
-    # sort キーの分岐を持つため sinceID 単独の ASC を実装しておらず、同関数の doc
-    # コメント自身が「**#2766 が終わっても残る**」と書いている。`ListForAdmin` /
-    # `ListSystemFiles` も同様 (#2766 で追跡中)。
-    # **同じファイルの `MockDriveFolderRepository.ListByUser` は #2764 で
-    # SortMockPage に揃っている**ので、drive/folders 側は mock でも見える。
+    # drive/files は、このテストを足した時点では **mock からは順序回帰が
+    # 見えなかった** 経路 (`MockDriveFileRepository.ListByUser` が sinceID 単独の
+    # ASC を実装していなかった)。#2766 で揃えたので今は mock でも見えるが、
+    # mock は production の SQL を実行しないので実 API 側のゲートは残す。
     #
     # `sort` を渡さないのは意図的。production も upstream も sort 指定時は
     # paginationOrder を通らず固定 order を使う (`drive_file.go` の switch)。

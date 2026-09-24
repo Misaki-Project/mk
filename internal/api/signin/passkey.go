@@ -9,7 +9,9 @@ import (
 
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/labstack/echo/v4"
+	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 )
 
 // SigninWithPasskey handles POST /api/signin-with-passkey.
@@ -56,7 +58,17 @@ func (h *Handler) SigninWithPasskey(c echo.Context) error {
 	}
 
 	// Step 2: credential 検証。
-	if req.Context == "" {
+	//
+	// **形まで見る (#3037)。** `context` はサーバーが発行した 16 バイト乱数の
+	// hex でしかないので、それ以外は受け取る意味が無い。upstream も
+	// `SigninWithPasskeyApiService.ts:122` で「context は常にサーバー側の
+	// `randomUUID()` なので UUID でないものは拒否する」と書いて同じ形の
+	// 検査をしている。
+	//
+	// 素通しすると、この値が (a) **Redis のキーの一部**になり
+	// (`twofa:webauthn:passkey:<context>`)、(b) 失敗時に**そのままログへ出る**。
+	// どちらも未認証で任意長・任意バイト列を渡せる面なので、閉じておく。
+	if !validPasskeyContext(req.Context) {
 		return c.JSON(http.StatusBadRequest, errBody("1658cc2e-4495-461f-aee4-d403cdf073c1"))
 	}
 
@@ -112,6 +124,16 @@ func (h *Handler) finishPasskeySignin(c echo.Context, user *model.User, cred *we
 	}
 
 	profile, err := h.userRepo.FindProfileByUserID(user.ID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。**id は認証失敗のもの
+		// (932c904e) ではなく INTERNAL_ERROR のもの**を使う — 前者は upstream が
+		// 403 でしか出さないので、500 と組み合わせると error.id で分岐する
+		// drop-in クライアントが「パスワードが違います」を表示する。
+		// **body の形を同 package の他の 500 に揃える** — `signin/handler.go` は
+		// `apierr.InternalError()` を返す。`errBody` は `{error:{id}}` だけで
+		// code / message / kind を持たない。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || profile == nil {
 		return c.JSON(http.StatusForbidden, errBody("932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
@@ -129,8 +151,8 @@ func (h *Handler) finishPasskeySignin(c echo.Context, user *model.User, cred *we
 
 	// upstream は `{ signinResponse: { finished: true, id, i } }` を返す。
 	signinResp := h.okBody(user)
-	if h.ipLoggingOn && h.ipLogger != nil {
-		go h.ipLogger.Upsert(user.ID, c.RealIP())
+	if h.ipRecorder != nil {
+		h.ipRecorder.Record(user.ID, c.RealIP())
 	}
 	if h.signinRepo != nil && h.idGen != nil {
 		hdrs := c.Request().Header.Clone()
@@ -154,6 +176,27 @@ func newPasskeyContext() (string, error) {
 	}
 	return hex.EncodeToString(buf), nil
 }
+
+// validPasskeyContext reports whether s has the exact shape newPasskeyContext
+// produces: 32 lowercase hex characters (16 random bytes).
+//
+// **生成側と 1 対 1 にする。** 「hex であればよい」のような緩い判定にすると、
+// 長さが変わったときに検査が実質的に消える。
+func validPasskeyContext(s string) bool {
+	if len(s) != passkeyContextHexLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// passkeyContextHexLen is the hex length of a passkey context id.
+const passkeyContextHexLen = 32
 
 // readRandom is the indirection point for crypto/rand.Read. tests swap this
 // to exercise rand-failure paths. test-only swapper は export_test.go に置く

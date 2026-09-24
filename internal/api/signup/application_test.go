@@ -1,15 +1,19 @@
 package signup_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	apisignup "github.com/shiroha-a/mk/internal/api/signup"
+	"github.com/shiroha-a/mk/internal/core/captcha"
 	coresignup "github.com/shiroha-a/mk/internal/core/signup"
 	"github.com/shiroha-a/mk/internal/core/signupapplication"
+	"github.com/shiroha-a/mk/internal/core/signupform"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
 	"github.com/shiroha-a/mk/internal/model"
@@ -77,9 +81,7 @@ type stubTicketStore struct {
 	created   []*model.RegistrationTicket
 	deleted   []string
 	usedTkt   string
-	usedUsr   string
 	createErr error
-	markErr   error
 
 	pendingTkt     string
 	pendingRow     string
@@ -91,9 +93,13 @@ func (s *stubTicketStore) FindByCode(string) (*model.RegistrationTicket, error) 
 }
 
 func (s *stubTicketStore) MarkUsed(ticketID, userID string) error {
-	s.usedTkt, s.usedUsr = ticketID, userID
-	return s.markErr
+	s.usedTkt = ticketID
+	return nil
 }
+
+func (s *stubTicketStore) ClaimForSignup(string, bool) (bool, error) { return true, nil }
+
+func (s *stubTicketStore) ReleaseClaim(string) error { return nil }
 
 func (s *stubTicketStore) MarkPending(ticketID, pendingID string) error {
 	s.pendingTkt, s.pendingRow = ticketID, pendingID
@@ -336,8 +342,10 @@ func TestApplicationRegister_LookupFailure(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
-// **招待コードは利用者に渡さない。** ここで発行し、同じ流れで消費する。
-func TestApplicationRegister_MintsAndConsumesTicket(t *testing.T) {
+// **即時作成では ticket を発行しない (#2813)。** 発行しても誰も参照しない —
+// 一回性は settleApplicationTx の行ロックが担保しており (#2580)、ticket は
+// `signup_application.ticketId` に記録されるだけだった。
+func TestApplicationRegister_ImmediateDoesNotMintTicket(t *testing.T) {
 	env := newApprovalEnv(t, true)
 	tickets := &stubTicketStore{}
 	env.handler.SetTicketStore(tickets)
@@ -350,26 +358,71 @@ func TestApplicationRegister_MintsAndConsumesTicket(t *testing.T) {
 		`{"claimCode":"c","username":"newbie","password":"hunter22"}`)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
-	require.Len(t, tickets.created, 1)
-	issued := tickets.created[0]
-	assert.NotEmpty(t, issued.Code)
-	require.NotNil(t, issued.ExpiresAt, "期限を切ること")
-	assert.True(t, issued.ExpiresAt.Before(time.Now().Add(time.Hour)),
-		"渡していない credential を長く残さない")
-	// 招待一覧から「誰の承認で作られたか」を辿れるようにする。
-	require.NotNil(t, issued.CreatedByID)
-	assert.Equal(t, moderator, *issued.CreatedByID)
-
-	assert.Equal(t, issued.ID, tickets.usedTkt, "同じ流れで消費すること")
-	assert.Equal(t, issued.ID, env.apps.completedTkt)
+	assert.Empty(t, tickets.created, "即時作成では発行しない")
+	assert.Empty(t, tickets.usedTkt)
 	assert.Empty(t, tickets.deleted)
-	// レスポンスにコードが漏れていないこと。
-	assert.NotContains(t, rec.Body.String(), issued.Code)
+	assert.Empty(t, env.apps.completedTkt, "ticketId は記録しない")
+
+	// **監査は申請だけで辿れる。** 登録者は申請に残る。審査した管理者
+	// (processedById) を DB から読み直して確かめるのは統合テスト側
+	// (TestApplicationRegister_ImmediateCreatesNoTicket) — ここで
+	// `env.apps.app` を読み直しても、テスト自身が入れた値を見るだけになる。
+	assert.NotEmpty(t, env.apps.completedUsr, "登録者は申請に残る")
 }
 
-// **登録に失敗したチケットは残さない。** 残すと、使用済みに見えないまま浮いた
-// 招待が積み上がる。
-func TestApplicationRegister_DiscardsTicketOnFailure(t *testing.T) {
+// **メール経路では発行の失敗を 500 にする。** ここを素通しにすると ticket が nil に
+// なり、registerViaEmailConfirmation は MarkTicket を丸ごと飛ばす — 行ロック付きの
+// 申請状態の再確認 (#2571 / #2576) を通らないまま確認メールが飛ぶ。
+func TestApplicationRegister_EmailRequired_TicketIssueFailure(t *testing.T) {
+	env, pendingRepo, _, sent := newApprovalEnvWithEmail(t)
+	env.handler.SetTicketStore(&stubTicketStore{createErr: errors.New("boom")})
+
+	rec := doPost(env.handler.ApplicationRegister,
+		`{"claimCode":"c","username":"newbie","password":"hunter22","emailAddress":"newbie@example.com"}`)
+	require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+	// **ここまで来ていないこと**を見る。ステータスだけだと、pending を作って
+	// メールを飛ばしてから 500 を返す形でも緑になる。
+	assert.Empty(t, pendingRepo.Rows, "pending を作らない")
+	// **待たずに select すると空振りする。** 送信は goroutine なので、
+	// `default:` だとスケジュールされる前に通り抜ける (実測で 30 回中 0 回検出)。
+	select {
+	case to := <-sent:
+		t.Fatalf("確認メールを送ってはいけない (to=%s)", to)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// ticketStore が発行に失敗しても、即時作成は ticket を使わないので通る (#2813)。
+func TestApplicationRegister_ImmediateIgnoresTicketStoreFailure(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	env.handler.SetTicketStore(&stubTicketStore{createErr: errors.New("boom")})
+	env.apps.app = approvedApplication()
+
+	rec := doPost(env.handler.ApplicationRegister,
+		`{"claimCode":"c","username":"newbie","password":"hunter22"}`)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+// **メール必須を切る前に始まっていた確認待ちの残骸は破棄する。** 残すと、
+// 届いた確認リンクが後から踏めてしまう。
+func TestApplicationRegister_ImmediateDiscardsLeftoverTicket(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	tickets := &stubTicketStore{}
+	env.handler.SetTicketStore(tickets)
+	app := approvedApplication()
+	leftover := "old-ticket"
+	app.TicketID = &leftover
+	env.apps.app = app
+
+	rec := doPost(env.handler.ApplicationRegister,
+		`{"claimCode":"c","username":"newbie","password":"hunter22"}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Empty(t, tickets.created, "新しくは発行しない")
+	assert.Equal(t, []string{leftover}, tickets.deleted)
+}
+
+// 登録に失敗したら申請を完了扱いにしない。
+func TestApplicationRegister_ImmediateFailureDoesNotCompleteApplication(t *testing.T) {
 	env := newApprovalEnv(t, true)
 	tickets := &stubTicketStore{}
 	env.handler.SetTicketStore(tickets)
@@ -378,27 +431,14 @@ func TestApplicationRegister_DiscardsTicketOnFailure(t *testing.T) {
 	rec := doPost(env.handler.ApplicationRegister,
 		`{"claimCode":"c","username":"!!!invalid!!!","password":"hunter22"}`)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
-
-	require.Len(t, tickets.created, 1)
-	assert.Equal(t, []string{tickets.created[0].ID}, tickets.deleted)
+	assert.Empty(t, tickets.created)
 	assert.Empty(t, env.apps.completedApp, "失敗したら申請は完了扱いにしない")
 }
 
-func TestApplicationRegister_TicketIssueFailure(t *testing.T) {
-	env := newApprovalEnv(t, true)
-	env.handler.SetTicketStore(&stubTicketStore{createErr: errors.New("boom")})
-	env.apps.app = approvedApplication()
-
-	rec := doPost(env.handler.ApplicationRegister,
-		`{"claimCode":"c","username":"newbie","password":"hunter22"}`)
-	assert.Equal(t, http.StatusInternalServerError, rec.Code)
-}
-
-// 消費や完了記録に失敗してもアカウントは作られている。**ここで 500 を返すと、
+// 完了記録に失敗してもアカウントは作られている。**ここで 500 を返すと、
 // 利用者には「失敗したのに登録されている」状態になる。**
 func TestApplicationRegister_BookkeepingFailuresDoNotFailSignup(t *testing.T) {
 	env := newApprovalEnv(t, true)
-	env.handler.SetTicketStore(&stubTicketStore{markErr: errors.New("boom")})
 	env.apps.app = approvedApplication()
 	env.apps.markErr = errors.New("boom")
 
@@ -482,7 +522,12 @@ func newApprovalEnvWithEmail(t *testing.T) (*approvalEnv, *testutil.MockUserPend
 	svc.SetUserPendingRepo(pendingRepo)
 	h := apisignup.NewHandler(svc, metaRepo, idGen)
 
-	apps := &stubApplications{app: approvedApplication()}
+	// **審査した管理者を入れておく。** 入れないと「ticket に漏れない」(#2805) の
+	// アサートが空振りする — 元が nil なら何をしても nil になる。
+	app := approvedApplication()
+	moderator := "mod-1"
+	app.ProcessedByID = &moderator
+	apps := &stubApplications{app: app}
 	h.SetSignupApplications(apps)
 	tickets := &stubTicketStore{}
 	h.SetTicketStore(tickets)
@@ -516,6 +561,19 @@ func TestApplicationRegister_EmailRequired_CreatesPendingAndSendsEmail(t *testin
 	// 発行した ticket は pending に結び付き、まだ消費されていない。
 	require.Len(t, tickets.created, 1)
 	issued := tickets.created[0]
+	assert.NotEmpty(t, issued.Code)
+	require.NotNil(t, issued.ExpiresAt, "期限を切ること")
+	assert.True(t, issued.ExpiresAt.Before(time.Now().Add(time.Hour)),
+		"渡していない credential を長く残さない")
+	// **createdById は入れない (#2805)。** 入れると、承認するたびに審査した管理者
+	// 名義の招待が 1 枚増え、`invite/create` の上限を食い `invite/list` にも出る。
+	// どちらの query も `WHERE "createdById" = ?` なので NULL なら両方から外れる。
+	// #2813 で即時作成が ticket を発行しなくなったので、**この保証が効くのは
+	// この経路だけ**になった。
+	assert.Nil(t, issued.CreatedByID, "承認は審査した管理者の招待枠を消費しない")
+	// レスポンスにコードが漏れていないこと。
+	assert.NotContains(t, rec.Body.String(), issued.Code)
+
 	require.NotNil(t, row.InvitationTicketID)
 	assert.Equal(t, issued.ID, *row.InvitationTicketID)
 	assert.Equal(t, issued.ID, tickets.pendingTkt)
@@ -702,4 +760,347 @@ func TestSignupPending_WithoutApplicationLeavesApplicationsAlone(t *testing.T) {
 	rec = doPost(env.handler.SignupPending, `{"code":"`+row.Code+`"}`)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	assert.Empty(t, env.apps.completedApp)
+}
+
+// --- 署名付きフォームトークン (#2806) ---
+//
+// **captcha の代替ではない。** 止まるのは「フォームを取得せずに endpoint を直接
+// 叩く」bot だけで、待って送るスクリプトには 2 倍のリクエストしか課さない。
+// 位置づけの全文は core/signupform の doc にある。
+
+type fakeFormNonces struct {
+	burnt map[string]bool
+	// err は nonce store の障害 (Redis 断など) を注入する。
+	err error
+}
+
+func (f *fakeFormNonces) Burn(_ context.Context, nonce string, _ time.Duration) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.burnt == nil {
+		f.burnt = map[string]bool{}
+	}
+	if f.burnt[nonce] {
+		return false, nil
+	}
+	f.burnt[nonce] = true
+	return true, nil
+}
+
+// withFormTokens wires an issuer with no minimum dwell time. 滞在時間そのものは
+// core/signupform の単体テストが押さえるので、ここでは要求の有無を見る。
+func withFormTokens(t *testing.T, env *approvalEnv, minAge time.Duration) *signupform.Issuer {
+	t.Helper()
+	issuer, _ := withFormTokenNonces(t, env, minAge)
+	return issuer
+}
+
+func withFormTokenNonces(t *testing.T, env *approvalEnv, minAge time.Duration) (*signupform.Issuer, *fakeFormNonces) {
+	t.Helper()
+	nonces := &fakeFormNonces{}
+	issuer := signupform.NewIssuerWithTimings([]byte("test-key"), nonces, minAge, time.Minute)
+	require.NotNil(t, issuer)
+	env.handler.SetFormTokenIssuer(issuer)
+	return issuer, nonces
+}
+
+func applyBody(t *testing.T, token string) string {
+	t.Helper()
+	return `{"answers":["理由"],"formToken":` + strconvQuote(token) + `}`
+}
+
+func strconvQuote(s string) string { return `"` + s + `"` }
+
+// captcha の実 provider が 1 つも無いときは、フォームトークンが要る。
+func TestApplicationApply_RequiresFormTokenWithoutRealCaptcha(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	issuer := withFormTokens(t, env, 0)
+
+	rec := doPost(env.handler.ApplicationApply, `{"answers":["理由"]}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "FORM_TOKEN_INVALID")
+	// **応答を書くだけでは足りない。** `c.JSON` は成功時に nil を返すので、
+	// 呼び出し側が error だけを見ると素通りして申請行を作ってしまう。
+	assert.Nil(t, env.apps.appliedAnswers, "弾いたら申請行を作らない")
+
+	token, err := issuer.Issue(signupform.PurposeApply)
+	require.NoError(t, err)
+	rec = doPost(env.handler.ApplicationApply, applyBody(t, token))
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+// **使い捨てにしないと 1 枚を無限に使い回される。**
+func TestApplicationApply_FormTokenIsSingleUse(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	issuer := withFormTokens(t, env, 0)
+	token, err := issuer.Issue(signupform.PurposeApply)
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusOK, doPost(env.handler.ApplicationApply, applyBody(t, token)).Code)
+	rec := doPost(env.handler.ApplicationApply, applyBody(t, token))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "FORM_TOKEN_INVALID")
+}
+
+// 早すぎる送信は専用のコードで返す。**nonce は焼かれていない**ので、待てば通る。
+func TestApplicationApply_FormTokenTooSoon(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	issuer := withFormTokens(t, env, time.Hour)
+	token, err := issuer.Issue(signupform.PurposeApply)
+	require.NoError(t, err)
+
+	rec := doPost(env.handler.ApplicationApply, applyBody(t, token))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "FORM_TOKEN_TOO_SOON")
+	assert.Nil(t, env.apps.appliedAnswers, "弾いたら申請行を作らない")
+}
+
+// **testcaptcha は実 provider として数えない。** 数えると「マジック文字列一致
+// だけが効いていて、フォームトークンは要求されない」という最悪の組み合わせになる。
+func TestApplicationApply_TestcaptchaStillRequiresFormToken(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	env.meta.EnableTestcaptcha = true
+	env.handler.SetCaptcha(captcha.NewService(env.meta))
+	withFormTokens(t, env, 0)
+
+	rec := doPost(env.handler.ApplicationApply,
+		`{"answers":["理由"],"testcaptcha-response":"testcaptcha-passed"}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "FORM_TOKEN_INVALID")
+	assert.Nil(t, env.apps.appliedAnswers, "弾いたら申請行を作らない")
+}
+
+// 実 provider が有効なときは要求しない (二重の負担を課さない)。
+func TestApplicationApply_RealCaptchaSkipsFormToken(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"valid":true}`))
+	}))
+	defer srv.Close()
+	secret, instanceURL := "s", srv.URL
+	// **sitekey も要る (#3037 レビュー 2 周目)。** upstream
+	// `SignupApiService.ts:86` は 3 つ揃って初めて mcaptcha を有効にする。
+	siteKey := "sk"
+	env.meta.EnableMcaptcha = true
+	env.meta.McaptchaSecretKey = &secret
+	env.meta.McaptchaSiteKey = &siteKey
+	env.meta.McaptchaInstanceURL = &instanceURL
+	env.handler.SetCaptcha(captcha.NewServiceWithClient(env.meta, srv.Client()))
+	withFormTokens(t, env, 0)
+
+	rec := doPost(env.handler.ApplicationApply,
+		`{"answers":["理由"],"m-captcha-response":"ok"}`)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+// testMode は既存 captcha と同じ扱い。**この endpoint を叩く e2e は Playwright にも
+// 本家 backend e2e にも無い** (mk-go 独自なので upstream のテストは持たない) ので、
+// 根拠は「captcha と扱いを分ける理由が無い」で足りる。
+func TestApplicationApply_TestModeSkipsFormToken(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	withFormTokens(t, env, 0)
+	env.handler.SetTestMode(true)
+
+	assert.Equal(t, http.StatusOK, doPost(env.handler.ApplicationApply, `{"answers":["理由"]}`).Code)
+}
+
+// 未配線なら要求しない (fail-open)。**router の recordCriticalWiring が起動時に
+// 止める**ので、本番でこの状態にはならない。
+func TestApplicationApply_UnwiredIssuerDoesNotRequireToken(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	assert.False(t, env.handler.HasFormTokens())
+	assert.Equal(t, http.StatusOK, doPost(env.handler.ApplicationApply, `{"answers":["理由"]}`).Code)
+}
+
+func TestApplicationFormToken_IssuesUsableToken(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	withFormTokens(t, env, 0)
+
+	rec := doPost(env.handler.ApplicationFormToken, `{}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp struct {
+		Token          string `json:"token"`
+		MinWaitSeconds int    `json:"minWaitSeconds"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.NotEmpty(t, resp.Token)
+	assert.Equal(t, 0, resp.MinWaitSeconds)
+
+	// 発行したものがそのまま apply で通ること。
+	assert.Equal(t, http.StatusOK, doPost(env.handler.ApplicationApply, applyBody(t, resp.Token)).Code)
+}
+
+// **minWaitSeconds は切り上げる。** 切り捨てにすると、非整数秒にした瞬間に画面の
+// ほうが短く待ち、正規の利用者が FORM_TOKEN_TOO_SOON を見る。
+func TestApplicationFormToken_MinWaitSecondsRoundsUp(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	withFormTokens(t, env, 1500*time.Millisecond)
+
+	rec := doPost(env.handler.ApplicationFormToken, `{}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp struct {
+		MinWaitSeconds int `json:"minWaitSeconds"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, 2, resp.MinWaitSeconds, "画面はサーバーより短く待ってはいけない")
+}
+
+// 実 provider が有効なら空文字を返す。画面は「空なら送信を抑えない」だけで済む。
+func TestApplicationFormToken_EmptyWhenRealCaptcha(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	secret, instanceURL := "s", "https://mcaptcha.example"
+	// **sitekey も要る (#3037 レビュー 2 周目)。**
+	siteKey := "sk"
+	env.meta.EnableMcaptcha = true
+	env.meta.McaptchaSecretKey = &secret
+	env.meta.McaptchaSiteKey = &siteKey
+	env.meta.McaptchaInstanceURL = &instanceURL
+	env.handler.SetCaptcha(captcha.NewService(env.meta))
+	withFormTokens(t, env, 0)
+
+	rec := doPost(env.handler.ApplicationFormToken, `{}`)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Body.String(), `"token":""`)
+}
+
+// 承認制が無効なら発行もしない。
+func TestApplicationFormToken_DisabledReturns503(t *testing.T) {
+	env := newApprovalEnv(t, false)
+	withFormTokens(t, env, 0)
+	assert.Equal(t, http.StatusServiceUnavailable,
+		doPost(env.handler.ApplicationFormToken, `{}`).Code)
+}
+
+// **回答の検証で落ちても nonce を焼かない (#2806)。** 焼くと、入力を直して
+// 送り直した利用者が「フォームを開き直せ」と言われる。
+func TestApplicationApply_ValidationFailureKeepsFormToken(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	issuer := withFormTokens(t, env, 0)
+	token, err := issuer.Issue(signupform.PurposeApply)
+	require.NoError(t, err)
+
+	// 必須項目が空 → ANSWER_REQUIRED。
+	rec := doPost(env.handler.ApplicationApply, `{"answers":[""],"formToken":`+strconvQuote(token)+`}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "ANSWER_REQUIRED")
+
+	// 同じ token で通ること (焼かれていない)。
+	assert.Equal(t, http.StatusOK, doPost(env.handler.ApplicationApply, applyBody(t, token)).Code)
+}
+
+// **nonce store が落ちても素通しにしない (#2806)。** 素通しにすると、captcha を
+// 設定していないインスタンスで防波堤が 1 つも無い状態に戻る。`NOT_APPROVED` の
+// ように利用者向けの答えへ丸めず 500 にするのは、障害をドメインの答えに化け
+// させないため (#2799 と同じ)。
+func TestApplicationApply_NonceStoreFailureIsNotFailOpen(t *testing.T) {
+	env := newApprovalEnv(t, true)
+	issuer, nonces := withFormTokenNonces(t, env, 0)
+	token, err := issuer.Issue(signupform.PurposeApply)
+	require.NoError(t, err)
+
+	nonces.err = errors.New("redis down")
+	rec := doPost(env.handler.ApplicationApply, applyBody(t, token))
+	require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+	assert.NotContains(t, rec.Body.String(), "FORM_TOKEN")
+	assert.Nil(t, env.apps.appliedAnswers, "申請行を作らない")
+}
+
+// 申請経由の登録も最小文字数を受け、`USERNAME_TOO_SHORT` で返す (#3015)。
+//
+// **`signupServiceError` の写像を落とすと 500 になる。** 承認された人が
+// 何度やっても登録できず、しかも原因が「サーバーの不具合」に見える。
+// 即時作成とメール確認の**両方**を見る — 通る関数が違う
+// (`SignupForApplication` / `CreatePendingForApplication`)。
+func TestApplicationRegister_UsernameTooShort(t *testing.T) {
+	t.Run("即時作成", func(t *testing.T) {
+		env := newApprovalEnv(t, true)
+		env.apps.app = approvedApplication()
+		env.meta.MinimumUsernameLength = 5
+
+		rec := doPost(env.handler.ApplicationRegister,
+			`{"claimCode":"c","username":"abcd","password":"hunter22"}`)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "USERNAME_TOO_SHORT")
+
+		// **弾きすぎていないこと。** 常に 400 でもこの subtest 単体は緑になる。
+		rec = doPost(env.handler.ApplicationRegister,
+			`{"claimCode":"c","username":"abcde","password":"hunter22"}`)
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	})
+
+	t.Run("メール確認経由", func(t *testing.T) {
+		env, pendingRepo, _, _ := newApprovalEnvWithEmail(t)
+		env.meta.MinimumUsernameLength = 5
+
+		rec := doPost(env.handler.ApplicationRegister,
+			`{"claimCode":"c","username":"abcd","password":"hunter22","emailAddress":"a@example.com"}`)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "USERNAME_TOO_SHORT")
+		assert.Empty(t, pendingRepo.Rows, "弾いたのに pending を作っている")
+	})
+}
+
+// 申請経路の error は **Misskey misc 形式** (`{"error":{"code":...}}`) で返す。
+//
+// **Fastify 形式だと code がクライアントに届かない。** あちらは code を
+// `message` にしか載せず、frontend の `misskeyApi` は `body.error` —
+// Fastify 形式では文字列 `"Bad Request"` — で reject する。受け側は
+// `err.code` で分岐するので**どの case にも当たらず**、
+// 「処理に失敗しました。時間をおいて試してください。」だけが出ていた。
+//
+// `signup-application/*` は upstream に存在しない mk-go 独自 endpoint なので、
+// 形を揃える相手もいない (`apierr/fastify.go` が Fastify 化の対象を 4 endpoint に
+// 限っている)。
+func TestApplicationRegister_ErrorsCarryCodeInTheMiscShape(t *testing.T) {
+	newEnv := func(t *testing.T) *approvalEnv {
+		t.Helper()
+		env := newApprovalEnv(t, true)
+		env.apps.app = approvedApplication()
+		return env
+	}
+
+	for name, tc := range map[string]struct {
+		setup func(env *approvalEnv)
+		body  string
+		want  string
+	}{
+		"USERNAME_TOO_SHORT": {
+			setup: func(env *approvalEnv) { env.meta.MinimumUsernameLength = 5 },
+			body:  `{"claimCode":"c","username":"abcd","password":"hunter22"}`,
+			want:  "USERNAME_TOO_SHORT",
+		},
+		"INVALID_USERNAME": {
+			body: `{"claimCode":"c","username":"!!!","password":"hunter22"}`,
+			want: "INVALID_USERNAME",
+		},
+		"USED_USERNAME": {
+			setup: func(env *approvalEnv) { env.meta.PreservedUsernames = model.StringArray{"admin"} },
+			body:  `{"claimCode":"c","username":"admin","password":"hunter22"}`,
+			want:  "USED_USERNAME",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newEnv(t)
+			if tc.setup != nil {
+				tc.setup(env)
+			}
+			rec := doPost(env.handler.ApplicationRegister, tc.body)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+
+			// **`code` を名指しで読む。** body の文字列一致だと、Fastify 形式の
+			// `"message":"Error: USERNAME_TOO_SHORT"` でも通ってしまう
+			// (= 直したはずの形に戻しても緑になる)。
+			var resp struct {
+				Error struct {
+					Code string `json:"code"`
+					ID   string `json:"id"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp), rec.Body.String())
+			assert.Equal(t, tc.want, resp.Error.Code, "クライアントが分岐に使う code が届いていない")
+			assert.NotEmpty(t, resp.Error.ID)
+		})
+	}
 }

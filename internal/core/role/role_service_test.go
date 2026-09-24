@@ -2127,3 +2127,401 @@ func TestGetUserPolicies_CanUseChunkedUploadAggregation(t *testing.T) {
 	svc.InvalidateAllRoleCaches()
 	assert.Equal(t, true, svc.GetUserPolicies("user1")[role.PolicyCanUseChunkedUpload])
 }
+
+// **ロールに入れた値が実際に届くこと (#2958)。**
+//
+// `resolvePolicies` は `effectivepolicy.Defaults()` のキーだけで出力 map を
+// 作るので、**defaults からキーが落ちると、管理画面には設定が入って見えるのに
+// 上限が一切効かない**。しかも frontend のキー一覧を見る gate は期待値を
+// defaults から導出するため、削除すると gate 自身が黙って弱くなる。
+// service 側のテストは stub の map を返すのでこの経路を通らない。
+func TestGetUserPolicies_EmojiApplicationQuotaAggregation(t *testing.T) {
+	for _, key := range []string{
+		role.PolicyEmojiApplicationMaxPerDay,
+		role.PolicyEmojiApplicationMaxPerWeek,
+		role.PolicyEmojiApplicationMaxPerMonth,
+		role.PolicyEmojiApplicationMaxPending,
+	} {
+		t.Run(key, func(t *testing.T) {
+			svc, roleRepo, assignRepo, _ := newTestService(t)
+			// 既定は 0 = その期間の上限なし。
+			assert.Equal(t, 0, svc.GetUserPolicies("user1")[key])
+
+			roleRepo.Roles["tight"] = &model.Role{
+				ID: "tight", Name: "Tight",
+				Policies: datatypes.JSON([]byte(
+					`{"` + key + `": {"useDefault": false, "priority": 0, "value": 3}}`)),
+			}
+			assignRepo.Assignments["user1:tight"] = &model.RoleAssignment{ID: "a1", UserID: "user1", RoleID: "tight"}
+			svc.InvalidateAllRoleCaches()
+			assert.Equal(t, 3, svc.GetUserPolicies("user1")[key])
+
+			// **集約は max。** 緩い方に倒れるので、上限としては弱い方が勝つ。
+			// `docs/divergence.md` が「0 は無制限を表現できない」と書いている
+			// のはこの向きによる。
+			roleRepo.Roles["loose"] = &model.Role{
+				ID: "loose", Name: "Loose",
+				Policies: datatypes.JSON([]byte(
+					`{"` + key + `": {"useDefault": false, "priority": 0, "value": 10}}`)),
+			}
+			assignRepo.Assignments["user1:loose"] = &model.RoleAssignment{ID: "a2", UserID: "user1", RoleID: "loose"}
+			svc.InvalidateAllRoleCaches()
+			assert.Equal(t, 10, svc.GetUserPolicies("user1")[key])
+		})
+	}
+}
+
+// **`rootUserId` を設定したら、それが唯一の答え (#3037)。**
+//
+// 以前は「どちらかが一致すれば root」だったので、`user.isRoot` が立った
+// 利用者を降ろす手段がどこにも無かった (mk-go には `isRoot` を書く経路しか
+// 無く、admin API にも false へ戻す口が無い)。DB を直接触るしかないうえ、
+// 管理画面にも出ないので「元の運営者が永久に管理者のまま」に気付けない。
+func TestIsAdministrator_RootUserIDOverridesStaleIsRoot(t *testing.T) {
+	svc, _, _, metaRepo := newTestService(t)
+	newRoot := "carol"
+	metaRepo.Meta = &model.Meta{ID: "x", RootUserID: &newRoot}
+	userRepo := testutil.NewMockUserRepository()
+	// 引き継ぎ前の運営者。フラグは立ったまま。
+	require.NoError(t, userRepo.Create(&model.User{ID: "alice", Username: "alice", IsRoot: true}))
+	require.NoError(t, userRepo.Create(&model.User{ID: "carol", Username: "carol"}))
+	svc.SetUserRepo(userRepo)
+
+	assert.False(t, svc.IsAdministrator("alice"), "降ろしたはずの root が管理者のまま")
+	assert.True(t, svc.IsAdministrator("carol"), "設定した root が管理者になっていない")
+}
+
+// **空文字は「未設定」として扱う。** 列は nullable だが、空文字が入った DB を
+// 「root は誰もいない」ではなく「誰とも一致しない」と読むと、drop-in の
+// fallback が効かなくなる。
+func TestIsAdministrator_EmptyRootUserIDFallsBackToIsRoot(t *testing.T) {
+	svc, _, _, metaRepo := newTestService(t)
+	empty := ""
+	metaRepo.Meta = &model.Meta{ID: "x", RootUserID: &empty}
+	userRepo := testutil.NewMockUserRepository()
+	require.NoError(t, userRepo.Create(&model.User{ID: "alice", Username: "alice", IsRoot: true}))
+	svc.SetUserRepo(userRepo)
+
+	assert.True(t, svc.IsAdministrator("alice"))
+}
+
+// **meta を読めないときは従来どおり `isRoot` を見る。** 「設定されているか」が
+// 分からない状態で無視すると、DB の瞬断のあいだ本物の root が管理画面から
+// 締め出される。
+func TestIsAdministrator_MetaUnavailableFallsBackToIsRoot(t *testing.T) {
+	svc, _, _, metaRepo := newTestService(t)
+	metaRepo.Meta = nil // Fetch がエラーになる
+	userRepo := testutil.NewMockUserRepository()
+	require.NoError(t, userRepo.Create(&model.User{ID: "alice", Username: "alice", IsRoot: true}))
+	svc.SetUserRepo(userRepo)
+
+	assert.True(t, svc.IsAdministrator("alice"))
+}
+
+// **自己付与できる管理者ロールを作らせない (#3037)。**
+func TestCreate_RejectsSelfGrantableConditionalPrivilege(t *testing.T) {
+	svc, _, _, _ := newTestService(t)
+
+	for _, tt := range []struct {
+		name    string
+		opts    role.CreateOptions
+		wantErr bool
+	}{
+		{
+			name: "条件つき + 管理者 + isCat",
+			opts: role.CreateOptions{
+				Target: model.RoleTargetConditional, IsAdministrator: true,
+				CondFormula: datatypes.JSON(`{"type":"isCat"}`),
+			},
+			wantErr: true,
+		},
+		{
+			name: "条件つき + モデレーター + 入れ子の isBot",
+			opts: role.CreateOptions{
+				Target: model.RoleTargetConditional, IsModerator: true,
+				CondFormula: datatypes.JSON(`{"type":"and","values":[{"type":"isLocal"},{"type":"isBot"}]}`),
+			},
+			wantErr: true,
+		},
+		{
+			// **読めない式は判定できない。** ここで通すと壊れた JSON を
+			// 送るだけで検査を迂回できる。
+			name: "条件つき + 管理者 + 壊れた式",
+			opts: role.CreateOptions{
+				Target: model.RoleTargetConditional, IsAdministrator: true,
+				CondFormula: datatypes.JSON(`{`),
+			},
+			wantErr: true,
+		},
+		{
+			// **アカウントの年齢は barrier にならない (#3045)。** 攻撃者は
+			// いくらでも待てるし、ロールを作った時点で条件を満たす既存
+			// アカウントが全員その場で管理者になる。
+			name: "条件つき + 管理者 + createdMoreThan 1年",
+			opts: role.CreateOptions{
+				Target: model.RoleTargetConditional, IsAdministrator: true,
+				CondFormula: datatypes.JSON(`{"type":"and","values":[{"type":"isLocal"},{"type":"createdMoreThan","sec":31536000}]}`),
+			},
+			wantErr: true,
+		},
+		{
+			// **`not(createdLessThan)` は「`sec` 以上前に作られた」(#3045)。**
+			// #3044 は否定側に判定を当てておらず、「1 秒より前に
+			// 作られた全アカウントが管理者」がそのまま通っていた。
+			name: "条件つき + 管理者 + not(createdLessThan 1秒)",
+			opts: role.CreateOptions{
+				Target: model.RoleTargetConditional, IsAdministrator: true,
+				CondFormula: datatypes.JSON(`{"type":"not","value":{"type":"createdLessThan","sec":1}}`),
+			},
+			wantErr: true,
+		},
+		{
+			// 手動ロールを参照する形は残る。誰が配れるかは
+			// `RoleGrantsPrivilegeIndirectly` が別に見る。
+			name: "条件つき + 管理者 + roleAssignedTo",
+			opts: role.CreateOptions{
+				Target: model.RoleTargetConditional, IsAdministrator: true,
+				CondFormula: datatypes.JSON(`{"type":"and","values":[{"type":"isLocal"},{"type":"roleAssignedTo","roleId":"staff"}]}`),
+			},
+		},
+		{
+			// 手動ロールは条件で配らないので対象外。
+			name: "手動 + 管理者 + isCat",
+			opts: role.CreateOptions{
+				Target: model.RoleTargetManual, IsAdministrator: true,
+				CondFormula: datatypes.JSON(`{"type":"isCat"}`),
+			},
+		},
+		{
+			// 権限を持たない条件つきロールは従来どおり。
+			name: "条件つき + 権限なし + isCat",
+			opts: role.CreateOptions{
+				Target:      model.RoleTargetConditional,
+				CondFormula: datatypes.JSON(`{"type":"isCat"}`),
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := svc.Create(tt.name, "", tt.opts)
+			if tt.wantErr {
+				assert.ErrorIs(t, err, role.ErrSelfGrantablePrivilege)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// **更新後の姿で判定する。** 「条件つきに変える」「管理者を立てる」
+// 「条件を差し替える」のどれ 1 つを送っても組み合わせは作れる。
+func TestUpdateFields_RejectsSelfGrantableConditionalPrivilege(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		stored  *model.Role
+		fields  map[string]any
+		wantErr bool
+	}{
+		{
+			name:    "管理者だけを立てる",
+			stored:  &model.Role{ID: "r", Target: model.RoleTargetConditional, CondFormula: datatypes.JSON(`{"type":"isCat"}`)},
+			fields:  map[string]any{"isAdministrator": true},
+			wantErr: true,
+		},
+		{
+			name:    "条件つきに変える",
+			stored:  &model.Role{ID: "r", Target: model.RoleTargetManual, IsAdministrator: true, CondFormula: datatypes.JSON(`{"type":"isCat"}`)},
+			fields:  map[string]any{"target": string(model.RoleTargetConditional)},
+			wantErr: true,
+		},
+		{
+			name:    "条件を差し替える",
+			stored:  &model.Role{ID: "r", Target: model.RoleTargetConditional, IsModerator: true, CondFormula: datatypes.JSON(`{"type":"isLocal"}`)},
+			fields:  map[string]any{"condFormula": datatypes.JSON(`{"type":"isBot"}`)},
+			wantErr: true,
+		},
+		{
+			name:   "権限を下ろせば通る",
+			stored: &model.Role{ID: "r", Target: model.RoleTargetConditional, IsAdministrator: true, CondFormula: datatypes.JSON(`{"type":"isCat"}`)},
+			fields: map[string]any{"isAdministrator": false},
+		},
+		{
+			name:   "無関係な更新",
+			stored: &model.Role{ID: "r", Target: model.RoleTargetConditional, CondFormula: datatypes.JSON(`{"type":"isCat"}`)},
+			fields: map[string]any{"name": "new"},
+		},
+		{
+			// **既存のロールは動き続けるが、編集はできなくなる (#3045)。**
+			// 評価側に guard は無いので黙って降格させない一方、更新は
+			// **更新後の姿**で判定するため名前だけの変更も弾かれる。
+			// upstream にこの検査は無いので、TS から引き継いだ DB には
+			// 「古参はモデレーター」のようなロールが現実に存在しうる。
+			// 逃げ道は権限を下ろす / 条件を差し替える / 手動に変える。
+			name: "特権つき条件ロールは無関係な更新も弾く",
+			stored: &model.Role{ID: "r", Target: model.RoleTargetConditional, IsModerator: true,
+				CondFormula: datatypes.JSON(`{"type":"and","values":[{"type":"isLocal"},{"type":"createdMoreThan","sec":31536000}]}`)},
+			fields:  map[string]any{"name": "new"},
+			wantErr: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, roleRepo, _, _ := newTestService(t)
+			roleRepo.Roles["r"] = tt.stored
+
+			_, err := svc.UpdateFields("r", tt.fields)
+			if tt.wantErr {
+				assert.ErrorIs(t, err, role.ErrSelfGrantablePrivilege)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// **`isAdministrator` / `isModerator` だけでは足りない (#3037 レビュー)。**
+//
+// `canManageCustomEmojis` / `canManageAvatarDecorations` は `RequireRolePolicy`
+// だけで `/admin/*` を開ける (emoji は 20 route、avatar-decorations は 4 route で、
+// どちらも `RequireModerator` を併用していない)。管理者フラグを塞いだことで
+// 「システムが守ってくれる」と読まれるぶん、こちらが無警告で通るのはより悪い。
+func TestCreate_RejectsSelfGrantablePrivilegedPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		policies string
+		wantErr  bool
+	}{
+		{
+			name:     "canManageCustomEmojis を配る",
+			policies: `{"canManageCustomEmojis":{"useDefault":false,"priority":2,"value":true}}`,
+			wantErr:  true,
+		},
+		{
+			name:     "canManageAvatarDecorations を配る",
+			policies: `{"canManageAvatarDecorations":{"useDefault":false,"priority":0,"value":true}}`,
+			wantErr:  true,
+		},
+		{
+			// **読めない policies は判定できないので拒否側へ。**
+			name:     "壊れた policies",
+			policies: `{`,
+			wantErr:  true,
+		},
+		// 既定へ戻す / 明示的に与えない設定まで弾くと正当なロールが作れない。
+		{
+			name:     "useDefault の entry",
+			policies: `{"canManageCustomEmojis":{"useDefault":true,"priority":0,"value":true}}`,
+		},
+		{
+			name:     "false を明示",
+			policies: `{"canManageCustomEmojis":{"useDefault":false,"priority":0,"value":false}}`,
+		},
+		{
+			name:     "特権でない policy",
+			policies: `{"canCreateChannel":{"useDefault":false,"priority":0,"value":true}}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _, _, _ := newTestService(t)
+			_, err := svc.Create(tt.name, "", role.CreateOptions{
+				Target:      model.RoleTargetConditional,
+				CondFormula: datatypes.JSON(`{"type":"isCat"}`),
+				Policies:    datatypes.JSON(tt.policies),
+			})
+			if tt.wantErr {
+				assert.ErrorIs(t, err, role.ErrSelfGrantablePrivilege)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// **handler が実際に入れる型で判定できること (#3037 レビュー)。**
+//
+// `admin/roles/update` は `fields["target"]` に `model.RoleTarget` を入れる。
+// `case string:` しか踏まないテストだと、`case model.RoleTarget:` を消しても
+// 緑のまま通り、production では「既存の管理者ロールを条件つきに変える」経路で
+// guard が黙って無効になる。
+func TestUpdateFields_MergedShapeHandlesHandlerTypes(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		fields map[string]any
+	}{
+		{"target が model.RoleTarget", map[string]any{"target": model.RoleTargetConditional}},
+		{"target が string", map[string]any{"target": string(model.RoleTargetConditional)}},
+		{"policies が datatypes.JSON", map[string]any{
+			"target":   model.RoleTargetConditional,
+			"policies": datatypes.JSON(`{"canManageCustomEmojis":{"useDefault":false,"priority":0,"value":true}}`),
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, roleRepo, _, _ := newTestService(t)
+			roleRepo.Roles["r"] = &model.Role{
+				ID: "r", Target: model.RoleTargetManual, IsAdministrator: true,
+				CondFormula: datatypes.JSON(`{"type":"isCat"}`),
+			}
+			if _, ok := tt.fields["policies"]; ok {
+				roleRepo.Roles["r"].IsAdministrator = false
+			}
+
+			_, err := svc.UpdateFields("r", tt.fields)
+			assert.ErrorIs(t, err, role.ErrSelfGrantablePrivilege)
+		})
+	}
+}
+
+// `canSearchIpHistory` (#3104) は**既定で管理者のみ**。
+//
+// **この既定が崩れると、upstream の `admin/get-user-ips` (`requireAdmin: true`)
+// と同じ機密情報に、モデレーター全員が通れる新しい経路ができる。** 既定値は
+// `internal/effectivepolicy` にあり、そこを `true` に書き換えても build も
+// `perm-check` も通る (`perm-check` は upstream にある endpoint しか見ない)。
+func TestHasRolePolicy_CanSearchIpHistory(t *testing.T) {
+	t.Run("既定では一般利用者に開かない", func(t *testing.T) {
+		svc, _, _, _ := newTestService(t)
+		assert.False(t, svc.HasRolePolicy("alice", role.PolicyCanSearchIPHistory))
+	})
+
+	// **モデレーターは短絡しない。** `HasRolePolicy` が見るのは管理者だけなので、
+	// route 側の `RequireModerator` を通っても policy が false なら 403 になる。
+	t.Run("モデレーターでも既定では開かない", func(t *testing.T) {
+		svc, roleRepo, assignRepo, _ := newTestService(t)
+		roleRepo.Roles["r_mod"] = &model.Role{ID: "r_mod", Name: "Mod", IsModerator: true}
+		assignRepo.Assignments["mod1:r_mod"] = &model.RoleAssignment{
+			ID: "a1", UserID: "mod1", RoleID: "r_mod",
+		}
+		assert.False(t, svc.HasRolePolicy("mod1", role.PolicyCanSearchIPHistory),
+			"既定でモデレーターに開いている (upstream は requireAdmin)")
+	})
+
+	t.Run("管理者は既定でも通る", func(t *testing.T) {
+		svc, roleRepo, assignRepo, _ := newTestService(t)
+		roleRepo.Roles["r_admin"] = &model.Role{ID: "r_admin", Name: "Admin", IsAdministrator: true}
+		assignRepo.Assignments["admin1:r_admin"] = &model.RoleAssignment{
+			ID: "a1", UserID: "admin1", RoleID: "r_admin",
+		}
+		assert.True(t, svc.HasRolePolicy("admin1", role.PolicyCanSearchIPHistory))
+	})
+
+	// 運営者がロールで開ける = 「モデレーターに許可するかを設定で決められる」。
+	t.Run("ロールで開ける", func(t *testing.T) {
+		svc, roleRepo, assignRepo, _ := newTestService(t)
+		roleRepo.Roles["r_ip"] = &model.Role{
+			ID: "r_ip", Name: "IPSearch",
+			Policies: datatypes.JSON([]byte(
+				`{"canSearchIpHistory":{"useDefault":false,"priority":0,"value":true}}`)),
+		}
+		assignRepo.Assignments["mod1:r_ip"] = &model.RoleAssignment{
+			ID: "a1", UserID: "mod1", RoleID: "r_ip",
+		}
+		assert.True(t, svc.HasRolePolicy("mod1", role.PolicyCanSearchIPHistory))
+	})
+}
+
+// 既定値そのものも固定する。**`DefaultPolicies` に key が無いと `HasRolePolicy`
+// は fail-closed で false を返す**ので、上の「既定では開かない」は key を丸ごと
+// 消しても通る。ロール編集画面へ出すには key が要るので、存在も併せて見る。
+func TestDefaultPolicies_CanSearchIpHistoryIsFalse(t *testing.T) {
+	v, ok := role.DefaultPolicies()[role.PolicyCanSearchIPHistory]
+	require.True(t, ok, "既定値が無いとロール編集画面に項目が出ない (#3104)")
+	assert.Equal(t, false, v, "既定は管理者のみ (upstream の requireAdmin に合わせる)")
+}

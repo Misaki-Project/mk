@@ -10,13 +10,16 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"gorm.io/gorm"
 
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/core/captcha"
 	coreemail "github.com/shiroha-a/mk/internal/core/email"
 	"github.com/shiroha-a/mk/internal/core/role"
 	coresignup "github.com/shiroha-a/mk/internal/core/signup"
+	"github.com/shiroha-a/mk/internal/core/signupform"
 	"github.com/shiroha-a/mk/internal/entity"
+	"github.com/shiroha-a/mk/internal/l10n"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
 	"github.com/shiroha-a/mk/internal/model"
@@ -27,6 +30,10 @@ import (
 type TicketStore interface {
 	FindByCode(code string) (*model.RegistrationTicket, error)
 	MarkUsed(ticketID, userID string) error
+	// ClaimForSignup / ReleaseClaim reserve and release a ticket around
+	// account creation (repository.RegistrationTicketRepository)。
+	ClaimForSignup(ticketID string, emailRequired bool) (bool, error)
+	ReleaseClaim(ticketID string) error
 	// MarkPending records usedAt + pendingUserId for an email-confirmation
 	// signup (確認メール再送防止窓、#2083)。
 	MarkPending(ticketID, pendingID string) error
@@ -67,10 +74,36 @@ type Handler struct {
 	// userPolicies は作成直後の利用者の**実効** policy を返す (#2673)。
 	// 未配線なら従来どおり素の default にフォールバックする。
 	userPolicies UserPolicyResolver
+	// emailDB は email-address/available の重複判定用 (#2791 で router.go の
+	// inline closure から移設)。
+	emailDB *gorm.DB
+	// userRepo / usedUsernameRepo は username/available 用 (#2791 で router.go の
+	// inline closure から移設)。
+	userRepo         repository.UserRepository
+	usedUsernameRepo repository.UsedUsernameRepository
 	// applications は承認制の登録 (#2569)。未配線なら該当 endpoint は 503。
-	// ticketStore は承認済み申請の登録でも使う (内部で招待を発行して即消費する)。
+	// ticketStore は承認済み申請でも使う。**発行するのはメール確認の経路だけ**
+	// (#2813) で、確認リンクを踏んだ時点で消費する。即時作成は発行しないが、
+	// メール必須を切る前に始まっていた確認待ちの残骸を破棄するのに触る。
 	applications SignupApplications
+	// formTokens は captcha の実 provider が 1 つも無いときに
+	// signup-application/apply を守る署名付きフォームトークン (#2806)。
+	// **captcha の代替ではない** — 位置づけは core/signupform の doc を見ること。
+	formTokens *signupform.Issuer
 }
+
+// SetFormTokenIssuer wires the signed form tokens used when no real captcha
+// provider is configured (#2806).
+func (h *Handler) SetFormTokenIssuer(i *signupform.Issuer) {
+	h.formTokens = i
+}
+
+// HasFormTokens reports whether the signup form token issuer is wired.
+//
+// 未配線だと、captcha が 1 つも設定されていないインスタンスで申請 endpoint の
+// 唯一の簡易チェックが素通しになる。router のコメントも同じ理由で critical
+// wiring に載せている。
+func (h *Handler) HasFormTokens() bool { return h.formTokens != nil }
 
 // SetSigninRecorder wires the recorder used to fire login side-effects after
 // account creation (#1804)。
@@ -214,14 +247,34 @@ func (h *Handler) Signup(c echo.Context) error {
 		if verr := validateEmailWithMeta(c.Request().Context(), meta, req.EmailAddress, h.emailValidationClient); verr != nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error("UNAVAILABLE", "Email is not available.", "a25440a9-451e-41de-b291-00a8f29fbca6"))
 		}
+		// **確認済みの重複を弾く。** 判定は `email-address/available` にしか
+		// 実装が無く、実際に書くここは通っていなかった。upstream は
+		// `validateEmailForAccount` を全経路が通る。DB にも UNIQUE が無いので、
+		// 1 つのメールボックスから無制限にアカウントを作れた
+		// (`emailRequiredForSignup` が sockpuppet 対策として期待する性質が失われる)。
+		if h.userRepo != nil {
+			inUse, ierr := h.userRepo.EmailVerifiedInUse(req.EmailAddress)
+			if ierr != nil {
+				// **判定できないときは通さない。** 重複検査を素通りさせない。
+				slog.Error("signup: cannot check whether the email is in use", "err", ierr)
+				return apierr.JSONInternalError(c)
+			}
+			if inUse {
+				return c.JSON(http.StatusBadRequest, apierr.Error("UNAVAILABLE", "Email is not available.", "a25440a9-451e-41de-b291-00a8f29fbca6"))
+			}
+		}
 		// 招待制併用時は ticket.ID を pending row に保存しておき、
 		// PromotePending 完了時に MarkUsed で消費する (#600 item 5)。
 		var ticketID *string
 		if ticket != nil {
 			ticketID = &ticket.ID
+			if resp := h.claimInvitation(c, ticket, true); resp != nil {
+				return resp()
+			}
 		}
 		pending, perr := h.signupService.CreatePending(req.Username, req.EmailAddress, req.Password, ticketID)
 		if perr != nil {
+			h.releaseInvitation(ticket)
 			// upstream は username 系 error を Fastify-style reply error
 			// で投げる (SignupApiService.ts:174-184)。mk-go も同 shape に揃える
 			// (#802)。INVALID_PARAM は upstream 上流に対応 code が無いが
@@ -243,6 +296,15 @@ func (h *Handler) Signup(c echo.Context) error {
 				// DENIED_USERNAME で返す (非 email path の USED_USERNAME とは異なる、#2080)。
 				return apierr.FastifyReply(c, http.StatusBadRequest, "DENIED_USERNAME")
 			}
+			if errors.Is(perr, coresignup.ErrUsernameTooShort) {
+				// **`USED_USERNAME` / `INVALID_USERNAME` に混ぜない (#3015)。**
+				// 前者は「他人が使っている」、後者は「文字種か長さの上限が不正」で、
+				// どちらも利用者の直し方が違う。最小文字数は運営者の設定なので、
+				// 何文字必要かが分からないと直しようがない。additive な error code
+				// なので既存クライアントの互換は壊れない (未知の code は汎用の
+				// エラー表示に落ちる)。
+				return apierr.FastifyReply(c, http.StatusBadRequest, "USERNAME_TOO_SHORT")
+			}
 			if errors.Is(perr, coresignup.ErrPasswordTooLong) {
 				return apierr.FastifyReply(c, http.StatusBadRequest, "PASSWORD_TOO_LONG")
 			}
@@ -259,7 +321,7 @@ func (h *Handler) Signup(c echo.Context) error {
 				slog.Warn("signup: failed to mark invitation ticket pending", "ticketId", ticket.ID, "err", merr)
 			}
 		}
-		h.sendSignupConfirmation(meta, req.EmailAddress, pending.Code)
+		h.sendSignupConfirmation(meta, req.EmailAddress, pending.Code, c.Request().Header.Get("Accept-Language"))
 		// TS 互換: 本体は何も返さない (frontend は確認メールを待つ)。
 		return c.NoContent(http.StatusNoContent)
 	}
@@ -283,8 +345,14 @@ func (h *Handler) Signup(c echo.Context) error {
 		hv := strings.ToLower(strings.TrimSpace(req.Host))
 		remoteHost = &hv
 	}
-	result, err := h.signupService.SignupWithHost(req.Username, req.Password, isInitialSetup, remoteHost)
+	if ticket != nil {
+		if resp := h.claimInvitation(c, ticket, false); resp != nil {
+			return resp()
+		}
+	}
+	result, err := h.signupService.SignupWithHost(req.Username, req.Password, isInitialSetup, remoteHost, coresignup.UsernamePolicyPublic)
 	if err != nil {
+		h.releaseInvitation(ticket)
 		// upstream の `/api/signup` は username 系 error を Fastify-style
 		// reply error で投げる (SignupApiService.ts)。shape を揃える (#802)。
 		if errors.Is(err, coresignup.ErrUsernameAlreadyExists) {
@@ -301,15 +369,22 @@ func (h *Handler) Signup(c echo.Context) error {
 			// 非 email path は upstream SignupService と同じく preserved も USED_USERNAME (#2080)。
 			return apierr.FastifyReply(c, http.StatusBadRequest, "USED_USERNAME")
 		}
+		if errors.Is(err, coresignup.ErrUsernameTooShort) {
+			// 最小文字数 (#3015)。理由は email path 側のコメントを参照。
+			return apierr.FastifyReply(c, http.StatusBadRequest, "USERNAME_TOO_SHORT")
+		}
 		if errors.Is(err, coresignup.ErrPasswordTooLong) {
 			return apierr.FastifyReply(c, http.StatusBadRequest, "PASSWORD_TOO_LONG")
 		}
 		return apierr.FastifyReply(c, http.StatusInternalServerError, "INTERNAL_ERROR")
 	}
 
-	// invitation code使用済みにする
+	// invitation code使用済みにする。確保 (usedAt) は済んでいるので、ここで失敗しても
+	// 同じコードは再利用できない。アカウントは作成済みなので戻さずに記録だけ残す。
 	if ticket != nil && h.ticketStore != nil {
-		_ = h.ticketStore.MarkUsed(ticket.ID, result.User.ID)
+		if err := h.ticketStore.MarkUsed(ticket.ID, result.User.ID); err != nil {
+			slog.Warn("signup: failed to bind invitation ticket to the account", "ticketId", ticket.ID, "err", err)
+		}
 	}
 
 	// upstream SignupApiService が signinService.signin を呼ぶのは signup-pending
@@ -351,8 +426,10 @@ func (h *Handler) SignupPending(c echo.Context) error {
 		case coresignup.ErrInvitationAlreadyUsed:
 			return apierr.FastifyReply(c, http.StatusBadRequest, "INVITATION_ALREADY_USED")
 		case coresignup.ErrApplicationNotApproved:
-			// 承認が既に使われている / 期限切れ。**アカウントは作られていない**
-			// (同じ tx で巻き戻る、#2576)。
+			// 承認が既に使われている / 期限切れ / 不在 (#2576)、または承認制が
+			// 有効なのに申請に紐付いていない (#2804)。**どちらもアカウントは
+			// 作られていない** — 前者は同じ tx で巻き戻り、後者は tx に入る前に
+			// 返る。
 			return apierr.FastifyReply(c, http.StatusBadRequest, "NOT_APPROVED")
 		case coresignup.ErrInvitationRevoked:
 			// admin が ticket を削除した状態 (#610 item 2)。AlreadyUsed と区別。
@@ -396,7 +473,7 @@ func (h *Handler) SignupPending(c echo.Context) error {
 // 承認制の登録 (#2571) も同じメールに合流させるため helper 化している。
 // **2 箇所に同じ文面を書かない** — 片方だけ直すと、どちらの経路で登録したかで
 // 届く内容が変わる。
-func (h *Handler) sendSignupConfirmation(meta *model.Meta, to, code string) {
+func (h *Handler) sendSignupConfirmation(meta *model.Meta, to, code, acceptLanguage string) {
 	if h.emailSender == nil {
 		return
 	}
@@ -404,17 +481,18 @@ func (h *Handler) sendSignupConfirmation(meta *model.Meta, to, code string) {
 	if meta != nil && meta.Name != nil && *meta.Name != "" {
 		siteName = *meta.Name
 	}
+	lang := l10n.ResolveFromHeader(acceptLanguage, l10n.LangsFromMeta(meta))
+	subject, lead, linkLabel := l10n.SignupConfirm(lang, siteName)
 	confirmURL := h.signupConfirmURL(code)
-	lead := "Welcome to " + siteName + "! Click the link to complete your signup:"
-	text, bodyHTML := coreemail.LinkText(lead, "Complete signup", confirmURL)
+	text, bodyHTML := coreemail.LinkText(lead, linkLabel, confirmURL)
 	html := coreemail.WrapHTML(coreemail.HTMLWrapInput{
 		SiteName: siteName,
 		SiteURL:  h.serverURL,
-		Subject:  "Confirm your account",
+		Subject:  subject,
 		BodyHTML: bodyHTML,
 	})
 	go h.emailSender(to, miscsmtp.Message{
-		Subject: "Confirm your account",
+		Subject: subject,
 		Text:    text,
 		HTML:    html,
 	})
@@ -437,6 +515,42 @@ func (h *Handler) signupConfirmURL(code string) string {
 func validateEmailWithMeta(ctx context.Context, meta *model.Meta, addr string, client *http.Client) error {
 	svc := coreemail.NewServiceWithClient(meta, client)
 	return svc.Validate(ctx, addr)
+}
+
+// claimInvitation reserves the invitation ticket right before the account
+// (or the pending signup) is created. It returns a response to send when
+// the ticket could not be reserved, or nil to continue.
+//
+// **validateInvitationCode は読むだけなので、それだけでは 1 回きりにならない。**
+// 同じコードで並行に来たリクエストは全部検証を通るので、作成の前にここで
+// 条件付き UPDATE により 1 件だけを通す (upstream 2026.9.1 SignupApiService の
+// claimRegistrationTicket)。取れなかった側には検証失敗と同じエラーを返す。
+func (h *Handler) claimInvitation(c echo.Context, ticket *model.RegistrationTicket, emailRequired bool) func() error {
+	if ticket == nil || h.ticketStore == nil {
+		return nil
+	}
+	claimed, err := h.ticketStore.ClaimForSignup(ticket.ID, emailRequired)
+	if err != nil {
+		slog.Error("signup: cannot reserve the invitation ticket", "ticketId", ticket.ID, "err", err)
+		return func() error { return apierr.JSONInternalError(c) }
+	}
+	if !claimed {
+		return func() error {
+			return c.JSON(http.StatusBadRequest, apierr.Error("INVITATION_CODE_INVALID", "Invalid invitation code.", "11e71a03-43c4-4a99-92cf-bb7e2c581998"))
+		}
+	}
+	return nil
+}
+
+// releaseInvitation undoes claimInvitation when the signup failed, so the
+// code is not wasted. A ticket already bound to an account is left alone.
+func (h *Handler) releaseInvitation(ticket *model.RegistrationTicket) {
+	if ticket == nil || h.ticketStore == nil {
+		return
+	}
+	if err := h.ticketStore.ReleaseClaim(ticket.ID); err != nil {
+		slog.Warn("signup: failed to release the invitation ticket", "ticketId", ticket.ID, "err", err)
+	}
 }
 
 // validateInvitationCode checks the ticket store for a valid invitation code.

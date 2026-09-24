@@ -3,6 +3,7 @@ package drive_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"image"
@@ -13,18 +14,23 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/shiroha-a/mk/internal/core/drive"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/misc/imagedecode"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-var stubError = errors.New("stub error")
+var errStub = errors.New("stub error")
 
 // brokenStorage points the LocalStorage rootDir at an existing file so that
 // any Put/Delete operation fails.
@@ -156,7 +162,7 @@ type failingFileRepo struct {
 }
 
 func (f *failingFileRepo) Create(_ *model.DriveFile) error {
-	return stubError
+	return errStub
 }
 
 func TestUpload_RepoCreateError(t *testing.T) {
@@ -164,7 +170,7 @@ func TestUpload_RepoCreateError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
 	_, err := svc.Upload(context.Background(), drive.UploadInput{User: &model.User{ID: "u1"}, Body: []byte("x")})
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 func TestUpload_StoragePutError(t *testing.T) {
@@ -178,7 +184,7 @@ func TestUpload_StoragePutError(t *testing.T) {
 // errReader implements io.Reader and always returns an error.
 type errReader struct{}
 
-func (errReader) Read(_ []byte) (int, error) { return 0, stubError }
+func (errReader) Read(_ []byte) (int, error) { return 0, errStub }
 
 func TestUpload_AccessKeyGenError(t *testing.T) {
 	restore := drive.SetRandReaderForTest(errReader{})
@@ -722,7 +728,7 @@ type failingUpdateFileRepo struct {
 }
 
 func (f *failingUpdateFileRepo) Update(_ string, _ map[string]any) error {
-	return stubError
+	return errStub
 }
 
 func TestUpdate_RepoUpdateError(t *testing.T) {
@@ -734,7 +740,7 @@ func TestUpdate_RepoUpdateError(t *testing.T) {
 	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
 	newName := "x"
 	_, err := svc.Update(&model.User{ID: "u1"}, "f1", drive.UpdateInput{Name: &newName})
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 // --- Delete ---
@@ -806,7 +812,7 @@ type failingCreateFolderRepo struct {
 }
 
 func (f *failingCreateFolderRepo) Create(_ *model.DriveFolder) error {
-	return stubError
+	return errStub
 }
 
 func TestCreateFolder_RepoError(t *testing.T) {
@@ -815,7 +821,7 @@ func TestCreateFolder_RepoError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen)
 	_, err := svc.CreateFolder(&model.User{ID: "u1"}, "x", nil)
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 func TestShowFolder_NilUser(t *testing.T) {
@@ -900,7 +906,7 @@ type failingUpdateFolderRepo struct {
 }
 
 func (f *failingUpdateFolderRepo) Update(_ string, _ map[string]any) error {
-	return stubError
+	return errStub
 }
 
 func TestUpdateFolder_RepoError(t *testing.T) {
@@ -912,7 +918,7 @@ func TestUpdateFolder_RepoError(t *testing.T) {
 	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen)
 	newName := "x"
 	_, err := svc.UpdateFolder(&model.User{ID: "u1"}, "c", drive.UpdateFolderInput{Name: &newName})
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 func TestDeleteFolder_NotFound(t *testing.T) {
@@ -944,7 +950,7 @@ type failingHasChildrenRepo struct {
 }
 
 func (f *failingHasChildrenRepo) HasChildren(_ string) (bool, error) {
-	return false, stubError
+	return false, errStub
 }
 
 func TestDeleteFolder_HasChildrenError(t *testing.T) {
@@ -955,7 +961,7 @@ func TestDeleteFolder_HasChildrenError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := drive.NewService(testutil.NewMockDriveFileRepository(), repo, drive.NewLocalStorage(t.TempDir(), ""), idGen)
 	err := svc.DeleteFolder(&model.User{ID: "u1"}, "p")
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 // --- Streaming publisher hooks (Step K-7) ----------------------------------
@@ -1061,7 +1067,7 @@ type failingFindByIDRepo struct {
 func (r *failingFindByIDRepo) FindByID(id string) (*model.DriveFile, error) {
 	r.calls++
 	if r.calls > 1 {
-		return nil, stubError
+		return nil, errStub
 	}
 	return r.MockDriveFileRepository.FindByID(id)
 }
@@ -1075,7 +1081,7 @@ func TestUpdate_FindByIDReloadError(t *testing.T) {
 	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
 	name := "renamed"
 	_, err := svc.Update(&model.User{ID: "u1"}, "f1", drive.UpdateInput{Name: &name})
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 // failingDeleteFileRepo causes fileRepo.Delete to fail.
@@ -1083,7 +1089,7 @@ type failingDeleteFileRepo struct {
 	*testutil.MockDriveFileRepository
 }
 
-func (r *failingDeleteFileRepo) Delete(_ *model.DriveFile) error { return stubError }
+func (r *failingDeleteFileRepo) Delete(_ *model.DriveFile) error { return errStub }
 
 func TestDelete_FileRepoDeleteError(t *testing.T) {
 	mock := testutil.NewMockDriveFileRepository()
@@ -1093,7 +1099,7 @@ func TestDelete_FileRepoDeleteError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := drive.NewService(repo, testutil.NewMockDriveFolderRepository(), drive.NewLocalStorage(t.TempDir(), ""), idGen)
 	err := svc.Delete(&model.User{ID: "u1"}, "f1")
-	assert.ErrorIs(t, err, stubError)
+	assert.ErrorIs(t, err, errStub)
 }
 
 // ---------------------------------------------------------------------------
@@ -1214,7 +1220,7 @@ type stubVideoProcessor struct {
 	thumbnail *drive.ProcessedImage
 }
 
-func (s *stubVideoProcessor) GenerateThumbnail(_ []byte, _ string) (*drive.ProcessedImage, error) {
+func (s *stubVideoProcessor) GenerateThumbnail(_ context.Context, _ []byte, _ string) (*drive.ProcessedImage, error) {
 	return s.thumbnail, nil
 }
 
@@ -1469,4 +1475,567 @@ func TestDelete_WithoutLocalStorageFallsBackToPrimary(t *testing.T) {
 	}))
 	require.NoError(t, svc.Delete(&model.User{ID: uid}, "f1"))
 	assert.Contains(t, objStore.deleted, "k")
+}
+
+// blockingImageProcessor reports the peak number of concurrent calls.
+//
+// **画像で測る。** 枠が守っているのは「同時に確保される中間バッファの本数」で、
+// その根拠 (`imagedecode` の pixel cap / `processImage` の 4 回デコード) は
+// すべて画像の話。動画で測っていた 1 稿目は、**画像だけ枠を外す変異が素通り
+// する**ことを敵対的レビューで実測された。
+type blockingImageProcessor struct {
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+	release  chan struct{}
+}
+
+func (b *blockingImageProcessor) enter() {
+	b.mu.Lock()
+	b.inFlight++
+	if b.inFlight > b.peak {
+		b.peak = b.inFlight
+	}
+	b.mu.Unlock()
+	<-b.release
+	b.mu.Lock()
+	b.inFlight--
+	b.mu.Unlock()
+}
+
+func (b *blockingImageProcessor) GetDimensions(_ []byte, _ string) (int, int, error) {
+	b.enter()
+	return 1, 1, nil
+}
+func (b *blockingImageProcessor) CalculateBlurhash(_ []byte, _ string) (string, error) {
+	return "", nil
+}
+func (b *blockingImageProcessor) GenerateThumbnail(_ []byte, _ string) (*drive.ProcessedImage, error) {
+	return nil, nil
+}
+func (b *blockingImageProcessor) GenerateWebpublic(_ []byte, _ string) (*drive.ProcessedImage, error) {
+	return nil, nil
+}
+
+// blockingVideoProcessor blocks so tests can observe whether the video path
+// takes a slot.
+type blockingVideoProcessor struct {
+	mu       sync.Mutex
+	inFlight int
+	peak     int
+	release  chan struct{}
+}
+
+func (b *blockingVideoProcessor) GenerateThumbnail(_ context.Context, _ []byte, _ string) (*drive.ProcessedImage, error) {
+	b.mu.Lock()
+	b.inFlight++
+	if b.inFlight > b.peak {
+		b.peak = b.inFlight
+	}
+	b.mu.Unlock()
+	<-b.release
+	b.mu.Lock()
+	b.inFlight--
+	b.mu.Unlock()
+	return &drive.ProcessedImage{Data: []byte("thumb"), MimeType: "image/webp"}, nil
+}
+
+// waitForInFlight waits until the probe reports at least n concurrent calls.
+func waitForInFlight(get func() int, n int) {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if get() >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// **同時実行枠が実際に効いていること (画像経路)。**
+//
+// デコードは 1 枚で数百 MB を確保しうるので、枠が無いと認証済みの利用者が
+// 並行アップロードを投げるだけで確保量を掛け算できる。Go の大確保失敗は
+// `throw("out of memory")` で recover できないため、プロセスごと落ちる。
+func TestGenerateAlts_ConcurrencyIsBounded(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	proc := &blockingImageProcessor{release: make(chan struct{})}
+	svc.SetImageProcessor(proc)
+	svc.SetMediaProcessingConcurrency(1)
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			svc.GenerateAltsCtxForTest(context.Background(), []byte("img"), "image/png")
+		}()
+	}
+	waitForInFlight(func() int {
+		proc.mu.Lock()
+		defer proc.mu.Unlock()
+		return proc.inFlight
+	}, 1)
+	time.Sleep(50 * time.Millisecond)
+	close(proc.release)
+	wg.Wait()
+
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	assert.Equal(t, 1, proc.peak, "枠を超えて同時に処理している (peak=%d)", proc.peak)
+}
+
+// 枠を広げれば同時に走る。**これが無いと「常に 1 本ずつ」でもテストが通る。**
+func TestGenerateAlts_ConcurrencyHonoursTheConfiguredSize(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	proc := &blockingImageProcessor{release: make(chan struct{})}
+	svc.SetImageProcessor(proc)
+	svc.SetMediaProcessingConcurrency(3)
+
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			svc.GenerateAltsCtxForTest(context.Background(), []byte("img"), "image/png")
+		}()
+	}
+	waitForInFlight(func() int {
+		proc.mu.Lock()
+		defer proc.mu.Unlock()
+		return proc.inFlight
+	}, 3)
+	close(proc.release)
+	wg.Wait()
+
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	assert.Equal(t, 3, proc.peak, "枠を広げても 1 本ずつになっている")
+}
+
+// **動画は枠を取らない。** ffmpeg は別プロセスで Go ヒープの中間バッファを
+// 抱えず、`exec.Command` は context も timeout も持たないので、枠の内側に
+// 入れると動画 1 本が画像処理を全部止める。
+func TestGenerateAlts_VideoDoesNotTakeASlot(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	proc := &blockingVideoProcessor{release: make(chan struct{})}
+	svc.SetVideoProcessor(proc)
+	svc.SetMediaProcessingConcurrency(1)
+
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			svc.GenerateAltsCtxForTest(context.Background(), []byte("video"), "video/mp4")
+		}()
+	}
+	waitForInFlight(func() int {
+		proc.mu.Lock()
+		defer proc.mu.Unlock()
+		return proc.inFlight
+	}, 3)
+	close(proc.release)
+	wg.Wait()
+
+	proc.mu.Lock()
+	defer proc.mu.Unlock()
+	assert.Equal(t, 3, proc.peak, "ffmpeg が枠を占有している (枠 1 で 1 本ずつになっている)")
+}
+
+// 枠待ちの間に呼び出し元が諦めたら処理しない (best-effort の契約どおり nil)。
+func TestGenerateAlts_CancelledWhileWaiting(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	proc := &blockingImageProcessor{release: make(chan struct{})}
+	svc.SetImageProcessor(proc)
+	svc.SetMediaProcessingConcurrency(1)
+
+	holder := make(chan struct{})
+	go func() {
+		defer close(holder)
+		svc.GenerateAltsCtxForTest(context.Background(), []byte("img"), "image/png")
+	}()
+	waitForInFlight(func() int {
+		proc.mu.Lock()
+		defer proc.mu.Unlock()
+		return proc.inFlight
+	}, 1)
+
+	// **待たずに済む形で呼ぶ。** guard が無いと processor の中で止まるので、
+	// 直接呼ぶとテストごとデッドロックして「タイムアウトで落ちた」という
+	// 読みにくい失敗になる。別 goroutine + 期限で「戻ってこないこと自体」を
+	// 失敗として扱う。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan bool, 1)
+	go func() { done <- svc.GenerateAltsCtxForTest(ctx, []byte("img"), "image/png") }()
+
+	select {
+	case processed := <-done:
+		assert.False(t, processed, "ctx が切れているのに処理へ進んでいる")
+	case <-time.After(2 * time.Second):
+		t.Error("ctx が切れているのに枠を待ち続けている (processor まで進んだ可能性)")
+	}
+
+	close(proc.release)
+	<-holder
+}
+
+// 既定の枠は GOMAXPROCS の半分 (最低 1)。0 以下を渡したら既定へ戻す。
+//
+// **「1 以上 4 以下」のような緩い範囲では固定にならない。** GOMAXPROCS 全部に
+// 戻す変異 (= 無制限と区別が付かなくなる形) がコア数次第で素通りする。
+// media proxy の枠 (#3032) と同じ規則であることまで書く。
+func TestMediaProcessingConcurrency_Defaults(t *testing.T) {
+	want := runtime.GOMAXPROCS(0) / 2
+	if want < 1 {
+		want = 1
+	}
+	def := drive.DefaultMediaProcessingConcurrencyForTest()
+	assert.Equal(t, want, def, "既定が GOMAXPROCS/2 (最低 1) でない")
+
+	svc, _, _ := newSvc(t)
+	assert.Equal(t, def, svc.MediaProcessingSlotsForTest(), "NewService が枠を配線していない")
+
+	svc.SetMediaProcessingConcurrency(2)
+	assert.Equal(t, 2, svc.MediaProcessingSlotsForTest())
+
+	svc.SetMediaProcessingConcurrency(0)
+	assert.Equal(t, def, svc.MediaProcessingSlotsForTest(), "0 以下は既定へ戻す")
+}
+
+// bmpHeaderForTest builds a 54-byte BMP header declaring w x h at 24bpp,
+// with no pixel data at all.
+//
+// **データを付けないのが要点。** ヘッダだけ見て弾けていれば、その先を読みに
+// 行かないので、判定がデコードより前にあることを直接確かめられる。
+func bmpHeaderForTest(w, h int32) []byte {
+	var b bytes.Buffer
+	b.WriteString("BM")
+	_ = binary.Write(&b, binary.LittleEndian, uint32(54))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(54))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(40))
+	_ = binary.Write(&b, binary.LittleEndian, w)
+	_ = binary.Write(&b, binary.LittleEndian, h)
+	_ = binary.Write(&b, binary.LittleEndian, uint16(1))
+	_ = binary.Write(&b, binary.LittleEndian, uint16(24))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&b, binary.LittleEndian, int32(2835))
+	_ = binary.Write(&b, binary.LittleEndian, int32(2835))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	_ = binary.Write(&b, binary.LittleEndian, uint32(0))
+	return b.Bytes()
+}
+
+// **アップロード経路にも pixel cap が効いていること。**
+//
+// `decodeImage` は `internal/misc/imagedecode` へ委譲しているので、cap は
+// media proxy と共通のものが効く。**その委譲が外れると、ローカルアップロード
+// だけ 54 バイトのヘッダで数 GB を確保できる状態に戻る** (Go の大確保失敗は
+// `throw("out of memory")` で recover できないのでプロセスごと落ちる)。
+// 4 つの入口すべてを見るのは、どれか 1 つだけ直接 `imaging.Decode` に
+// 戻される形を捕まえるため。
+func TestImageProcessor_RefusesOversizedHeader(t *testing.T) {
+	p := drive.NewDefaultImageProcessor()
+	// 54 バイトで 8.6GB (46341^2 x 4 byte) を要求するヘッダ。
+	data := bmpHeaderForTest(46341, 46341)
+	require.Len(t, data, 54)
+
+	// **cap の sentinel まで見る。** 「何かのエラー」で満足すると、委譲を外して
+	// 素の `imaging.Decode` に戻しても (54 バイトしか無いので) デコード失敗で
+	// エラーにはなり、テストが通ってしまう。
+	_, _, err := p.GetDimensions(data, "image/bmp")
+	require.Error(t, err, "GetDimensions が巨大なヘッダを受けている")
+	assert.ErrorIs(t, err, imagedecode.ErrTooManyPixels)
+
+	_, err = p.CalculateBlurhash(data, "image/bmp")
+	require.Error(t, err, "CalculateBlurhash が巨大なヘッダを受けている")
+	assert.ErrorIs(t, err, imagedecode.ErrTooManyPixels)
+
+	// サムネイル / webpublic はデコード失敗を `nil, nil` に倒す契約 (best-effort)
+	// なので、ここで見られるのは「画像を作らずに戻る」ことまで。ラスタを
+	// 確保しないことは上の 2 つが sentinel で押さえている。
+	thumb, err := p.GenerateThumbnail(data, "image/bmp")
+	assert.NoError(t, err)
+	assert.Nil(t, thumb, "巨大なヘッダからサムネイルを作っている")
+
+	wp, err := p.GenerateWebpublic(data, "image/bmp")
+	assert.NoError(t, err)
+	assert.Nil(t, wp, "巨大なヘッダから webpublic を作っている")
+}
+
+// **普通の画像はこれまでどおり通る。** これが無いと「BMP を常に拒否する」
+// 実装でも上のテストが通る。
+func TestImageProcessor_OrdinaryImageStillProcesses(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	img.Set(0, 0, color.RGBA{R: 1, G: 2, B: 3, A: 255})
+	var buf bytes.Buffer
+	require.NoError(t, png.Encode(&buf, img))
+
+	p := drive.NewDefaultImageProcessor()
+	w, h, err := p.GetDimensions(buf.Bytes(), "image/png")
+	require.NoError(t, err)
+	assert.Equal(t, 16, w)
+	assert.Equal(t, 16, h)
+}
+
+// **列に入らないファイル名を弾く (#3037)。**
+//
+// `drive_file.name` は varchar(256)。NUL も不正な UTF-8 も列幅超過も、そのまま
+// INSERT / UPDATE すると PostgreSQL がクエリごと落とす (22021 / 22001) ので、
+// **認証済みの利用者が 1 文字で 500 を起こせていた**。#3022 と同じく既存の
+// 述語 (`ValidateFileName`) に畳んで既存の 400 に落とす。
+func TestValidateFileName_RejectsUnstorable(t *testing.T) {
+	for name, in := range map[string]string{
+		"NUL":            "a\x00b.png",
+		"invalid UTF-8":  "a\x80b.png",
+		"lone surrogate": "a\xed\xa0\x80b.png",
+		"too long (201)": strings.Repeat("a", 201),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.False(t, drive.ValidateFileName(in), "列に入らない名前を受け入れている")
+		})
+	}
+}
+
+// **普通の名前は通ったまま。** これが無いと「常に拒否する」実装でも上が通る。
+func TestValidateFileName_OrdinaryNamesStillPass(t *testing.T) {
+	for _, in := range []string{
+		"hello.png",
+		"日本語のファイル名.jpg",
+		"絵文字\U0001F600.png",
+		strings.Repeat("あ", 200),
+	} {
+		assert.True(t, drive.ValidateFileName(in), "正当な名前を弾いている: %q", in)
+	}
+}
+
+// **読み切る前に上限を引けること (#3037)。**
+//
+// `Upload` の中にも同じ判定があるが、あそこへ届く時点で本体は全部メモリに
+// 載っている。既定では policy が 30MB なのに `config.maxFileSize` が 250MB
+// なので、30MB しか保存できない利用者が 250MB を確保させられた。
+func TestMaxUploadBytes(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	local := &model.User{ID: "u1"}
+	remoteHost := "remote.example"
+	remote := &model.User{ID: "u2", Host: &remoteHost}
+
+	// roleChecker 未配線 → 上限なし。
+	_, ok := svc.MaxUploadBytes(local)
+	assert.False(t, ok, "role が未配線なのに上限を作っている")
+
+	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+		"u1": {"maxFileSizeMb": 30},
+		"u2": {"maxFileSizeMb": 30},
+		"u3": {"maxFileSizeMb": 0},
+		"u4": {"maxFileSizeMb": 1.5},
+	}})
+
+	got, ok := svc.MaxUploadBytes(local)
+	require.True(t, ok)
+	assert.Equal(t, int64(30*1024*1024), got)
+
+	// 小数の policy も gate と同じ値になる (`Capacity` と同じ理由、#2611)。
+	got, ok = svc.MaxUploadBytes(&model.User{ID: "u4"})
+	require.True(t, ok)
+	assert.Equal(t, int64(1.5*1024*1024), got)
+
+	// 上限を作らない側。**`Upload` の gate と対象を揃える** — あちらも
+	// system file と remote user は見ない。
+	for _, tt := range []struct {
+		name string
+		user *model.User
+	}{
+		{"system file (user なし)", nil},
+		{"remote user", remote},
+		{"policy が 0", &model.User{ID: "u3"}},
+		{"policy の無い user", &model.User{ID: "u9"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ok := svc.MaxUploadBytes(tt.user)
+			assert.False(t, ok, "上限を作ってはいけない相手に上限を作っている")
+		})
+	}
+}
+
+// --- #3037 レビュー 2 周目: メタデータを落とせない画像は受け取らない ---
+
+// webpWithExif builds a RIFF/WEBP container of at least size bytes that carries
+// an EXIF chunk, without needing a real encoder.
+func webpWithExif(size int) []byte {
+	exif := []byte("EXIF")
+	payload := []byte("Exif\x00\x00II*\x00\x08\x00\x00\x00")
+	pad := size
+	if pad < 64 {
+		pad = 64
+	}
+	b := make([]byte, 0, pad+64)
+	b = append(b, "RIFF"...)
+	b = append(b, 0, 0, 0, 0) // size は判定に使われないので 0 のままでよい
+	b = append(b, "WEBP"...)
+	// VP8 チャンクで嵩を作る。
+	b = append(b, "VP8 "...)
+	b = append(b, 0, 0, 0, 0)
+	b = append(b, make([]byte, pad)...)
+	// EXIF チャンク。
+	b = append(b, exif...)
+	b = append(b, byte(len(payload)), 0, 0, 0)
+	b = append(b, payload...)
+	return b
+}
+
+// **デコードできない画像を受け取ると、原本がそのまま公開側へ出る。**
+//
+// `SandboxedDecoderMaxBytes` (32MiB) は #3037 が新しく入れた上限で、これに
+// 当たると `GenerateWebpublic` が `nil, nil` を返す。webpublic が無いと
+// `GetPublicURL` は原本へ落ちるので、**EXIF の GPS がそのまま公開される** —
+// この PR が `entity/drive.go` 側で塞いだ穴と同じもの。しかも
+// `NormalizeImageForDetection` も同じ理由で失敗するので、センシティブ判定も
+// fail-open で `false` になる。
+//
+// 発火するのは `maxFileSizeMb >= 33` の構成だけ (既定は 30)。
+func TestUpload_RejectsImagesWhoseMetadataCannotBeStripped(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+		"u1": {"maxFileSizeMb": 64},
+	}})
+	body := webpWithExif(33 << 20)
+
+	_, err := svc.Upload(context.Background(), drive.UploadInput{
+		User: &model.User{ID: "u1"}, Body: body, Name: "x.webp",
+	})
+
+	require.ErrorIs(t, err, drive.ErrUndecodableImage,
+		"メタデータを落とせない画像を受け取っている (原本が公開側に出る)")
+}
+
+// **拒否したファイルの実体を残さない (#3037 レビュー 3 周目)。**
+//
+// guard が `backend.Put` の後ろにあると、本体だけがストレージに残る。
+// `drive_file` 行は作られないので `UsageByUser` にも `DeleteOrphans`
+// (行ベース) にも乗らず、**恒久的にリークする** — 実測で拒否 1 回あたり
+// 34,603,050 バイトが残った。認証済みの利用者が何度でも叩ける。
+func TestUpload_RejectedImageLeavesNothingInStorage(t *testing.T) {
+	dir := t.TempDir()
+	storage := drive.NewLocalStorage(dir, "https://example.com/files")
+	svc, fileRepo := newSvcWithStorage(t, storage)
+	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+		"u1": {"maxFileSizeMb": 64},
+	}})
+
+	_, err := svc.Upload(context.Background(), drive.UploadInput{
+		User: &model.User{ID: "u1"}, Body: webpWithExif(33 << 20), Name: "x.webp",
+	})
+	require.ErrorIs(t, err, drive.ErrUndecodableImage)
+
+	assert.Empty(t, fileRepo.Files, "拒否したのに drive_file 行がある")
+	var left []string
+	require.NoError(t, filepath.Walk(dir, func(path string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if !info.IsDir() {
+			left = append(left, path)
+		}
+		return nil
+	}))
+	assert.Empty(t, left, "拒否したファイルの実体がストレージに残っている (恒久的にリークする)")
+}
+
+// **上限の内側なら従来どおり通る。** これが無いと「WebP を常に拒否する」
+// 実装でも上のテストが通る。
+func TestUpload_AcceptsImagesUnderTheDecoderSizeCap(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+		"u1": {"maxFileSizeMb": 64},
+	}})
+	body := webpWithExif(1 << 20)
+
+	_, err := svc.Upload(context.Background(), drive.UploadInput{
+		User: &model.User{ID: "u1"}, Body: body, Name: "x.webp",
+	})
+
+	require.NotErrorIs(t, err, drive.ErrUndecodableImage, "上限の内側を弾いている")
+}
+
+// **落とすものが無い画像は通す。** 原本を出しても漏れないので、上限に当たる
+// だけで拒否すると受け取れるものを不必要に減らす。
+func TestUpload_AcceptsLargeImagesWithoutMetadata(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+		"u1": {"maxFileSizeMb": 64},
+	}})
+	// EXIF チャンクを持たない WebP。
+	body := make([]byte, 0, 33<<20)
+	body = append(body, "RIFF"...)
+	body = append(body, 0, 0, 0, 0)
+	body = append(body, "WEBP"...)
+	body = append(body, "VP8 "...)
+	body = append(body, 0, 0, 0, 0)
+	body = append(body, make([]byte, 33<<20)...)
+
+	_, err := svc.Upload(context.Background(), drive.UploadInput{
+		User: &model.User{ID: "u1"}, Body: body, Name: "x.webp",
+	})
+
+	require.NotErrorIs(t, err, drive.ErrUndecodableImage, "落とすものが無い画像を弾いている")
+}
+
+// **AVIF は中身に関わらず拒否する (#3037 レビュー 3 周目)。**
+//
+// `hasStrippableMetadata` は AVIF に false を返す — 「AVIF は寸法に関わらず
+// webpublic を作る枝が別にある」ことが前提だが、**デコードできなければその枝も
+// 動かない**。AVIF の原本は Mastodon / MS Edge が表示できないので、通すと
+// 壊れた添付になる。2 周目はこの枝を足したのにテストを置いておらず、
+// **条件を消しても緑のままだった**。
+func TestUpload_RejectsOversizedAVIFEvenWithoutMetadata(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+		"u1": {"maxFileSizeMb": 64},
+	}})
+
+	_, err := svc.Upload(context.Background(), drive.UploadInput{
+		User: &model.User{ID: "u1"}, Body: avifWithoutMetadata(33 << 20), Name: "x.avif",
+	})
+
+	require.ErrorIs(t, err, drive.ErrUndecodableImage,
+		"メタデータの無い巨大 AVIF を受け取っている (原本は Mastodon / Edge で表示できない)")
+}
+
+// **上限の内側の AVIF は通す。** これが無いと「AVIF を常に拒否する」実装でも
+// 上のテストが通る。
+func TestUpload_AcceptsAVIFUnderTheDecoderSizeCap(t *testing.T) {
+	svc, _, _ := newSvc(t)
+	svc.SetRoleChecker(&fakeMod{policies: map[string]map[string]any{
+		"u1": {"maxFileSizeMb": 64},
+	}})
+
+	_, err := svc.Upload(context.Background(), drive.UploadInput{
+		User: &model.User{ID: "u1"}, Body: avifWithoutMetadata(1 << 20), Name: "x.avif",
+	})
+
+	require.NotErrorIs(t, err, drive.ErrUndecodableImage, "上限の内側の AVIF を弾いている")
+}
+
+// avifWithoutMetadata builds an ISOBMFF container with the `avif` brand and no
+// EXIF/XMP box, padded to at least size bytes.
+func avifWithoutMetadata(size int) []byte {
+	pad := size
+	if pad < 64 {
+		pad = 64
+	}
+	b := make([]byte, 0, pad+32)
+	// ftyp box: size(4) + "ftyp" + major brand + minor version + compatible brand.
+	b = append(b, 0, 0, 0, 20)
+	b = append(b, "ftyp"...)
+	b = append(b, "avif"...)
+	b = append(b, 0, 0, 0, 0)
+	b = append(b, "avif"...)
+	// mdat box に嵩を持たせる (中身は読まれない)。
+	b = append(b, 0, 0, 0, 8)
+	b = append(b, "mdat"...)
+	b = append(b, make([]byte, pad)...)
+	return b
 }

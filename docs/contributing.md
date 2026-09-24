@@ -34,16 +34,55 @@
 ## コミット前チェック
 
 ```bash
-make fmt    # gofmt -s -w .
-make lint   # go vet ./...
-make test   # go test ./... -v
+make check  # fmt → lint → actionlint → golangci-lint → test
 ```
 
-CIで`gofmt`差分チェック、`go vet`、カバレッジ閾値チェックが走る。
+個別に回すなら `make fmt` / `make lint` / `make actionlint` / `make golangci-lint` / `make test`。
+テストは `-race -count=1 -shuffle=3` で CI と同じ実行条件。
+
+CIで`gofmt`差分チェック、`go vet`、actionlint、golangci-lint、カバレッジ閾値チェックが走る。
 
 PR を出すと十数個の check が走る。**required なのは `build` / `test` / `lint` の 3 つだけ**で、
 残りは非ブロッキング。どれが何を見ていて落ちたとき何を疑うかは [CI で回る項目](ci.md) に
 まとめてある。
+
+## fork frontend (`third_party/misskey`) を触るとき
+
+mk-go 1.0 以降は fork frontend を独自に進化させる。Go 側の `make check` だけでは
+frontend の規約違反を拾えないので、submodule を変える PR では以下も確認する。
+
+### submodule の系列
+
+mk が追跡するのは fork の **`mk-2026.x.x` 系列**であり、fork `develop` ではない。
+misskey-ts への PR は base を mk の gitlink が指す系列に合わせ、mk 側では
+[upstream-catch-up.md の祖先確認](upstream-catch-up.md#mk-固有パッチだけを載せるときrelease-bump-以外)
+を bump 前に必ず行う。
+
+### 手元での確認（CI `frontend-check` job 相当）
+
+`make frontend-check` は**型 (`vue-tsc`) + submodule のソースを読むゲート + eslint** まで (#2892 / #2906)。job 全体はさらに vitest と `make plugins-all` / 統合バイナリの build も走る。下のブロックが eslint を再度呼ぶのは、CI も別 step (`Lint (eslint)`) で回しているのを揃えているため。
+
+```bash
+cd third_party/misskey && pnpm install && pnpm build-pre && pnpm -r build
+make plugins-all && go build -o /dev/null ./cmd/misskey   # CI と同じ統合ビルド
+make frontend-check
+cd third_party/misskey/packages/frontend && pnpm eslint
+make frontend-test
+```
+
+`make uds-frontend-build` / `make e2e-frontend-build` は本番の `built/` を書き換えるので
+検証には使わない ([development.md](development.md))。
+
+### コーディング規約（fork frontend）
+
+| 規約 | 詳細 |
+|---|---|
+| i18n | パラメータ付き文字列は `i18n.tsx._key.func({ n })`。`i18n.t()` は `@deprecated`（`ts` / `tsx` 直接参照のほうが Vue のキャッシュ効率が良い） |
+| import | 型は top-level の `import type { Foo } from '...'`。値 import 内の `type Foo` は eslint `import/consistent-type-specifier-style` で落ちる |
+| vitest | `vitest.config.unit.ts` の include は `test/unit/**/*.test.ts` のみ。**`src/` 直下の `.test.ts` は CI でも手元でも実行されない** |
+
+Playwright spec を足すときは [playwright.md](playwright.md) の selector 規約も読む
+（位置依存の `querySelector` はフォーム項目が増えると壊れる）。
 
 ## ドキュメントを直すときのレビュー条件
 
@@ -216,3 +255,20 @@ rate limit の例:
 ## ライセンス
 
 [GNU AGPL-3.0](../LICENSE)
+
+### Go のソースに SPDX ヘッダーは付けない
+
+AGPL-3.0 が求めるのはライセンス全文を添えること (§4) と、改変の告知 (§5a)、
+ネットワーク越しの利用者へのソース提供 (§13) で、**各ファイルのヘッダーは条件では
+ない**。GPL の付録 "How to Apply These Terms" が推奨しているだけで、mk-go は
+`LICENSE` と README の表記で足りている。
+
+**上流 TS からヘッダーをコピーしないこと。** `SPDX-FileCopyrightText: syuilo and
+misskey-project` は upstream Misskey の著作権表示なので、mk-go 自身のコードに
+付けると**帰属が逆になる**。実際に `plugin/` の 3 ファイルがその状態だった。
+
+**fork frontend (`third_party/misskey`) は別。** 上流のヘッダーを消すのは §4 の
+「既存の告知をそのまま残す」に反する。AGPL 管轄ディレクトリへ新規ファイルを足す
+ときも、submodule 側の `scripts/check-spdx.mjs` が落とすのでヘッダーが要る。
+`tools/pluginbuild` が生成する `server-plugins.generated.ts` がそこに入るのも
+同じ理由で、あれは Go 側の方針の例外ではなく submodule 側の要件。

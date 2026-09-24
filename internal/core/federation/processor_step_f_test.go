@@ -1,6 +1,7 @@
 package federation_test
 
 import (
+	"encoding/json"
 	"errors"
 	"strconv"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	corereaction "github.com/shiroha-a/mk/internal/core/reaction"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/pgarray"
 	"github.com/shiroha-a/mk/internal/queue"
 	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/testutil"
@@ -1025,13 +1027,18 @@ func TestProcess_UndoAnnounceBadObject(t *testing.T) {
 
 // --- Note update (Step J) -----------------------------------------------------
 
+// **著者を実在させないと attribution 検査が空振りする (#3037)。** 検査は
+// `note.UserID` から著者を引いて `author.URI == actor` を見るので、居ない ID を
+// 書いたフィクスチャは「引けなかった」経路を通る。fail-open だったころは
+// それでも更新が通っていたため、**テストは検査を一度も踏んでいなかった**。
 func TestProcess_UpdateNoteHappyPath(t *testing.T) {
 	env := newFullProcessor(t, aliceActor)
+	authorID := seedRemoteAlice(env)
 	uri := "https://remote.example/notes/n1"
 	host := "remote.example"
 	original := "original"
 	env.noteRepo.Notes["n1"] = &model.Note{
-		ID: "n1", URI: &uri, UserID: "alice-id", UserHost: &host, Text: &original,
+		ID: "n1", URI: &uri, UserID: authorID, UserHost: &host, Text: &original,
 	}
 	body := []byte(`{
 		"type": "Update",
@@ -1093,8 +1100,13 @@ func TestProcess_UpdateNote_RepoErrorPropagates(t *testing.T) {
 	mock := testutil.NewMockNoteRepository()
 	uri := "https://remote.example/notes/n1"
 	host := "remote.example"
+	// 著者を実在させる (上の HappyPath と同じ理由)。
+	aliceURI := "https://remote.example/users/alice"
+	userRepo.Users["alice_remote"] = &model.User{
+		ID: "alice_remote", Username: "alice", Host: &host, URI: &aliceURI,
+	}
 	mock.Notes["n1"] = &model.Note{
-		ID: "n1", URI: &uri, UserID: "alice-id", UserHost: &host,
+		ID: "n1", URI: &uri, UserID: "alice_remote", UserHost: &host,
 	}
 	noteRepo := &updateFailNoteRepo{MockNoteRepository: mock}
 	emojiRepo := testutil.NewMockEmojiRepository()
@@ -1965,5 +1977,183 @@ func TestProcess_CollectionItemActorSpoofIgnored(t *testing.T) {
 	for _, r := range env.reactionRepo.Reactions {
 		// reaction は alice (collection actor) 名義であり victim 名義ではない。
 		assert.NotContains(t, r.UserID, "victim", "詐称 actor では記録されない (#2023 security)")
+	}
+}
+
+// findFailUserRepo makes the author lookup fail, so the attribution check
+// cannot confirm who owns the note.
+type findFailUserRepo struct {
+	*testutil.MockUserRepository
+	failFor  string
+	withUser bool
+}
+
+func (r *findFailUserRepo) FindByID(id string) (*model.User, error) {
+	if id == r.failFor {
+		if r.withUser {
+			// **値と error を同時に返す形も見る。** `author == nil` だけを
+			// 見る実装だとここが素通りし、`aerr != nil` の判定が空虚になる。
+			u, _ := r.MockUserRepository.FindByID(id)
+			return u, errors.New("user SELECT failed")
+		}
+		return nil, errors.New("user SELECT failed")
+	}
+	return r.MockUserRepository.FindByID(id)
+}
+
+// **著者を確認できないなら更新しない (#3037)。**
+//
+// 以前は「`FindByID` が成功し、`author.URI` が非 nil で、値が違うとき」だけ
+// 拒否していたので、**DB 障害 / 行の消失 / URI が NULL のどれでも検査が
+// 丸ごと消えて**いた。ここは「他人のノートを書き換えられるか」を決める
+// 唯一の検査で、通れば `text` / `cw` / `url` に加えて `upsertEmojis` が
+// 使う host まで攻撃者の言い値になる。
+func TestProcess_UpdateNote_AuthorLookupFailureDoesNotUpdate(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(*testing.T, *testutil.MockUserRepository) repository.UserRepository
+	}{
+		{
+			name: "著者の lookup が失敗する",
+			setup: func(_ *testing.T, base *testutil.MockUserRepository) repository.UserRepository {
+				return &findFailUserRepo{MockUserRepository: base, failFor: "alice_remote"}
+			},
+		},
+		{
+			name: "lookup が値と error を同時に返す",
+			setup: func(_ *testing.T, base *testutil.MockUserRepository) repository.UserRepository {
+				return &findFailUserRepo{MockUserRepository: base, failFor: "alice_remote", withUser: true}
+			},
+		},
+		{
+			name: "著者の行が消えている",
+			setup: func(_ *testing.T, base *testutil.MockUserRepository) repository.UserRepository {
+				delete(base.Users, "alice_remote")
+				return base
+			},
+		},
+		{
+			name: "著者の URI が NULL",
+			setup: func(_ *testing.T, base *testutil.MockUserRepository) repository.UserRepository {
+				base.Users["alice_remote"].URI = nil
+				return base
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			userRepo := testutil.NewMockUserRepository()
+			noteRepo := testutil.NewMockNoteRepository()
+			host := "remote.example"
+			aliceURI := "https://remote.example/users/alice"
+			userRepo.Users["alice_remote"] = &model.User{
+				ID: "alice_remote", Username: "alice", Host: &host, URI: &aliceURI,
+			}
+			uri := "https://remote.example/notes/n1"
+			original := "original"
+			noteRepo.Notes["n1"] = &model.Note{
+				ID: "n1", URI: &uri, UserID: "alice_remote", UserHost: &host, Text: &original,
+			}
+
+			effective := tt.setup(t, userRepo)
+			urls := activitypub.NewURLBuilder("https://example.com")
+			idGen, _ := id.NewGenerator("aidx")
+			resolver := federation.NewResolver(effective, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+			followingSvc := corefollowing.NewService(effective, testutil.NewMockFollowingRepository(), testutil.NewMockFollowRequestRepository(), idGen)
+			p := federation.NewProcessor(resolver, followingSvc, nil, nil, effective, noteRepo)
+
+			body := []byte(`{
+				"type": "Update",
+				"actor": "https://remote.example/users/alice",
+				"object": {
+					"id": "https://remote.example/notes/n1",
+					"type": "Note",
+					"attributedTo": "https://remote.example/users/alice",
+					"content": "edited"
+				}
+			}`)
+			_ = p.Process(body)
+
+			got := noteRepo.Notes["n1"]
+			require.NotNil(t, got.Text)
+			assert.Equal(t, "original", *got.Text, "著者を確認できないのに更新している")
+		})
+	}
+}
+
+// **poll 側も fail-closed であること (#3037 レビュー)。**
+//
+// このコミットは Note と Question の**両方**を fail-closed にしたが、テストが
+// 増えたのは Note 側だけだった。Question の guard を旧 fail-open 形に戻しても
+// 誰も気付かない状態 (レビュアーが変異検証で実測)。
+func TestProcess_UpdateQuestion_AuthorLookupFailureDoesNotUpdate(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(*testing.T, *testutil.MockUserRepository) repository.UserRepository
+		// wantErr は「判定できなかった」ぶんを job へ返すか (#3116)。
+		// **更新しないことと ack することは別**で、not-found (行が消えた /
+		// URI が NULL) は retry しても変わらないので ack、DB 障害は伝播させる。
+		wantErr bool
+	}{
+		{
+			name: "著者の lookup が失敗する",
+			setup: func(_ *testing.T, base *testutil.MockUserRepository) repository.UserRepository {
+				return &findFailUserRepo{MockUserRepository: base, failFor: "alice_remote"}
+			},
+			wantErr: true,
+		},
+		{
+			name: "著者の行が消えている",
+			setup: func(_ *testing.T, base *testutil.MockUserRepository) repository.UserRepository {
+				delete(base.Users, "alice_remote")
+				return base
+			},
+		},
+		{
+			name: "著者の URI が NULL",
+			setup: func(_ *testing.T, base *testutil.MockUserRepository) repository.UserRepository {
+				base.Users["alice_remote"].URI = nil
+				return base
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			userRepo := testutil.NewMockUserRepository()
+			noteRepo := testutil.NewMockNoteRepository()
+			pollRepo := testutil.NewMockPollRepository()
+			host := "remote.example"
+			aliceURI := "https://remote.example/users/alice"
+			userRepo.Users["alice_remote"] = &model.User{
+				ID: "alice_remote", Username: "alice", Host: &host, URI: &aliceURI,
+			}
+			uri := "https://remote.example/notes/q1"
+			noteRepo.Notes["q1"] = &model.Note{ID: "q1", URI: &uri, UserID: "alice_remote", UserHost: &host}
+			pollRepo.Polls["q1"] = &model.Poll{
+				NoteID: "q1", Choices: []string{"a", "b"}, Votes: pgarray.Int64Array{0, 0},
+			}
+
+			effective := tt.setup(t, userRepo)
+			urls := activitypub.NewURLBuilder("https://example.com")
+			idGen, _ := id.NewGenerator("aidx")
+			resolver := federation.NewResolver(effective, noteRepo, urls, &stubFetcher{body: []byte(aliceActor)}, idGen)
+			resolver.SetPollRepo(pollRepo)
+
+			err := resolver.UpdateRemoteQuestion(json.RawMessage(`{
+				"id": "https://remote.example/notes/q1",
+				"type": "Question",
+				"attributedTo": "https://remote.example/users/alice",
+				"oneOf": [
+					{"name": "a", "replies": {"totalItems": 99}},
+					{"name": "b", "replies": {"totalItems": 99}}
+				]
+			}`), "https://remote.example/users/alice")
+			if tt.wantErr {
+				require.Error(t, err, "DB 障害を ack している (job が retry されない)")
+			} else {
+				require.NoError(t, err, "not-found を retry に倒している")
+			}
+
+			assert.Equal(t, pgarray.Int64Array{0, 0}, pollRepo.Polls["q1"].Votes,
+				"著者を確認できないのに票数を更新している")
+		})
 	}
 }

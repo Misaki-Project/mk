@@ -10,6 +10,7 @@ import (
 	apiadmin "github.com/shiroha-a/mk/internal/api/admin"
 	"github.com/shiroha-a/mk/internal/entitycompat/shapetest"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -700,7 +701,11 @@ func TestPromoCreate_MissingExpiresAt(t *testing.T) {
 func TestPromoCreate_NoSuchNote(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
 	h.SetPromoNoteRepo(&stubPromoRepo{})
-	h.SetNoteFinder(&stubNoteFinder{err: assertError{}})
+	// **not-found を返す。** 以前は汎用の `assertError{}` を渡して 400 を
+	// 期待していたが、それは「DB 障害でも 400」を固定していた。#2792 で
+	// 種別を分けたので、404 相当を出すのは not-found のときだけ。障害が
+	// 500 になることは `TestAdmin_DBFailureIsNot4xx` が見る。
+	h.SetNoteFinder(&stubNoteFinder{err: repository.ErrNotFound})
 	rec := doPost(h.PromoCreate, `{"noteId":"missing","expiresAt":1}`, adminUser)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
@@ -914,4 +919,15 @@ func TestAvatarDecorations_MutationsInvalidateCatalogCache(t *testing.T) {
 		require.Less(t, rec.Code, 300)
 		assert.Equal(t, 1, spy.calls)
 	})
+}
+
+// **結果に影響しないカーソルでも 400 (#3025)。** upstream の paramDef は
+// `misskey:id` なので ajv が弾く。ここだけ 200 を返すと「カーソルは 400」という
+// 規則の例外になり、`untilId` を bind する handler を機械的に検査できなくなる。
+func TestAvatarDecorationsList_RejectsUnstorableCursor(t *testing.T) {
+	h, _ := setupAvatarDecorationHandler(t)
+	rec := doPost(h.AvatarDecorationsList, `{"untilId":"a\u0000b"}`, adminUser)
+	assert.Equal(t, http.StatusBadRequest, rec.Code,
+		"列に入らないカーソルを 200 で受けている: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
 }

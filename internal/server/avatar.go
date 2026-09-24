@@ -1,12 +1,14 @@
 package server
 
 import (
-	"github.com/shiroha-a/mk/internal/entity"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 
+	apiusers "github.com/shiroha-a/mk/internal/api/users"
+	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
 )
@@ -43,13 +45,14 @@ type avatarUserLookup interface {
 // Sets Cache-Control: public, max-age=86400 so browsers do not run
 // the DB lookup for every mention chip (matches upstream).
 func avatarHandler(userRepo avatarUserLookup, localHost string) echo.HandlerFunc {
-	localHost = strings.ToLower(localHost)
 	return func(c echo.Context) error {
 		// 304 / cache-hit でも返したい header なので Redirect 前に書く。
 		c.Response().Header().Set(echo.HeaderCacheControl, "public, max-age=86400")
 
 		acct := c.Param("acct")
-		username, host := parseAcct(acct, localHost)
+		// **実装は users.ParseAcct に一本化してある** (#2791)。
+		// pinned-users も同じ形で acct を解く。
+		username, host := apiusers.ParseAcct(acct, localHost)
 		if username == "" {
 			return c.Redirect(http.StatusFound, avatarStaticFallback)
 		}
@@ -78,39 +81,46 @@ func avatarHandler(userRepo avatarUserLookup, localHost string) echo.HandlerFunc
 		// mention chip を 1 つ表示するだけで閲覧者の IP とリファラが相手
 		// インスタンスへ渡っていた。
 		//
+		// **`?static=1` は静止画にして返す (#2908)。** 利用者の「アニメーション
+		// 画像を再生しない」設定 (disableShowingAnimatedImages / dataSaver.avatar)
+		// が frontend からこの形で届く。ここで受けないと frontend は
+		// `<mediaProxy>/static.webp?url=<instance>/avatar/@u@h&static=1` を組み立てるが、
+		// **その URL は allowlist のどの列にも無い**ので 403 + `max-age=86400` に
+		// なり、静止画になるどころか 1 日壊れる (#2905 のレビューで実測)。
+		//
+		// **同一オリジンでもプロキシへ回す。** ローカルの drive アバターも
+		// GIF / APNG / animated WebP になりうるので、リモートに限ると静止画設定が
+		// ローカルユーザーにだけ効かない。allowlist は判断材料にならない —
+		// `StaticAvatarProxyURL` は必ず `sig` を付け、`Authorize` は allowlist より
+		// **先に** HMAC を見る (`/emoji/:path` が無条件にプロキシへ回しているのと
+		// 同じ形、#2905)。
+		if _, wantsStatic := c.QueryParams()["static"]; wantsStatic && proxyableAvatarTarget(*target) {
+			if proxied := entity.StaticAvatarProxyURL(*target); proxied != "" {
+				return c.Redirect(http.StatusFound, proxied)
+			}
+			// context 未配線 (テスト等) なら従来どおり raw へ 302 する。
+		}
 		// 同一オリジン・相対 URL (identicon fallback を含む) は wrap されない。
 		return c.Redirect(http.StatusFound, entity.ProxyAvatarURLString(*target))
 	}
 }
 
-// parseAcct decomposes an acct parameter ("username" or
-// "username@host") into the username and (optional) host pointer.
-// localHost is the running instance's canonical host (lowercased);
-// if the acct's host part matches it, host is treated as local
-// (returned nil) to align with upstream Misskey storing local users
-// with host=NULL.
+// proxyableAvatarTarget reports whether the media proxy can fetch the avatar
+// URL at all (#2908).
 //
-// Empty input or pathological forms like "@" return ("", nil) so the
-// caller can short-circuit to the static fallback redirect.
-func parseAcct(acct, localHost string) (username string, host *string) {
-	acct = strings.TrimSpace(acct)
-	acct = strings.TrimPrefix(acct, "@")
-	if acct == "" {
-		return "", nil
+// 除外するのは identicon fallback (`/identicon/<id>`) だけ。相対 URL なので
+// `mediaproxy.Fetch` は同一オリジン判定 (`instanceURL + "/files/"` の接頭一致) を
+// 外れて `fetchRemote` に落ち、取りに行けない URL として弾かれる。結果は
+// **400 + `max-age=86400`** (#3034 より前は 404 + 同じキャッシュ) で、静止画
+// 設定を入れた利用者だけがアバターを 1 日失う。identicon は PNG を生成して
+// 返すのでアニメーションもせず、回す理由が無い。
+func proxyableAvatarTarget(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
 	}
-	at := strings.IndexByte(acct, '@')
-	if at < 0 {
-		return acct, nil
-	}
-	name := acct[:at]
-	h := strings.ToLower(acct[at+1:])
-	if name == "" {
-		return "", nil
-	}
-	if h == "" || h == localHost {
-		return name, nil
-	}
-	return name, &h
+	// proxy が実際に取得できるのは http(s) だけ。
+	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 func strPtr(s string) *string { return &s }

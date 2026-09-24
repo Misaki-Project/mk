@@ -25,14 +25,14 @@ import (
 	"gorm.io/datatypes"
 )
 
-var stubError = errors.New("stub error")
+var errStub = errors.New("stub error")
 
 // failingPiningRepo lets us trigger non-domain errors from PinNote.
 type failingPiningRepo struct {
 	*testutil.MockUserNotePiningRepository
 }
 
-func (f *failingPiningRepo) CountByUser(_ string) (int, error) { return 0, stubError }
+func (f *failingPiningRepo) CountByUser(_ string) (int, error) { return 0, errStub }
 
 // failingPiningDeleteRepo lets us trigger non-domain errors from UnpinNote
 // while still allowing FindByPair to succeed (so the service reaches Delete).
@@ -41,7 +41,7 @@ type failingPiningDeleteRepo struct {
 }
 
 func (f *failingPiningDeleteRepo) Delete(_ *model.UserNotePining) error {
-	return stubError
+	return errStub
 }
 
 func newHandlerWithFailingUnpinDelete(t *testing.T) (*Handler, *testutil.MockUserNotePiningRepository) {
@@ -70,7 +70,7 @@ type failingUserRepoForUpdate struct {
 	*testutil.MockUserRepository
 }
 
-func (f *failingUserRepoForUpdate) UpdateUser(_ string, _ map[string]any) error { return stubError }
+func (f *failingUserRepoForUpdate) UpdateUser(_ string, _ map[string]any) error { return errStub }
 
 func newHandlerWithFailingUpdate(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	t.Helper()
@@ -620,7 +620,7 @@ func TestMe_CreatedAtFromValidID(t *testing.T) {
 
 	// AIDXで生成した有効なIDを使う
 	idGen, _ := id.NewGenerator("aidx")
-	validID := idGen.Generate(java_time())
+	validID := idGen.Generate(javaTime())
 
 	user := &model.User{
 		ID:                validID,
@@ -646,7 +646,7 @@ func TestMe_CreatedAtFromValidID(t *testing.T) {
 	assert.Contains(t, createdAt, "T") // ISO8601 format
 }
 
-func java_time() time.Time {
+func javaTime() time.Time {
 	return time.Date(2024, 6, 15, 12, 0, 0, 0, time.UTC)
 }
 
@@ -2369,18 +2369,18 @@ type failingSetRegistryRepo struct {
 	*testutil.MockRegistryRepository
 }
 
-func (f *failingSetRegistryRepo) Set(_ *model.RegistryItem) error { return stubError }
+func (f *failingSetRegistryRepo) Set(_ *model.RegistryItem) error { return errStub }
 
 type failingGetAllRegistryRepo struct {
 	*testutil.MockRegistryRepository
 }
 
 func (f *failingGetAllRegistryRepo) GetAll(_ string, _ []string, _ *string) ([]*model.RegistryItem, error) {
-	return nil, stubError
+	return nil, errStub
 }
 
 func (f *failingGetAllRegistryRepo) KeysWithType(_ string, _ []string, _ *string) (map[string]string, error) {
-	return nil, stubError
+	return nil, errStub
 }
 
 type failingRemoveRegistryRepo struct {
@@ -2388,7 +2388,7 @@ type failingRemoveRegistryRepo struct {
 }
 
 func (f *failingRemoveRegistryRepo) Remove(_ string, _ string, _ []string, _ *string) error {
-	return stubError
+	return errStub
 }
 
 func TestRegistrySet_Error(t *testing.T) {
@@ -2820,4 +2820,94 @@ func TestUpdate_ReturnsRoleFlags(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
 	assert.Equal(t, true, resp["isAdmin"], "admin の i/update は isAdmin=true を返す")
 	assert.Equal(t, true, resp["isModerator"])
+}
+
+// **registry の `key` / `domain` も列に入らない値を弾く (#3025)。** scope だけ
+// 検証していたので、`key = ?` / `domain = ?` の bind parameter に NUL が乗って
+// 500 になっていた (`i/registry/*` は**任意の認証ユーザー**が叩ける)。
+func TestRegistryRejectsUnstorableKeyAndDomain(t *testing.T) {
+	user := &model.User{ID: "u1"}
+	for _, tt := range []struct {
+		name string
+		call func(h *Handler) func(echo.Context) error
+		body string
+	}{
+		{"set の key", func(h *Handler) func(echo.Context) error { return h.RegistrySet }, `{"key":"a\u0000b","value":"x"}`},
+		{"set の domain", func(h *Handler) func(echo.Context) error { return h.RegistrySet }, `{"key":"theme","value":"x","domain":"a\u0000b"}`},
+		{"get-all の domain", func(h *Handler) func(echo.Context) error { return h.RegistryGetAll }, `{"domain":"a\u0000b"}`},
+		{"keys の domain", func(h *Handler) func(echo.Context) error { return h.RegistryKeys }, `{"domain":"a\u0000b"}`},
+		{"remove の key", func(h *Handler) func(echo.Context) error { return h.RegistryRemove }, `{"key":"a\u0000b"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newHandlerWithRegistry(t)
+			rec := post(tt.call(h), tt.body, user)
+			assert.Equal(t, http.StatusBadRequest, rec.Code,
+				"列に入らない値を SQL へ流している: %s", rec.Body.String())
+			assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+		})
+	}
+}
+
+// **jsonb 列へそのまま入る field を弾く (#3037)。** PostgreSQL は NUL
+// エスケープを SQLSTATE 22P05 でクエリごと落とすので、引く前に弾かないと
+// **任意の認証ユーザーが 500 を起こせる**。
+func TestUpdate_UnstorableJSONBFieldsAre400(t *testing.T) {
+	esc := `\u0000`
+	for name, body := range map[string]string{
+		"room":                      `{"room":{"a":"x` + esc + `y"}}`,
+		"mutedWords":                `[["x` + esc + `y"]]`,
+		"notificationRecieveConfig": `{"notificationRecieveConfig":{"x` + esc + `y":{"type":"all"}}}`,
+		"mutedInstances":            `{"mutedInstances":["x` + esc + `y"]}`,
+		"emailNotificationTypes":    `{"emailNotificationTypes":["x` + esc + `y"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload := body
+			if name == "mutedWords" {
+				payload = `{"mutedWords":` + body + `}`
+			}
+			h, repo, _, _ := newTestHandler(t)
+			user := updateUser(repo)
+			rec := post(h.Update, payload, user)
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "列に入らない jsonb を受け入れている")
+			assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+		})
+	}
+}
+
+// **普通の値は通ったまま。** これが無いと「常に拒否する」実装でも上が通る。
+func TestUpdate_OrdinaryJSONBFieldsStillPass(t *testing.T) {
+	h, repo, _, _ := newTestHandler(t)
+	user := updateUser(repo)
+	rec := post(h.Update, `{"room":{"あ":"絵文字"},"mutedInstances":["example.com"]}`, user)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+// **`fields` も jsonb 列へ入る (#3037)。**
+//
+// ここはプレーンな `string` なので NUL のエスケープが実 NUL バイトとして
+// decode され、`core/user` が `json.Marshal` で戻したものが jsonb へ渡って
+// SQLSTATE 22P05 で落ちる。`json.RawMessage` の一覧とは経路が違うので、
+// 手で持つ一覧から漏れていた (敵対的レビューで実測)。
+func TestUpdate_UnstorableFieldsAre400(t *testing.T) {
+	esc := `\u0` + `000`
+	for name, body := range map[string]string{
+		"name に NUL":  `{"fields":[{"name":"a` + esc + `b","value":"x"}]}`,
+		"value に NUL": `{"fields":[{"name":"a","value":"x` + esc + `y"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, repo, _, _ := newTestHandler(t)
+			user := updateUser(repo)
+			rec := post(h.Update, body, user)
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "列に入らない fields を受け入れている")
+			assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+		})
+	}
+}
+
+// **普通の fields は通ったまま。** これが無いと「常に拒否する」実装でも上が通る。
+func TestUpdate_OrdinaryFieldsStillPass(t *testing.T) {
+	h, repo, _, _ := newTestHandler(t)
+	user := updateUser(repo)
+	rec := post(h.Update, `{"fields":[{"name":"サイト","value":"https://example.com"}]}`, user)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 }

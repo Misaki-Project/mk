@@ -21,8 +21,27 @@
 # 名になり、同名で動く本番を recreate しうる。
 name: mk-image
 
+# ログの上限 (#2828)。
+#
+# **既定の json-file はローテーションしない。** 指定しないとコンテナが動いている
+# あいだログが増え続け、ディスクを埋める。
+#
+# **`max-size` は decimal。** json-file は units.FromHumanSize で読むので、`50m` は
+# 50,000,000 バイト (= 47.7 MiB)。`50mib` と書いても同じ扱いで、MiB は表現できない。
+# 3 世代で 1 サービスあたり最大 150 MB (= 143 MiB)。実測 (mk-go の本番) では
+# 1 日あたり約 13 MB なので、封筒の分を含めて 1 週間前後は遡れる。
+#
+# **既存のコンテナには効かない。** この設定は生成時に固定されるので、
+# `docker compose up -d` で作り直すまで反映されない。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   app:
+    logging: *default-logging
     # MK_IMAGE で上書きできる。手元でビルドした image を試すときに使う。
     image: ${MK_IMAGE:-ghcr.io/shiroha-a/mk:bundled}
     ports:
@@ -53,6 +72,7 @@ services:
   # マイグレーションを適用する one-shot サービス。app は完走を待って起動する。
   # golang-migrate が適用済みバージョンを管理するので何度流しても冪等。
   migrate:
+    logging: *default-logging
     image: ${MK_IMAGE:-ghcr.io/shiroha-a/mk:bundled}
     entrypoint: ["/app/migrate"]
     command: ["-config", ".config/default.yml", "-direction", "up"]
@@ -68,6 +88,7 @@ services:
     restart: "no"
 
   db:
+    logging: *default-logging
     image: postgres:18-alpine
     environment:
       POSTGRES_DB: misskey
@@ -83,6 +104,7 @@ services:
     restart: unless-stopped
 
   redis:
+    logging: *default-logging
     image: redis:7-alpine
     volumes:
       - redis-data:/data

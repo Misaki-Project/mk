@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -55,10 +56,18 @@ type Harness struct {
 	// peer 経路 (#2537) の記録。Handle / OnReply はプラグインが登録し、
 	// テストは DeliverPeer / DeliverPeerReply から叩く。
 	mu          sync.Mutex
+	httpClient  *http.Client
 	peers       []string
 	peerSends   []PeerSend
 	peerHandler plugin.PeerHandler
 	peerReply   plugin.PeerReplyHandler
+
+	// キュー (#2818) の記録。**実際には積まない**ので、テストが Redis を
+	// 要求しない。ハンドラは JobSet.Run から直接叩く。
+	enqueued []Enqueued
+	// hasJobs は Definition.Jobs を宣言しているか。**本番と同じ理由で
+	// Enqueue を拒否する**ため、Routes / Jobs を呼んだ時点で記録する。
+	hasJobs bool
 }
 
 // New starts a harness. The plugin name defaults to "test".
@@ -98,6 +107,19 @@ func (h *Harness) WithAPI(api plugin.API) *Harness {
 	return h
 }
 
+// WithHTTPClient sets the client returned by [plugin.Context.HTTP].
+//
+// **既定は「必ず失敗する」client。** 設定しないと `ctx.HTTP()` を使う
+// コードはテストで落ちる — 素の client を既定にすると、テストが気付かない
+// うちに本物の外部サービスへ出ていくため。`httptest.NewServer` の
+// `Client()` を渡すのが普通。
+func (h *Harness) WithHTTPClient(c *http.Client) *Harness {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.httpClient = c
+	return h
+}
+
 // WithEffectivePolicyInvalidator sets the invalidator passed to the policy
 // provider factory.
 func (h *Harness) WithEffectivePolicyInvalidator(v plugin.EffectivePolicyInvalidator) *Harness {
@@ -118,6 +140,34 @@ type PeerSend struct {
 	ID   string
 	// Payload is what the plugin passed, as JSON.
 	Payload json.RawMessage
+}
+
+// noteJobs records whether the definition declares background work, so
+// [plugin.Queue.Enqueue] can refuse the same cases mk-go refuses.
+func (h *Harness) noteJobs(def plugin.Definition) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.hasJobs = def.Jobs != nil
+}
+
+// Enqueued is one recorded [plugin.Queue.Enqueue].
+type Enqueued struct {
+	Name string
+	// Payload is what the plugin passed, as JSON.
+	Payload json.RawMessage
+	Options plugin.EnqueueOptions
+}
+
+// Enqueues returns the jobs the plugin enqueued so far, in order.
+//
+// **実際には積まない。** ハンドラを走らせたいなら [Harness.Jobs] から
+// JobSet.Run を使うこと。
+func (h *Harness) Enqueues() []Enqueued {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]Enqueued, len(h.enqueued))
+	copy(out, h.enqueued)
+	return out
 }
 
 // PeerSends returns the sends recorded so far, in order.
@@ -222,6 +272,7 @@ func (h *Harness) Context() plugin.Context {
 func (h *Harness) Routes(def plugin.Definition) Handlers {
 	h.t.Helper()
 	h.applyMigrations(def)
+	h.noteJobs(def)
 
 	r := &fakeRouter{handlers: Handlers{}}
 	if def.Routes == nil {
@@ -234,9 +285,28 @@ func (h *Harness) Routes(def plugin.Definition) Handlers {
 }
 
 // Jobs runs def.Jobs and returns the registered job handlers and schedules.
+// Peer runs the definition's [plugin.Definition.Peer] callback.
+//
+// **本番はロールに関係なくこれを呼ぶ (#2819)。** 送信の POST は queue ロールで
+// 走るので、Handle / OnReply を Routes の中で登録するとロールを分割した構成で
+// 応答が届かない。DeliverPeer / DeliverPeerReply の前にこれを呼ぶこと。
+func (h *Harness) Peer(def plugin.Definition) {
+	h.t.Helper()
+	h.applyMigrations(def)
+	h.noteJobs(def)
+
+	if def.Peer == nil {
+		return
+	}
+	if err := def.Peer(h.Context(), &fakePeer{h: h}); err != nil {
+		h.t.Fatalf("plugintest: Peer が失敗しました: %v", err)
+	}
+}
+
 func (h *Harness) Jobs(def plugin.Definition) *JobSet {
 	h.t.Helper()
 	h.applyMigrations(def)
+	h.noteJobs(def)
 
 	j := &fakeJobs{set: &JobSet{Handlers: map[string]plugin.JobHandler{}}}
 	if def.Jobs == nil {
@@ -413,7 +483,59 @@ func (c *fakeContext) Storage() plugin.Storage {
 	return &fakeStorage{db: c.h.db}
 }
 
-func (c *fakeContext) Peer() plugin.Peer { return &fakePeer{h: c.h} }
+func (c *fakeContext) Peer() plugin.Peer   { return &fakePeer{h: c.h} }
+func (c *fakeContext) Queue() plugin.Queue { return &fakeQueue{h: c.h} }
+
+// HTTP returns the client the test wired with [Harness.WithHTTPClient], or a
+// client that fails every request.
+//
+// **既定を「必ず失敗する」にしてある。** 素の `&http.Client{}` を返すと、
+// テストが気付かないうちに**本物の外部サービスへ出ていく**。本番の
+// `ctx.HTTP()` は SSRF ガードと運営者の proxy 設定を持つので、テストでも
+// 明示的に差し替えさせる。
+func (c *fakeContext) HTTP() *http.Client {
+	c.h.mu.Lock()
+	defer c.h.mu.Unlock()
+	if c.h.httpClient == nil {
+		return &http.Client{Transport: unwiredTransport{}}
+	}
+	return c.h.httpClient
+}
+
+type unwiredTransport struct{}
+
+func (unwiredTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("plugintest: HTTP client が未設定です (Harness.WithHTTPClient で差し替えてください)")
+}
+
+type fakeQueue struct{ h *Harness }
+
+func (q *fakeQueue) Enqueue(_ context.Context, name string, payload any, opts ...plugin.EnqueueOption) error {
+	q.h.mu.Lock()
+	hasJobs := q.h.hasJobs
+	q.h.mu.Unlock()
+	// **本番と同じ理由で落とす。** mk-go は Jobs を宣言していないプラグインの
+	// キューを作らないので、積めても誰も処理しない。ここで通すと、本番では
+	// 通らない経路をテストが緑で通してしまう (fakePeer.Send と同じ方針)。
+	if !hasJobs {
+		return fmt.Errorf("plugintest: Definition.Jobs を宣言していないため積めません")
+	}
+	if name == "" {
+		return fmt.Errorf("plugintest: ジョブ名が空です")
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("plugintest: payload を JSON 化できません: %w", err)
+	}
+	var o plugin.EnqueueOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
+	q.h.mu.Lock()
+	defer q.h.mu.Unlock()
+	q.h.enqueued = append(q.h.enqueued, Enqueued{Name: name, Payload: body, Options: o})
+	return nil
+}
 
 // Go runs fn synchronously. テストで非同期にすると、検証の前に終わっていない
 // 競合が入る。

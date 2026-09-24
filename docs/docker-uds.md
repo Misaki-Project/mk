@@ -29,11 +29,11 @@ git submodule update --init --recursive third_party/misskey
 make uds-init
 ```
 
-`uds-init` は order-only prerequisite で実装されているので、ファイルが既にある場合は何もしません (`.example` を更新してもローカル編集は上書きされない)。`uds-build` / `uds-up` / `uds-down` / `uds-down-v` / `uds-logs` / `uds-ps` も同じ prerequisite を持つため、コピー忘れでエラーになることはありません (`uds-frontend-build` は compose / config を参照しないので対象外)。
+`uds-init` は order-only prerequisite で実装されているので、ファイルが既にある場合は何もしません (`.example` を更新してもローカル編集は上書きされない)。`uds-build` / `uds-up` / `uds-restart` / `uds-down` / `uds-down-v` / `uds-logs` / `uds-ps` も同じ prerequisite を持つため、コピー忘れでエラーになることはありません (`uds-frontend-build` は compose / config を参照しないので対象外。`uds-rebuild` 自身は prerequisite を持ちませんが、呼び出す `uds-build` が満たします)。
 
 ### 1. 本家フロントエンドのビルド
 
-初回のみ、本家 Misskey の vite ビルドを行います (3〜10 分)。`make uds-frontend-build` は既存の `e2e-frontend-build` と同一のターゲットで、`node:22-bookworm` コンテナの中で `pnpm install --frozen-lockfile && pnpm build` を走らせます。
+初回のみ、本家 Misskey の vite ビルドを行います (3〜10 分)。`make uds-frontend-build` は既存の `e2e-frontend-build` と同一のターゲットで、**submodule 自身の `Dockerfile` の `ARG NODE_VERSION`** (`26.4.0-trixie` の形で版と distro の両方を持つ) が指す image の中で `pnpm install --frozen-lockfile && pnpm build` を走らせます。pnpm の版も submodule の `packageManager` から取ります (#2921)。以前は `node:22-bookworm` 固定で、CI が `.node-version` を見るのに本番のビルドだけ Node 22 という食い違いがあり、しかも `node:22-bookworm` の 22.22.2 は `engines.node` の下限ちょうどでした。
 
 ```sh
 make uds-frontend-build
@@ -115,6 +115,26 @@ docker compose -f compose.uds.yaml logs -f mkgo
 docker compose -f compose.uds.yaml logs -f nginx
 ```
 
+### ログの上限
+
+`compose.uds.yaml.example` は全サービスに **50 MB × 3 世代**の上限を掛けている
+(`x-logging` アンカー)。Docker 既定の `json-file` はローテーションしないので、
+指定しないとディスクが埋まる。`max-size` は decimal で読まれるので `50m` は
+50,000,000 バイト (= 47.7 MiB)。
+
+**既存のコンテナには効かない。** ログの設定は生成時に固定されるので、
+`make uds-up` で作り直すまで反映されない。**この設定を初めて取り込む起動は
+4 サービス全部を作り直す**ので、postgres も一度止まる。
+
+```sh
+docker inspect mk-mkgo-1 --format '{{.HostConfig.LogConfig.Config}}'
+# → map[max-file:3 max-size:50m]   効いている
+# → map[]                          効いていない
+```
+
+自分の `compose.uds.yaml` は gitignore されているので、`.example` を更新しても
+**自動では反映されない**。差分を手で取り込むこと。
+
 ## トラブルシューティング
 
 ### `third_party/misskey` 自体が空 (submodule 未初期化)
@@ -149,7 +169,7 @@ docker compose -f compose.uds.yaml logs mkgo | tail -50  # mkgo だけ、過去�
 
 - スキーマが壊れている場合は手動で `psql` で問題を解消する。migration を巻き戻すなら `docker compose -f compose.uds.yaml exec mkgo /app/migrate -direction down -steps 1`。**UDS image は `/app/migrate` を同梱していて entrypoint がこれを叩く** (`deploy/uds/Dockerfile.mkgo`)。コンテナには Go toolchain が無いので `go run ./cmd/migrate` は使えない。手元のツリーから叩く場合は `go run ./cmd/migrate` で、`make build` は `./built/misskey` しか作らない
 - volume 自体がおかしい場合は `make uds-down-v` で named volume を消して綺麗な状態から再構築する (**DB データは全部消える**ので注意)
-- **`-steps` を省略すると全段 down する** (schema が消える)。1 段だけ戻したいときは必ず `-steps 1` を付ける
+- **`-steps` を省略すると全段 down する** (全テーブルが消える)。1 段だけ戻したいときは必ず `-steps 1` を付ける
 
 ### `/healthz` が 404 になる
 

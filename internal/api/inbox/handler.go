@@ -137,6 +137,13 @@ func (h *Handler) SetSignatureCapabilityRecorder(r SignatureCapabilityRecorder) 
 var signatureRelevantHeaders = []string{
 	"Signature",
 	"Date",
+	// **`X-Date` も運ぶ (#3037 レビュー)。** `x-date` を署名対象に入れて
+	// くる peer のリクエストは handler の admission を通るが、worker 側の
+	// `buildSigningString` がこのヘッダを持たないと
+	// `missing required header "x-date"` で落ち、**署名が正しいのに drop
+	// される**。同じ PR で「署名している peer は今までどおり」と書いたのに、
+	// 本番の非同期経路ではそうなっていなかった。
+	"X-Date",
 	"Host",
 	"Digest",
 	"Content-Type",
@@ -309,7 +316,7 @@ func (h *Handler) admitInbox(req *http.Request, body []byte) (*activitypub.Parse
 		return nil, err
 	}
 	return parsed, activitypub.VerifyInboxAdmission(parsed, req.Host, h.expectedHost,
-		activitypub.InboxDateHeader(req.Header), req.Header.Get("Digest"), body)
+		activitypub.InboxDateHeader(req.Header, parsed.Headers), req.Header.Get("Digest"), body)
 }
 
 // maxLoggedSignerLen bounds the attacker-controlled strings the discard logs

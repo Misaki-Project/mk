@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"mime/multipart"
 	"net/http"
 	"regexp"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
@@ -20,6 +21,7 @@ import (
 	coredrive "github.com/shiroha-a/mk/internal/core/drive"
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
 	"github.com/shiroha-a/mk/internal/entity"
+	"github.com/shiroha-a/mk/internal/misc/colfit"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
@@ -171,20 +173,105 @@ func (h *Handler) packDriveFileSelfList(f *model.DriveFile) entity.DriveFileEnti
 	return entity.PackDriveFileSelf(f, h.idGen)
 }
 
+// openMultipartFile opens one parsed multipart part. テスト用の差し替え口。
+//
+// **メモリ由来とは限らない。** echo の multipart パーサは `maxMemory` を
+// 超えた分を一時ファイルへ落とすので、`Open` は実ファイルを開く。ディスクが
+// 埋まっている / 一時ファイルが消された / I/O エラーのいずれでも失敗しうる。
+var openMultipartFile = func(fh *multipart.FileHeader) (multipart.File, error) {
+	return fh.Open()
+}
+
 // readMultipartFile extracts the uploaded file's bytes and original filename.
-// テスト用に差し替え可能な変数として定義する。Open()/ReadAll()はechoの
-// multipartパース後ではメモリまたはtempfile由来のreaderしか返さないため
-// 実用上失敗しない (FormFile以外のerrorパスは defensive 扱い)。
-var readMultipartFile = func(c echo.Context) ([]byte, string, error) {
+// テスト用に差し替え可能な変数として定義する。
+//
+// **`Open` と `ReadAll` の error を捨てない (#3037)。** 以前は `src, _ :=` /
+// `body, _ :=` と書いており、
+//
+//   - `Open` 失敗 → `src` が nil のまま `defer src.Close()` で **nil 参照 panic**
+//   - `ReadAll` の途中失敗 → **無言で切り詰められた本体**がそのまま保存され、
+//     MD5 / size / MIME がその切れ端で確定する (利用者には成功として返る)
+//
+// の 2 つが起きた。どちらも「実用上失敗しない」を前提にしていたが、上の
+// `openMultipartFile` のとおりその前提が成り立たない。
+var readMultipartFile = func(c echo.Context, maxBytes int64) ([]byte, string, error) {
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
 		return nil, "", err
 	}
-	src, _ := fileHeader.Open()
+	// **`io.ReadAll` のコピーを 1 つ減らす (#3037)。** `Upload` にも同じ判定が
+	// あるが、あそこへ届く時点で本体はもう読み終わっている。既定では policy が
+	// 30MB なのに `config.maxFileSize` が 250MB なので、**30MB しか保存できない
+	// 利用者が 250MB のヒープを確保させられた**。
+	//
+	// **「読む前」ではない (レビュー 2 周目の実測)。** global な
+	// `auth.Authenticate` が `multipart/form-data` のとき `c.FormValue("i")` を
+	// 呼ぶので、handler へ来る時点で `ParseMultipartForm(32MiB)` は済んでいる。
+	// 消えるのは `io.ReadAll` の 2 つ目のコピーだけで、**RAM 32MiB +
+	// 超過分の一時ファイル書き込みは残る** (`ParseMultipartForm` は 32MiB を
+	// 超えた分をディスクへ spill するので、250MB の本体なら約 218MB が
+	// ディスクに書かれる)。それでも最大 250MB のヒープ確保は実際に消える。
+	//
+	// `maxBytes` の上限値 (`math.MaxInt64`) は `readAtMost` 側で扱う。
+	// ここで比べる `fileHeader.Size` は `int64` なので、`MaxInt64` を
+	// 超えることは原理的に無い。
+	if maxBytes > 0 && fileHeader.Size > maxBytes {
+		return nil, "", coredrive.ErrMaxFileSizeExceeded
+	}
+	src, err := openMultipartFile(fileHeader)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: open: %w", errMultipartIO, err)
+	}
 	defer src.Close()
-	body, _ := io.ReadAll(src)
+	body, err := readAtMost(src, maxBytes)
+	if err != nil {
+		if errors.Is(err, coredrive.ErrMaxFileSizeExceeded) {
+			return nil, "", err
+		}
+		return nil, "", fmt.Errorf("%w: read: %w", errMultipartIO, err)
+	}
 	return body, fileHeader.Filename, nil
 }
+
+// readAtMost reads r fully, failing with ErrMaxFileSizeExceeded past maxBytes.
+//
+// **`FileHeader.Size` だけに頼らない。** あれはパーサが数えた値なので、
+// 数え方が変わったり part が差し替わったりすると読み込み量と食い違う。
+// 上限を強制するのは実際に読むこちら側で、`Size` は「読む前に落とせる
+// ときは落とす」ための早い枝。
+//
+// maxBytes <= 0 は上限なし (policy 未設定 / system file / remote user)。
+func readAtMost(r io.Reader, maxBytes int64) ([]byte, error) {
+	// **`maxBytes+1` のオーバーフローを避ける (#3037 レビュー)。**
+	// `policyMegabytes` は `safemath.MulFloat64` で `MaxInt64` に飽和するので、
+	// `maxFileSizeMb` に `math.MaxFloat64` (= このリポジトリが「無制限」の
+	// 意味で使うイディオム) を入れると `maxBytes+1` が `MinInt64` になり、
+	// `io.LimitReader` が即 EOF を返して **0 バイトの本体が error 無しで
+	// 保存される**。この関数の doc が塞いだばかりの「無言で切り詰められた
+	// 本体」そのもの。
+	if maxBytes <= 0 || maxBytes == math.MaxInt64 {
+		return io.ReadAll(r)
+	}
+	// 1 バイト余分に読んで、超過を「読めてしまった」ことで判定する。
+	body, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, coredrive.ErrMaxFileSizeExceeded
+	}
+	return body, nil
+}
+
+// errMultipartIO marks a multipart failure as **server-side**.
+//
+// **`c.FormFile` の失敗と分ける (#3037)。** あちらは「`file` フィールドが
+// 無い」= 本当にクライアント起因なので 400 でよい。`Open` / `ReadAll` の
+// 失敗はディスク満杯 / fd 枯渇 / 一時ファイル消失で、**全部サーバー側の
+// 事象**。まとめて `INVALID_PARAM` にすると (a) 利用者もフロントも
+// 「パラメータが不正」と読んで再試行せず、(b) 監視には 4xx しか出ないので
+// 障害が見えない。#2792 と同じ判断で 5xx に倒し、ログにも残す。
+var errMultipartIO = errors.New("drive: multipart io")
 
 // FilesCreate handles POST /api/drive/files/create.
 // multipart/form-data with the file under "file"; optional fields: name,
@@ -192,8 +279,21 @@ var readMultipartFile = func(c echo.Context) ([]byte, string, error) {
 func (h *Handler) FilesCreate(c echo.Context) error {
 	user := middleware.GetUser(c)
 
-	body, filename, err := readMultipartFile(c)
+	// 読み切る前に上限を引く (`readMultipartFile` の doc 参照)。
+	maxBytes, _ := h.svc.MaxUploadBytes(user)
+	body, filename, err := readMultipartFile(c, maxBytes)
 	if err != nil {
+		// upstream `drive/files/create` と同じ 413。**`Upload` が返すのと
+		// 同じ error** なので、読む前に落ちたか後で落ちたかで応答は変わらない。
+		if errors.Is(err, coredrive.ErrMaxFileSizeExceeded) {
+			return c.JSON(http.StatusRequestEntityTooLarge, apierr.Error("MAX_FILE_SIZE_EXCEEDED", "Max file size exceeded.", "b9d8c348-33f0-4673-b9a9-5d4da058977a"))
+		}
+		// サーバー側の I/O 障害は 500 + ログ。クライアント起因 (`file` が
+		// 無い) だけ 400 のまま。
+		if errors.Is(err, errMultipartIO) {
+			slog.ErrorContext(c.Request().Context(), "drive: multipart read failed", "err", err)
+			return apierr.JSONInternalError(c)
+		}
 		return apierr.JSONInvalidParam(c)
 	}
 
@@ -240,7 +340,7 @@ func (h *Handler) FilesCreate(c echo.Context) error {
 	}
 	if v := c.FormValue("comment"); v != "" {
 		// upstream paramDef は comment maxLength=512 (#1564)。
-		if utf8.RuneCountInString(v) > maxDriveCommentLength {
+		if !colfit.Fits(v, maxDriveCommentLength) {
 			return apierr.JSONInvalidParam(c)
 		}
 		in.Comment = &v
@@ -265,7 +365,9 @@ func (h *Handler) FilesCreate(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, apierr.Error("UNALLOWED_FILE_TYPE",
 				"Cannot upload the file because it is an unallowed file type.",
 				"4becd248-7f2c-48c4-a9f0-75edc4f9a1ea"))
-		case errors.Is(err, coredrive.ErrMaxFileSizeExceeded):
+		// **`ErrUndecodableImage` も 413 に寄せる (#3037 レビュー 2 周目)。**
+		// 新しい wire コードを足すとフロントエンドに分岐が無く汎用の失敗になる。
+		case errors.Is(err, coredrive.ErrMaxFileSizeExceeded), errors.Is(err, coredrive.ErrUndecodableImage):
 			// upstream drive/files/create は httpStatusCode:413 を明示する
 			return c.JSON(http.StatusRequestEntityTooLarge, apierr.Error("MAX_FILE_SIZE_EXCEEDED", "Max file size exceeded.", "b9d8c348-33f0-4673-b9a9-5d4da058977a"))
 		case errors.Is(err, coredrive.ErrNoFreeSpace):
@@ -397,7 +499,7 @@ func (h *Handler) FilesUpdate(c echo.Context) error {
 				return apierr.JSONInvalidParam(c)
 			}
 			// upstream update.ts paramDef は comment maxLength=512 (#1564)。
-			if utf8.RuneCountInString(comment) > maxDriveCommentLength {
+			if !colfit.Fits(comment, maxDriveCommentLength) {
 				return apierr.JSONInvalidParam(c)
 			}
 			cp := &comment
@@ -484,7 +586,7 @@ func (h *Handler) FoldersCreate(c echo.Context) error {
 		name = *req.Name
 	}
 	// upstream folders/create paramDef は name maxLength=200 (#1564)。
-	if utf8.RuneCountInString(name) > maxDriveFolderNameLength {
+	if !colfit.Fits(name, maxDriveFolderNameLength) {
 		return apierr.JSONInvalidParam(c)
 	}
 	f, err := h.svc.CreateFolder(user, name, req.ParentID)
@@ -588,7 +690,7 @@ func (h *Handler) FoldersUpdate(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// upstream folders/update paramDef は name maxLength=200 (#1564)。
-	if req.Name != nil && utf8.RuneCountInString(*req.Name) > maxDriveFolderNameLength {
+	if req.Name != nil && !colfit.Fits(*req.Name, maxDriveFolderNameLength) {
 		return apierr.JSONInvalidParam(c)
 	}
 	in := coredrive.UpdateFolderInput{Name: req.Name}
@@ -791,7 +893,10 @@ func (h *Handler) FilesList(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	files, err := h.fileRepo.ListByUser(user.ID, emptyFolderIDToNil(req.FolderID), false, req.Type, req.Sort, untilID, sinceID, limit)
 	if err != nil {
 		return c.JSON(http.StatusOK, []any{})
@@ -902,6 +1007,10 @@ func (h *Handler) FilesAttachedNotes(c echo.Context) error {
 	// (svc.IsModerator) に一本化し、wiring を二重化しない。
 	f, err := h.fileRepo.FindByID(req.FileID)
 	viewerIsOwner := err == nil && f.UserID != nil && *f.UserID == viewer.ID
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || (!viewerIsOwner && !h.svc.IsModerator(viewer.ID)) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "c118ece3-2e4b-4296-99d1-51756e32d232"))
 	}
@@ -910,7 +1019,10 @@ func (h *Handler) FilesAttachedNotes(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -957,7 +1069,7 @@ func (h *Handler) FilesUploadFromURL(c echo.Context) error {
 	// upstream paramDef は comment maxLength=512。ajv の maxLength は文字数
 	// (code unit) 基準なので byte 長ではなく rune 数で判定する (多バイト文字を
 	// 過剰に弾かないため)。超過は INVALID_PARAM。
-	if req.Comment != nil && utf8.RuneCountInString(*req.Comment) > maxDriveCommentLength {
+	if req.Comment != nil && !colfit.Fits(*req.Comment, maxDriveCommentLength) {
 		return apierr.JSONInvalidParam(c)
 	}
 	// uploader 未配線 (= 単体テスト等) は upstream と同じ空レスポンスで返す。
@@ -974,7 +1086,7 @@ func (h *Handler) FilesUploadFromURL(c echo.Context) error {
 		Marker:      req.Marker,
 		IsSensitive: req.IsSensitive,
 		Force:       req.Force,
-		RequestIP:   c.RealIP(),
+		RequestIP:   requestIPValue(c),
 	}
 	go h.urlUploader.Process(context.Background(), in)
 	return c.NoContent(http.StatusNoContent)
@@ -1015,6 +1127,10 @@ func (h *Handler) FilesMoveBulk(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FOLDER", "No such folder.", "d77545ec-1283-4b73-bbe1-e90e1da6a4e7"))
 		}
 		folder, err := h.folderRepo.FindByID(*req.FolderID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		if err != nil || folder.UserID == nil || *folder.UserID != user.ID {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FOLDER", "No such folder.", "d77545ec-1283-4b73-bbe1-e90e1da6a4e7"))
 		}
@@ -1052,7 +1168,10 @@ func (h *Handler) Stream(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	// upstream stream.ts は folder 条件を付けず全 folder 横断 (#1564)。
 	files, err := h.fileRepo.ListByUser(user.ID, nil, true, req.Type, "", untilID, sinceID, limit)
 	if err != nil {
@@ -1088,7 +1207,10 @@ func (h *Handler) FoldersList(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	folders, err := h.folderRepo.ListByUser(user.ID, emptyFolderIDToNil(req.FolderID), untilID, sinceID, limit)
 	if err != nil {
 		return c.JSON(http.StatusOK, []any{})
@@ -1135,7 +1257,23 @@ func (h *Handler) FoldersFind(c echo.Context) error {
 // は X-Forwarded-For / X-Real-IP を考慮した resolved IP を返すので、nginx
 // 等の reverse proxy 配下でも本物の client IP を取得できる。空文字なら
 // nil を返して `requestIp` column を NULL のままにする。
+// requestIPValue is requestIPFromContext as a plain string ("" = 記録しない)。
+func requestIPValue(c echo.Context) string {
+	if ip := requestIPFromContext(c); ip != nil {
+		return *ip
+	}
+	return ""
+}
+
 func requestIPFromContext(c echo.Context) *string {
+	// **プロセス内 API 呼び出しの IP は記録しない。** `pluginCaller.Call` は
+	// `RemoteAddr` に `127.0.0.1:0` を置く (IP を見る middleware が解釈に
+	// 困らないようにするため) が、その IP は実在しない。記録すると、
+	// モデレーターが `admin/drive/show-file` で見る値が実際の取得元と無関係な
+	// `127.0.0.1` になる (#3130 の `user_ip` / レート制限と同じ汚染)。
+	if middleware.IsInternalCall(c.Request().Context()) {
+		return nil
+	}
 	ip := c.RealIP()
 	if ip == "" {
 		return nil

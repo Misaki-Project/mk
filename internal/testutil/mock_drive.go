@@ -298,17 +298,13 @@ func matchesDriveFolder(actual, want *string) bool {
 }
 
 // ListByUser mirrors the production predicates and ordering. caller が知って
-// おくべき差は 4 つで、うち 2 つは**意図的な簡略化**:
+// おくべき差は 3 つで、うち 1 つは**意図的な簡略化**:
 //
 //   - `limit <= 0` を「無制限」として扱う。**乖離するのは `limit == 0` だけ** —
 //     production は生の値を GORM に渡し、GORM は負値では LIMIT 句自体を出さない
 //     ので `limit < 0` は production も無制限になる (#2755 のレビューで発見)。
 //     handler は `pagination.ResolveLimit` が 1 未満を 400 で弾くので endpoint
 //     経由では到達しない。**mock を直に叩くときは実値を渡すこと**
-//   - sinceID 単独指定時の ASC (paginationOrder) を実装していない。#2766 は
-//     `ListForAdmin` / `ListSystemFiles` の手書き bubble sort を SortMockPage に
-//     置き換える issue で、**こちらは sort キー分岐があるので単純置換できない**。
-//     #2766 が終わっても残る
 //
 // 残り 2 つは関数本体のコメントにある: name 比較の collation 差と、tie が
 // id 昇順に落ちること (production は tie 順を保証しない)。
@@ -351,24 +347,31 @@ func (m *MockDriveFileRepository) ListByUser(userID string, folderID *string, an
 	// unstable sort は tie グループが 2 つ以上あると並びを崩す (13 件から
 	// 実測で差が出る)。
 	sortpkg.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
-	sortpkg.SliceStable(rows, func(i, j int) bool {
-		switch sort {
-		case "-createdAt":
-			return rows[i].ID < rows[j].ID
-		case "+name":
-			return rows[i].Name > rows[j].Name
-		case "-name":
-			return rows[i].Name < rows[j].Name
-		case "+size":
-			return rows[i].Size > rows[j].Size
-		case "-size":
-			return rows[i].Size < rows[j].Size
-		default:
-			// "+createdAt" と未指定はともに id DESC (sinceID 指定時の ASC は
-			// mock では省略 — 既存テストは untilID / 無指定のみ)。
-			return rows[i].ID > rows[j].ID
-		}
-	})
+	// **sort を渡したかどうかで分かれる。** production (と upstream files.ts) は
+	// sort 指定時だけ order を上書きし、それ以外は paginationOrder に落とす
+	// (`internal/repository/drive_file.go` の switch)。未知の値も default 側なので、
+	// ここも列挙した 6 つ以外は全て SortMockPage に倒す (#2766)。
+	switch sort {
+	case "+createdAt", "-createdAt", "+name", "-name", "+size", "-size":
+		sortpkg.SliceStable(rows, func(i, j int) bool {
+			switch sort {
+			case "-createdAt":
+				return rows[i].ID < rows[j].ID
+			case "+name":
+				return rows[i].Name > rows[j].Name
+			case "-name":
+				return rows[i].Name < rows[j].Name
+			case "+size":
+				return rows[i].Size > rows[j].Size
+			case "-size":
+				return rows[i].Size < rows[j].Size
+			default: // "+createdAt"
+				return rows[i].ID > rows[j].ID
+			}
+		})
+	default:
+		SortMockPage(rows, sinceID, untilID, func(f *model.DriveFile) string { return f.ID })
+	}
 	if limit > 0 && len(rows) > limit {
 		rows = rows[:limit]
 	}
@@ -569,17 +572,7 @@ func (m *MockDriveFileRepository) ListForAdmin(userID, origin, host, fileType, u
 		}
 		rows = append(rows, f)
 	}
-	// id DESC 固定。production は paginationOrder で sinceID 単独指定時のみ
-	// ASC になるが、mock では省略している (#2747 で対象外とした)。順序だけで
-	// なく limit 打ち切りで残る行が変わるので、sinceID を使う paging を
-	// mock で検証しないこと。
-	for i := 0; i < len(rows); i++ {
-		for j := i + 1; j < len(rows); j++ {
-			if rows[i].ID < rows[j].ID {
-				rows[i], rows[j] = rows[j], rows[i]
-			}
-		}
-	}
+	SortMockPage(rows, sinceID, untilID, func(f *model.DriveFile) string { return f.ID })
 	if limit <= 0 {
 		limit = 30
 	}
@@ -617,17 +610,7 @@ func (m *MockDriveFileRepository) ListSystemFiles(fileType, untilID, sinceID str
 		}
 		rows = append(rows, f)
 	}
-	// id DESC 固定。production は paginationOrder で sinceID 単独指定時のみ
-	// ASC になるが、mock では省略している (#2747 で対象外とした)。順序だけで
-	// なく limit 打ち切りで残る行が変わるので、sinceID を使う paging を
-	// mock で検証しないこと。
-	for i := 0; i < len(rows); i++ {
-		for j := i + 1; j < len(rows); j++ {
-			if rows[i].ID < rows[j].ID {
-				rows[i], rows[j] = rows[j], rows[i]
-			}
-		}
-	}
+	SortMockPage(rows, sinceID, untilID, func(f *model.DriveFile) string { return f.ID })
 	if limit <= 0 {
 		limit = 30
 	}
@@ -732,14 +715,42 @@ func (m *MockDriveFileRepository) ListOrphans(limit int) ([]*model.DriveFile, er
 	return out, nil
 }
 
-func (m *MockDriveFileRepository) DeleteRemoteCache() (int64, error) {
-	n := int64(0)
+// ExpireRemoteCache mirrors the repository: cached remote rows become link rows
+// instead of being deleted (#3102)。`uri` を持たない行だけ消す。
+func (m *MockDriveFileRepository) ExpireRemoteCache() (int64, error) {
+	ids := make([]string, 0, len(m.Files))
 	for id, f := range m.Files {
-		// upstream は isLink=false (キャッシュ実体) を消す。
 		if !f.IsLink && f.UserHost != nil {
+			ids = append(ids, id)
+		}
+	}
+	return m.ExpireByIDs(ids)
+}
+
+// ExpireByIDs turns the given rows into link rows (#3102)。
+func (m *MockDriveFileRepository) ExpireByIDs(ids []string) (int64, error) {
+	n := int64(0)
+	for _, id := range ids {
+		f, ok := m.Files[id]
+		if !ok {
+			continue
+		}
+		if f.URI == nil {
+			// uri が無ければ倒せないので消す (repository と同じ)。
 			delete(m.Files, id)
 			n++
+			continue
 		}
+		f.IsLink = true
+		f.URL = *f.URI
+		f.ThumbnailURL = nil
+		f.WebpublicURL = nil
+		f.StoredInternal = false
+		f.Size = 0
+		f.AccessKey = nil
+		f.ThumbnailAccessKey = nil
+		f.WebpublicAccessKey = nil
+		n++
 	}
 	return n, nil
 }

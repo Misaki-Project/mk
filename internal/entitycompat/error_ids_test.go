@@ -3,11 +3,15 @@ package entitycompat
 import (
 	_ "embed"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -107,6 +111,58 @@ func TestErrorIDDrift(t *testing.T) {
 		t.Fatalf("walk api dir: %v", err)
 	}
 
+	// **router.go にインラインで書かれた endpoint も見る** (#2784)。
+	// `internal/api` の walk は `handlerVar.Method` の形しか解決できないので、
+	// `api.POST("/promo/read", func(c echo.Context) error { ... })` のような
+	// closure が丸ごと gate の外にあった。golden が正しい id を持っているのに
+	// 検出されない状態だった (`promo/read` の NO_SUCH_NOTE で実際に起きていた)。
+	inline := scanInlineRoutes(t, filepath.Join(root, "internal/server/router.go"))
+	for ep, bodies := range inline {
+		if excludedEndpoint(ep) {
+			continue
+		}
+		// **body ごとに走査する。** join すると同一パスの複数登録
+		// (`get-online-users-count` の GET/POST は同じ closure) で二重計上され、
+		// drift 行も 2 回出る。`(?s)` の正規表現が body をまたぐ余地も残る。
+		var ems []emission
+		for _, body := range bodies {
+			ems = append(ems, scanBodyEmissions(body, helpers, consts)...)
+		}
+		for _, em := range ems {
+			resolved++
+			want, ok := golden[ep][em.code]
+			if !ok || !validUUID.MatchString(want) {
+				continue
+			}
+			if em.uuid != want {
+				drifts = append(drifts, drift{ep, em.code, em.uuid, want})
+			}
+		}
+	}
+
+	// **インライン endpoint は 0 件が正常** (#2791 で全 14 件を `internal/api` へ
+	// 移設した)。上の api walk が拾い直すので、gate のカバレッジはむしろ上がった。
+	//
+	// **向きを反転させてある。** 以前は「golden と突合できた数が 1 件未満なら
+	// 落とす」下限だったが、対象が無くなった今それは常に落ちる。代わりに
+	// **インラインが復活したら落とす**形にする — 新しく書かれた closure は
+	// `internal/api` の walk からも `scanInlineRoutes` からも漏れやすく、
+	// 「golden が正しい id を持っているのに検出されない」状態 (`promo/read` の
+	// `NO_SUCH_NOTE` で実際に起きていた) に戻る。
+	//
+	// **数えるのは `countInlineHandlers`** (レシーバを問わない)。`scanInlineRoutes`
+	// は endpoint パスを復元するために `api` ident に限るので、
+	// `promoGroup := api.Group("/promo")` のような整理をしただけで素通りする。
+	if inlineHandlers := countInlineHandlers(t, filepath.Join(root, "internal/server/router.go")); len(inlineHandlers) > 0 {
+		t.Errorf("router.go に inline endpoint が復活している (%d 件): %v\n"+
+			"  handler は internal/api 配下のパッケージに置くこと。router.go の\n"+
+			"  closure は error id gate から漏れやすく、golden が正しい値を持って\n"+
+			"  いても drift を検出できない (#2784 / #2791)。\n"+
+			"  移設先では **ハンドラを変数に代入してから渡す** こと — gate は\n"+
+			"  `handlerVar.Method` の形しか解決しない。",
+			len(inlineHandlers), inlineHandlers)
+	}
+
 	// silent-zero guard: regex ベースの抽出/解決が upstream フォーマット変更や
 	// リファクタで空振りすると、emission が 0 件になり gate が無意味に PASS して
 	// しまう。実際の解決数は数百件あるので、大きく下回ったら parser 破損とみなす。
@@ -180,13 +236,27 @@ func scanEmissions(src string, helpers map[string]emission, consts map[string]st
 		}
 		body := src[loc[0]:end]
 
-		for _, m := range inlineErrRe.FindAllStringSubmatch(body, -1) {
-			out = append(out, emission{fn: fn, code: m[1], uuid: resolveUUID(m[2], consts), kind: kindFromConstSuffix(m[3])})
+		for _, em := range scanBodyEmissions(body, helpers, consts) {
+			em.fn = fn
+			out = append(out, em)
 		}
-		for _, m := range helperCallRe.FindAllStringSubmatch(body, -1) {
-			if h, ok := helpers[m[1]]; ok {
-				out = append(out, emission{fn: fn, code: h.code, uuid: h.uuid, kind: h.kind})
-			}
+	}
+	return out
+}
+
+// scanBodyEmissions extracts emissions from **one function body**.
+//
+// `scanEmissions` は `func` 宣言で本体を切り分けるので、宣言を持たない closure
+// (router.go のインライン endpoint) には使えない — `locs` が空になり黙って
+// 0 件を返す (#2784 で実際に踏んだ)。そこだけを切り出してある。
+func scanBodyEmissions(body string, helpers map[string]emission, consts map[string]string) []emission {
+	var out []emission
+	for _, m := range inlineErrRe.FindAllStringSubmatch(body, -1) {
+		out = append(out, emission{code: m[1], uuid: resolveUUID(m[2], consts), kind: kindFromConstSuffix(m[3])})
+	}
+	for _, m := range helperCallRe.FindAllStringSubmatch(body, -1) {
+		if h, ok := helpers[m[1]]; ok {
+			out = append(out, emission{code: h.code, uuid: h.uuid, kind: h.kind})
 		}
 	}
 	return out
@@ -323,6 +393,277 @@ func parseRoutes(t *testing.T, path string) map[string][]string {
 		routes[key] = append(routes[key], m[1])
 	}
 	return routes
+}
+
+// scanInlineRoutes returns endpoint -> handler body sources for the routes that
+// router.go registers with a closure instead of a handler method.
+//
+// **`go/parser` で取る。** 正規表現だと closure 本体のネストした `{}` を数えられず、
+// 途中で切れた本体から emission を拾って誤検出する。
+//
+// 拾うのは `api.<METHOD>("/path", ...)` で、第 2 引数が
+//
+//   - `func(c echo.Context) error { ... }` の直書き
+//   - router.go 内で `x := func(c echo.Context) error { ... }` に束縛された識別子
+//
+// のいずれかのもの。`handlerVar.Method` の形は `parseRoutes` 側が解決するので
+// ここでは拾わない。
+//
+// **レシーバを `api` ident に限る。** 見ないと `pprofGroup.GET("/:name", ...)` の
+// ような API 以外の route まで endpoint として混ざる (実測でキー `:name` と `""`
+// が増える)。相対パスを key にしているので、golden の単一セグメント endpoint
+// (`i` など) と衝突しうる。
+//
+// **group 経由は拾えない。** `promoGroup := api.Group("/promo")` でも
+// `api.Group("/promo").POST(...)` のチェーンでも、レシーバが `api` ident では
+// なくなるので**ルートごと収集対象から外れる** (key が `read` になるのではない)。
+// endpoint パスを復元できないので drift 検出には使えないが、**「closure が
+// 書かれた」ことだけは `countInlineHandlers` がレシーバを問わず数える。**
+func scanInlineRoutes(t *testing.T, path string) map[string][]string {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read router: %v", err)
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, src, 0)
+	if err != nil {
+		t.Fatalf("parse router: %v", err)
+	}
+	base := fset.File(f.Pos()).Base()
+	bodyOf := func(fn *ast.FuncLit) string {
+		return string(src[int(fn.Body.Pos())-base : int(fn.Body.End())-base])
+	}
+
+	// `x := func(c echo.Context) error { ... }` を先に集める。route 登録より
+	// 前に書かれるとは限らないので、走査を 2 段に分ける。
+	//
+	// **スコープは見ない (同名は最後の束縛が勝つ)。** `var x = func(...)` の
+	// ValueSpec も拾わない。現状 router.go の closure 束縛は 5 個すべて一意で
+	// package-level の `var = func` は 0 件なので実害は無いが、増えたらここを直す。
+	lits := map[string]*ast.FuncLit{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		id, ok := as.Lhs[0].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if fn, ok := as.Rhs[0].(*ast.FuncLit); ok {
+			lits[id.Name] = fn
+		}
+		return true
+	})
+
+	out := map[string][]string{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		// parseRoutes の routeRe と同じ 4 メソッドに揃える。
+		switch sel.Sel.Name {
+		case "GET", "POST", "PUT", "DELETE":
+		default:
+			return true
+		}
+		recv, ok := sel.X.(*ast.Ident)
+		if !ok || recv.Name != "api" {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		ep, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return true
+		}
+		key := strings.TrimPrefix(ep, "/")
+		switch arg := call.Args[1].(type) {
+		case *ast.FuncLit:
+			out[key] = append(out[key], bodyOf(arg))
+		case *ast.Ident:
+			if fn, ok := lits[arg.Name]; ok {
+				out[key] = append(out[key], bodyOf(fn))
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// countInlineHandlers counts route registrations under the /api group whose
+// handler argument is not a resolvable method reference.
+//
+// `scanInlineRoutes` は endpoint パスを復元するためにレシーバを `api` ident に
+// 限るが、**guard の目的は「router.go に closure を書かせない」こと**なので
+// こちらは広く取る:
+//
+//   - `api` から派生した group を推移的に辿る (`promoGroup := api.Group("/promo")`)
+//   - **チェーン呼び出しも辿る** (`api.Group("/promo").POST(...)`)
+//   - `Match` / `Any` / `Add` も対象 (`/server-info` のような GET+POST 登録で
+//     使われうる)
+//   - closure literal と ident 束縛に加え、**コンストラクタ直渡し**
+//     (`api.POST("/x", pkg.NewHandler(a).Read)`) も数える。あの形は
+//     `parseRoutes` の `handlerVar.Method` 解決から外れるので、closure と同じく
+//     error id が丸ごと無検査になる
+//
+// **`/api` 配下に限る。** レシーバを一切問わないと `s.echo.GET("/healthz", ...)`
+// や frontend の catchall まで拾ってしまう。あれらは error id gate の対象では
+// ないし、`internal/api` に移すものでもない。
+func countInlineHandlers(t *testing.T, path string) []string {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read router: %v", err)
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, src, 0)
+	if err != nil {
+		t.Fatalf("parse router: %v", err)
+	}
+
+	// closure 束縛と、`api` から派生した group 変数を集める。
+	//
+	// group は `x := api.Group(...)` の形で作られ、そこから更に派生しうるので
+	// 変化が無くなるまで回す (宣言順に依存しない)。
+	lits := map[string]bool{}
+	apiGroups := map[string]bool{"api": true}
+	assigns := [][2]ast.Expr{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		id, ok := as.Lhs[0].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if _, ok := as.Rhs[0].(*ast.FuncLit); ok {
+			lits[id.Name] = true
+			return true
+		}
+		assigns = append(assigns, [2]ast.Expr{as.Lhs[0], as.Rhs[0]})
+		return true
+	})
+
+	// isAPIRecv reports whether an expression evaluates to the /api group or a
+	// group derived from it. **チェーン呼び出しのために再帰する** —
+	// `api.Group("/a").Group("/b").POST(...)` でもレシーバを辿れる。
+	var isAPIRecv func(ast.Expr) bool
+	isAPIRecv = func(x ast.Expr) bool {
+		switch v := x.(type) {
+		case *ast.Ident:
+			return apiGroups[v.Name]
+		case *ast.CallExpr:
+			sel, ok := v.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Group" {
+				return false
+			}
+			return isAPIRecv(sel.X)
+		}
+		return false
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for _, a := range assigns {
+			id := a[0].(*ast.Ident)
+			if apiGroups[id.Name] {
+				continue
+			}
+			call, ok := a[1].(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Group" {
+				continue
+			}
+			if !isAPIRecv(sel.X) {
+				continue
+			}
+			apiGroups[id.Name] = true
+			changed = true
+		}
+	}
+
+	// resolvableMethod reports whether the handler argument is the
+	// `handlerVar.Method` form that `parseRoutes` can resolve.
+	//
+	// **レシーバが ident であることまで見る。** `pkg.NewHandler(a).Read` も
+	// SelectorExpr だが、`parseRoutes` の正規表現 (`(\w+)\.(\w+)`) は
+	// 解決できないので gate から漏れる。
+	resolvableMethod := func(x ast.Expr) bool {
+		sel, ok := x.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		_, ok = sel.X.(*ast.Ident)
+		return ok
+	}
+
+	var out []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		// パス引数の位置がメソッドで違う。`Match` / `Add` は第 1 引数が
+		// メソッド (集合 / 文字列) で、パスは第 2 引数。
+		pathIdx, handlerIdx := 0, 1
+		switch sel.Sel.Name {
+		case "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "Any":
+		case "Match", "Add":
+			pathIdx, handlerIdx = 1, 2
+		default:
+			return true
+		}
+		if len(call.Args) <= handlerIdx {
+			return true
+		}
+		if !isAPIRecv(sel.X) {
+			return true
+		}
+		lit, ok := call.Args[pathIdx].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		ep, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return true
+		}
+		// catchall は endpoint ではない。
+		if ep == "/*" || ep == "*" {
+			return true
+		}
+		switch arg := call.Args[handlerIdx].(type) {
+		case *ast.FuncLit:
+			out = append(out, ep)
+		case *ast.Ident:
+			if lits[arg.Name] {
+				out = append(out, ep)
+			}
+		default:
+			if !resolvableMethod(arg) {
+				out = append(out, ep)
+			}
+		}
+		return true
+	})
+	sort.Strings(out)
+	return out
 }
 
 func excludedEndpoint(ep string) bool {

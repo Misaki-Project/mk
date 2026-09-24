@@ -17,6 +17,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/oauth"
 	"github.com/shiroha-a/mk/internal/config"
 	"github.com/shiroha-a/mk/internal/core/role"
+	"github.com/shiroha-a/mk/internal/core/signup"
 	"github.com/shiroha-a/mk/internal/frontendutil"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
@@ -167,7 +168,12 @@ func renderFrontendShell(c echo.Context, cfg *config.Config, metaRepo repository
 	// object storage から直接配信されるので、`'self'` だけだと enforce 時に
 	// 画像・動画・音声が丸ごと表示できなくなる。
 	var cspExtra cspExtras
+	// **meta を取れたかどうかを外に持ち出す。** CSP の media origin は
+	// object storage (meta 依存) と外部 media proxy (cfg のみで決まる) の
+	// 両方から来るので、meta の取得に失敗しても後者は足す必要がある。
+	var cspMeta *model.Meta
 	if m, err := metaRepo.Fetch(); err == nil {
+		cspMeta = m
 		if m.Name != nil && *m.Name != "" {
 			instanceName = *m.Name
 		}
@@ -206,14 +212,6 @@ func renderFrontendShell(c echo.Context, cfg *config.Config, metaRepo repository
 			prefetchTags += fmt.Sprintf(`<link rel="prefetch" as="image" href="%s">`, stdhtml.EscapeString(*u)) + "\n"
 		}
 		metaJSON = buildMetaJSON(cfg, m, proxyAccountResolver, chunkedUpload)
-		// useObjectStorage が false でも baseUrl が残っていることがあるので、
-		// **両方が揃っているときだけ**許可する。使っていない host を CSP に
-		// 載せる必要は無い。
-		if m.UseObjectStorage && m.ObjectStorageBaseURL != nil {
-			if origin := objectStorageOrigin(*m.ObjectStorageBaseURL); origin != "" {
-				cspExtra.Media = append(cspExtra.Media, origin)
-			}
-		}
 		// 有効な captcha 業者の origin (#2502)。無いと enforce で captcha の
 		// script が読めずサインアップが壊れる。
 		captchaEx := captchaCSPExtras(m.EnableHcaptcha, m.EnableRecaptcha, m.EnableTurnstile)
@@ -221,14 +219,11 @@ func renderFrontendShell(c echo.Context, cfg *config.Config, metaRepo repository
 		cspExtra.Connect = captchaEx.Connect
 		cspExtra.Style = captchaEx.Style
 	}
-	// 外部 media proxy 構成では、リモート画像もカスタム絵文字も proxy の origin
-	// から配信される (server-side pack とクライアント側の meta.mediaProxy の両方)。
-	// internal proxy ('self') なら何も足さない (#2501)。
-	if cfg.ExternalMediaProxyEnabled {
-		if origin := objectStorageOrigin(cfg.MediaProxy); origin != "" {
-			cspExtra.Media = append(cspExtra.Media, origin)
-		}
-	}
+	cspExtra.Media = cspMediaExtras(cfg, cspMeta)
+	// **SPA shell にだけ足す。** `/about-misskey` は embed shell には無いので、
+	// captcha の origin を embed に足さないのと同じ判断 (使っていない host を
+	// CSP に載せない、#2892)。
+	cspExtra.Image = creditImageOrigins
 
 	// CLIENT_ENTRYの設定
 	clientEntryJS := "null"
@@ -316,6 +311,15 @@ func renderFrontendShell(c echo.Context, cfg *config.Config, metaRepo repository
 	loaderCSSTag := inlineOrLinkCSS(loader.CSS, "/vite/loader/style.css")
 	loaderJSTag := inlineOrLinkJS(loader.JS, "/vite/loader/boot.js")
 
+	// **inline script は変数に切り出す。** CSP の hash はこの値から導くので、
+	// HTML 側と hash 側で別々に文字列を持つと、片方だけ変えたときに CSP を
+	// 有効にしている運用者の画面が真っ白になる (#2786)。
+	bootGlobals := fmt.Sprintf(
+		`const VERSION = %s; const CLIENT_ENTRY = %s; const LANGS = ["ja-JP","en-US"];`,
+		jsStringLiteral(cfg.Version), clientEntryJS)
+	// loader は inline のときだけ hash が要る (外部参照なら 'self' で通る)。
+	cspExtra.Script = append(cspExtra.Script, cspScriptHashes(bootGlobals, loader.JS)...)
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
@@ -336,7 +340,7 @@ func renderFrontendShell(c echo.Context, cfg *config.Config, metaRepo repository
 %s
 %s
 %s<style>:root{--splash-color:%s}</style>
-<script>const VERSION = '%s'; const CLIENT_ENTRY = %s; const LANGS = ["ja-JP","en-US"];</script>
+<script>%s</script>
 <script type="application/json" id="misskey_meta" data-generated-at="%d">%s</script>
 %s
 </head><body>
@@ -351,13 +355,16 @@ func renderFrontendShell(c echo.Context, cfg *config.Config, metaRepo repository
 		pageTitleEsc, noindexTag, stdhtml.EscapeString(faviconURL), stdhtml.EscapeString(appleTouchIconURL),
 		pageTitleEsc, baseURLEsc,
 		prefetchTags, ov.OG+ov.Head, viteClientTag, cssLinkTags,
-		loaderCSSTag, splashColor(themeColor), cfg.Version, clientEntryJS,
+		loaderCSSTag, splashColor(themeColor), bootGlobals,
 		time.Now().UnixMilli(), metaJSON, loaderJSTag,
 		stdhtml.EscapeString(splashIconURL), splashSpinnerSVG)
 
-	// SPA shell にだけ CSP を付ける (#2425)。shell を返す経路は catch-all と
-	// AP の non-AP fallback の 2 つで、どちらもこの関数を通るので path 判定が
+	// **shell を返す経路でだけ CSP を付ける** (#2425)。ここを通るのは catch-all と
+	// AP の non-AP fallback の 2 つで、どちらもこの関数を経由するので path 判定が
 	// 要らない。API / アセットに誤って付くこともない。
+	//
+	// `/embed/` は別の shell (`embed.go` の `render`) なので、そちらで同じ policy を
+	// 付ける (#2789)。
 	applyFrontendCSP(c, cfg.FrontendContentSecurityPolicy, cspExtra)
 
 	cacheControl := ov.CacheControl
@@ -424,7 +431,10 @@ func buildMetaJSON(cfg *config.Config, m *model.Meta, proxyAccountResolver meta.
 		// /api/meta と同じく mk-go の実装バージョンを additive に出す (#2274)。
 		// SSR 埋め込みにも載せることで、about 系ページが fetchInstance を
 		// 待たずに表示できる。
-		"mkGoVersion":               config.MkGoVersion,
+		"mkGoVersion": config.MkGoVersion,
+		// /api/meta と同じ additive field (#2700)。
+		"mkGoCommit":                config.MkGoCommit,
+		"mkGoFrontendVersion":       config.MkGoFrontendVersion,
 		"name":                      m.Name,
 		"shortName":                 m.ShortName,
 		"uri":                       cfg.URL,
@@ -438,48 +448,56 @@ func buildMetaJSON(cfg *config.Config, m *model.Meta, proxyAccountResolver meta.
 		// /api/meta を再取得しない。申請ページは定義を空と見て answers を 0 件送り、
 		// サーバーは定義どおりの件数を期待するので FORM_CHANGED で弾き続ける。
 		// 「再読み込みしてやり直してください」と出るが、再読み込みしても直らない。
-		"signupApplicationForm":        ssrJSONArray(m.SignupApplicationForm),
-		"enableHcaptcha":               m.EnableHcaptcha,
-		"hcaptchaSiteKey":              m.HcaptchaSiteKey,
-		"enableRecaptcha":              m.EnableRecaptcha,
-		"recaptchaSiteKey":             m.RecaptchaSiteKey,
-		"enableTurnstile":              m.EnableTurnstile,
-		"turnstileSiteKey":             m.TurnstileSiteKey,
-		"themeColor":                   m.ThemeColor,
-		"bannerUrl":                    m.BannerURL,
-		"backgroundImageUrl":           m.BackgroundImageURL,
-		"logoImageUrl":                 m.LogoImageURL,
-		"iconUrl":                      m.IconURL,
-		"cacheRemoteFiles":             m.CacheRemoteFiles,
-		"enableServiceWorker":          m.EnableServiceWorker,
-		"swPublickey":                  m.SwPublicKey,
-		"serverRules":                  m.ServerRules,
-		"maxNoteTextLength":            3000,
-		"tosUrl":                       m.TermsOfServiceURL,
-		"repositoryUrl":                m.RepositoryURL,
-		"feedbackUrl":                  m.FeedbackURL,
-		"impressumUrl":                 m.ImpressumURL,
-		"privacyPolicyUrl":             m.PrivacyPolicyURL,
-		"inquiryUrl":                   m.InquiryURL,
-		"federation":                   m.Federation,
-		"defaultLightTheme":            meta.PackTheme(m.DefaultLightTheme),
-		"defaultDarkTheme":             meta.PackTheme(m.DefaultDarkTheme),
-		"serverErrorImageUrl":          m.ServerErrorImageURL,
-		"notFoundImageUrl":             m.NotFoundImageURL,
-		"infoImageUrl":                 m.InfoImageURL,
-		"app192IconUrl":                m.App192IconURL,
-		"app512IconUrl":                m.App512IconURL,
-		"mascotImageUrl":               mascot,
-		"translatorAvailable":          translatorAvailable,
-		"enableEmail":                  m.EnableEmail,
-		"enableUrlPreview":             m.URLPreviewEnabled,
-		"ads":                          []any{},
-		"notesPerOneAd":                m.NotesPerOneAd,
-		"mediaProxy":                   cfg.MediaProxy,
-		"cacheRemoteSensitiveFiles":    m.CacheRemoteSensitiveFiles,
-		"requireSetup":                 m.RootUserID == nil,
-		"singleUserMode":               m.SingleUserMode,
-		"providesTarball":              cfg.PublishTarballInsteadOfProvideRepositoryUrl,
+		"signupApplicationForm": ssrJSONArray(m.SignupApplicationForm),
+		// 登録 username の最小文字数 (#3015)。**ここに載せ忘れると、登録
+		// フォームが最大 1 時間「1 文字以上」として振る舞う** — 上と同じ理由で
+		// SSR 埋め込みが localStorage cache を上書きする。事前チェックは通るのに
+		// `username/available` が false を返すので、利用者には理由の分からない
+		// 「利用できません」だけが出る。
+		"minimumUsernameLength":     signup.EffectiveMinimumUsernameLength(m),
+		"enableHcaptcha":            m.EnableHcaptcha,
+		"hcaptchaSiteKey":           m.HcaptchaSiteKey,
+		"enableRecaptcha":           m.EnableRecaptcha,
+		"recaptchaSiteKey":          m.RecaptchaSiteKey,
+		"enableTurnstile":           m.EnableTurnstile,
+		"turnstileSiteKey":          m.TurnstileSiteKey,
+		"themeColor":                m.ThemeColor,
+		"bannerUrl":                 m.BannerURL,
+		"backgroundImageUrl":        m.BackgroundImageURL,
+		"logoImageUrl":              m.LogoImageURL,
+		"iconUrl":                   m.IconURL,
+		"cacheRemoteFiles":          m.CacheRemoteFiles,
+		"enableServiceWorker":       m.EnableServiceWorker,
+		"swPublickey":               m.SwPublicKey,
+		"serverRules":               m.ServerRules,
+		"maxNoteTextLength":         3000,
+		"tosUrl":                    m.TermsOfServiceURL,
+		"repositoryUrl":             m.RepositoryURL,
+		"feedbackUrl":               m.FeedbackURL,
+		"impressumUrl":              m.ImpressumURL,
+		"privacyPolicyUrl":          m.PrivacyPolicyURL,
+		"inquiryUrl":                m.InquiryURL,
+		"federation":                m.Federation,
+		"defaultLightTheme":         meta.PackTheme(m.DefaultLightTheme),
+		"defaultDarkTheme":          meta.PackTheme(m.DefaultDarkTheme),
+		"serverErrorImageUrl":       m.ServerErrorImageURL,
+		"notFoundImageUrl":          m.NotFoundImageURL,
+		"infoImageUrl":              m.InfoImageURL,
+		"app192IconUrl":             m.App192IconURL,
+		"app512IconUrl":             m.App512IconURL,
+		"mascotImageUrl":            mascot,
+		"translatorAvailable":       translatorAvailable,
+		"enableEmail":               m.EnableEmail,
+		"enableUrlPreview":          m.URLPreviewEnabled,
+		"ads":                       []any{},
+		"notesPerOneAd":             m.NotesPerOneAd,
+		"mediaProxy":                cfg.MediaProxy,
+		"cacheRemoteSensitiveFiles": m.CacheRemoteSensitiveFiles,
+		"requireSetup":              meta.RequireSetup(m),
+		"singleUserMode":            m.SingleUserMode,
+		// /api/meta と同じ理由で常に false (#2700)。frontend の instance cache を
+		// 上書きする経路なので、片側だけ設定値に戻すと /api/meta と食い違う。
+		"providesTarball":              cfg.ProvidesTarball(),
 		"maxFileSize":                  cfg.MaxFileSize,
 		"proxyAccountName":             resolveProxyAccountNameForSSR(proxyAccountResolver),
 		"noteSearchableScope":          meta.NoteSearchableScope(cfg.FulltextSearch, cfg.Meilisearch),
@@ -680,11 +698,31 @@ func newViteProxy(target string) echo.HandlerFunc {
 	if err != nil {
 		panic("invalid vite proxy target: " + target)
 	}
-	proxy := httputil.NewSingleHostReverseProxy(remote)
-	origDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = remote.Host
+	// **`Director` は Go 1.26 で非推奨**なので `Rewrite` を使う。
+	//
+	// `SetURL` は宛先へ向けるだけでなく **Host ヘッダも target のものへ揃える**
+	// ので、`Director` 版の `req.Host = remote.Host` に相当する代入は要らない
+	// (足しても同じ値で、変異検証でも差が出なかった)。
+	//
+	// **`Rewrite` は X-Forwarded-* を落としてから呼ばれる。**
+	// `NewSingleHostReverseProxy` + `Director` では `ServeHTTP` が
+	// `X-Forwarded-For` を自動で足していたので `SetXForwarded()` で付け直すが、
+	// **等価ではない** (実測) — (1) `Director` 版は client 由来の値へ**追記**して
+	// いたのに対しこちらは観測した RemoteAddr で**置換**する、(2) `X-Forwarded-Host`
+	// と `X-Forwarded-Proto` を**新たに送る**、(3) client が送ってきた `Forwarded`
+	// ヘッダは**削除される**。(1)-(3) はどれも詐称ヘッダを dev server へ流さない
+	// 方向なのでこちらを採る。
+	//
+	// **(4) ヘッダ以外にもう 1 つある。** `Rewrite` 経路では `ServeHTTP` が
+	// `cleanQueryParams` を**無条件に**通すので、`;` や不正な `%` を含む query は
+	// その param が落ちる (`Director` 経路は `outreq.Form != nil` のときだけで、
+	// ここでは常に nil)。Vite が使う `?vue&type=style` / `?v=<hash>` 形式では
+	// 無変化であることを実測で確認済み。
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(remote)
+			r.SetXForwarded()
+		},
 	}
 
 	return func(c echo.Context) error {

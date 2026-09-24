@@ -1,9 +1,14 @@
 package i
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/shiroha-a/mk/internal/api/apierr"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,12 +20,14 @@ import (
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
 	"github.com/shiroha-a/mk/internal/entitycompat/shapetest"
 	"github.com/shiroha-a/mk/internal/misc/id"
+	passwordutil "github.com/shiroha-a/mk/internal/misc/password"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/queue"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/datatypes"
 )
@@ -37,6 +44,23 @@ func newExtraHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	return h, userRepo
 }
 
+// postExtraCanceled は**キャンセル済みの request context** で叩く。
+// Argon2id の検証枠を取れなかった経路 (OutcomeUnavailable) を待ち時間ゼロで再現する。
+func postExtraCanceled(h func(echo.Context) error, body string, user *model.User) *httptest.ResponseRecorder {
+	e := echo.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)).WithContext(ctx)
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	if user != nil {
+		c.Set(string(middleware.UserContextKey), user)
+	}
+	_ = h(c)
+	return rec
+}
+
 func postExtra(h func(echo.Context) error, body string, user *model.User) *httptest.ResponseRecorder {
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
@@ -50,13 +74,26 @@ func postExtra(h func(echo.Context) error, body string, user *model.User) *httpt
 	return rec
 }
 
-func setupUserWithPassword(repo *testutil.MockUserRepository, uid, password string) *model.User {
-	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+func setupUserWithPassword(repo *testutil.MockUserRepository, uid, plain string) *model.User {
+	hash, _ := bcrypt.GenerateFromPassword([]byte(plain), bcrypt.MinCost)
 	hashStr := string(hash)
 	token := "tok12345678901234"
 	user := &model.User{ID: uid, Username: uid, Token: &token}
 	repo.Users[uid] = user
 	repo.Profiles[uid] = &model.UserProfile{UserID: uid, Password: &hashStr}
+	return user
+}
+
+func setupUserWithArgon2Password(repo *testutil.MockUserRepository, uid, plain string) *model.User {
+	salt := []byte("0123456789abcdef")
+	digest := argon2.IDKey([]byte(plain), salt, 3, 64*1024, 4, 32)
+	hash := fmt.Sprintf("$argon2id$v=19$m=65536,t=3,p=4$%s$%s",
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(digest))
+	token := "tok12345678901234"
+	user := &model.User{ID: uid, Username: uid, Token: &token}
+	repo.Users[uid] = user
+	repo.Profiles[uid] = &model.UserProfile{UserID: uid, Password: &hash}
 	return user
 }
 
@@ -79,6 +116,28 @@ func TestChangePassword_Success(t *testing.T) {
 	user := setupUserWithPassword(repo, "u1", "oldpass")
 	rec := postExtra(h.ChangePassword, `{"currentPassword":"oldpass","newPassword":"newpass"}`, user)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestChangePassword_AcceptsArgon2AndStoresBcrypt(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithArgon2Password(repo, "u1", "oldpass")
+	rec := postExtra(h.ChangePassword, `{"currentPassword":"oldpass","newPassword":"newpass"}`, user)
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	stored := *repo.Profiles["u1"].Password
+	assert.True(t, strings.HasPrefix(stored, "$2"))
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(stored), []byte("newpass")))
+	cost, err := bcrypt.Cost([]byte(stored))
+	require.NoError(t, err)
+	assert.Equal(t, passwordutil.Cost(), cost)
+}
+
+func TestChangePassword_RejectsWrongArgon2PasswordWithoutRewrite(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithArgon2Password(repo, "u1", "oldpass")
+	before := *repo.Profiles["u1"].Password
+	rec := postExtra(h.ChangePassword, `{"currentPassword":"wrong","newPassword":"newpass"}`, user)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, before, *repo.Profiles["u1"].Password)
 }
 
 func TestChangePassword_WrongPassword(t *testing.T) {
@@ -677,4 +736,134 @@ func TestDeleteAccount_ProtectedSystemRejected(t *testing.T) {
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.False(t, repo.Users["u1"].IsDeleted)
+}
+
+// change-password でも枠を取れなければ 503 を返す (#2849)。**400 に潰さない** —
+// 現パスワードは正しいかもしれない。
+func TestChangePassword_VerifierBusyReturns503(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithArgon2Password(repo, "u1", "oldpass")
+
+	rec := postExtraCanceled(h.ChangePassword, `{"currentPassword":"oldpass","newPassword":"newpass"}`, user)
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	assert.Equal(t, "360", rec.Header().Get("Retry-After"))
+	// **kind は server。** 飽和はサーバー側の事情なので client に倒すと意味が逆。
+	var body struct {
+		Error struct {
+			ID   string `json:"id"`
+			Kind string `json:"kind"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.Equal(t, apierr.UUIDPasswordVerificationUnavailable, body.Error.ID)
+	assert.Equal(t, apierr.KindServer, body.Error.Kind)
+	// **hash は書き換わっていないこと。**
+	assert.True(t, strings.HasPrefix(*repo.Profiles["u1"].Password, "$argon2id$"))
+}
+
+// 未対応 profile では 400 のまま **hash を書き換えない** (#2849)。
+//
+// signin 側には同等のテストがあるのに `internal/api/i` だけ欠けており、
+// `!outcome.OK()` を `== OutcomeMismatch` に変える変異が素通りしていた。
+// その変異下では、壊れた hash を持つ利用者が**任意の現パスワードで
+// パスワードを変更できる**。
+func TestChangePassword_UnsupportedProfileStays400(t *testing.T) {
+	const stored = "$argon2id$v=19$m=4096,t=3,p=1$YWJjZGVmZ2hpamtsbW5vcA$YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY"
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "irrelevant")
+	p := stored
+	repo.Profiles["u1"].Password = &p
+
+	buf := captureExtraLogs(t)
+	rec := postExtra(h.ChangePassword, `{"currentPassword":"anything","newPassword":"newpass"}`, user)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Equal(t, stored, *repo.Profiles["u1"].Password, "hash が書き換わっている")
+
+	out := buf.String()
+	require.Contains(t, out, "unsupported password hash")
+	assert.Contains(t, out, "m=4096,t=3,p=1")
+	parts := strings.Split(stored, "$")
+	assert.NotContains(t, out, parts[4], "salt がログに出ている")
+	assert.NotContains(t, out, parts[5], "digest がログに出ている")
+}
+
+func captureExtraLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// 自己削除の root 保護は `meta.rootUserId` を見ること。
+//
+// **`user.isRoot` だけでは足りない。** あれは upstream が system_account 移行で
+// DROP 済みの残存列で、mk-go は drop-in のために持っているだけ。列を追加した
+// migration より前に作られた root は `isRoot = false` のままなので、meta を
+// 見ないとガードが発火しない (本番の root がまさにその状態だった)。
+//
+// 通ると `user` 行が物理削除され、`meta` に FK が無い構成では `rootUserId` が
+// 消えた ID を指したまま残るので **root が永久に不在**になる。`update-meta` は
+// `rootUserId` を落とすので API 経由で指名し直す手段が無い。
+func TestDeleteAccount_RootProtectionUsesMeta(t *testing.T) {
+	setup := func(t *testing.T, rootID *string) (*Handler, *testutil.MockUserRepository, *testutil.MockMetaRepository) {
+		t.Helper()
+		h, repo := newExtraHandler(t)
+		metaRepo := testutil.NewMockMetaRepository()
+		metaRepo.Meta = &model.Meta{ID: "x", RootUserID: rootID}
+		h.SetMetaRepo(metaRepo)
+		return h, repo, metaRepo
+	}
+
+	t.Run("isRoot が false でも meta が指していれば拒否", func(t *testing.T) {
+		rootID := "u1"
+		h, repo, _ := setup(t, &rootID)
+		user := setupUserWithPassword(repo, "u1", "pass")
+		user.IsRoot = false // 列が追加される前に作られた root
+
+		rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "ACCESS_DENIED")
+		assert.False(t, repo.Users["u1"].IsDeleted, "削除が進んでいる")
+	})
+
+	// **弾きすぎていないことを見る。** 常に拒否する実装でも上は緑になる。
+	t.Run("root でない利用者は削除できる", func(t *testing.T) {
+		rootID := "other"
+		h, repo, _ := setup(t, &rootID)
+		user := setupUserWithPassword(repo, "u1", "pass")
+
+		rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+		assert.Equal(t, http.StatusNoContent, rec.Code)
+		assert.True(t, repo.Users["u1"].IsDeleted)
+	})
+
+	// **meta が読めなければ 500 (#3037)。**
+	//
+	// 削除は通さない (DB 障害を「root ではない」と解釈して不可逆な操作を
+	// 通すわけにいかない) が、**`ACCESS_DENIED` で返すのも事実ではない** —
+	// 「root だから断った」のではなく「判定できなかった」。4xx に丸めると
+	// 本人の退会が自分のせいに見えるうえ、監視にも 4xx しか出ない (#2792)。
+	t.Run("meta が読めなければ 500", func(t *testing.T) {
+		h, repo, metaRepo := setup(t, nil)
+		metaRepo.Meta = nil // Fetch が error を返す
+		user := setupUserWithPassword(repo, "u1", "pass")
+
+		rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+		assert.False(t, repo.Users["u1"].IsDeleted, "判定できないまま削除している")
+	})
+
+	// 従来の `isRoot` 判定も残っていること (drop-in で TS から引き継いだ列)。
+	t.Run("isRoot が true なら meta が指していなくても拒否", func(t *testing.T) {
+		rootID := "other"
+		h, repo, _ := setup(t, &rootID)
+		user := setupUserWithPassword(repo, "u1", "pass")
+		user.IsRoot = true
+
+		rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
 }

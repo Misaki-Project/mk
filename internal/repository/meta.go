@@ -12,6 +12,34 @@ import (
 // recreated on the fly. 本家 MetaService.fetch() は 'x' 固定で upsert する。
 const defaultMetaID = "x"
 
+// defaultRepositoryURL is the source repository advertised to clients when the
+// singleton meta row is created.
+//
+// AGPL-3.0 section 13 が求める「動いているコードに対応するソース」の案内先で、
+// frontend は /about-mkgo と MkSourceCodeAvailablePopup でこれを読む。列 DEFAULT
+// (migration/000029) は upstream 互換のため misskey-dev/misskey のままだが、GORM は
+// *string の nil を NULL として明示挿入するので**列 DEFAULT は効かない**。ここで
+// 入れないと新規インスタンスの案内が空 (= 警告だけ) になる (#2700)。
+//
+// 値は config.MkGoRepositoryURL と同じ。repository 層は config に依存しない方針
+// なので定数を持ち直しており、一致は meta_test.go の
+// TestDefaultRepositoryURLMatchesConfig で固定する。
+const defaultRepositoryURL = "https://github.com/shiroha-a/mk"
+
+// defaultFeedbackURL is the feedback destination advertised to clients when the
+// singleton meta row is created.
+//
+// `defaultRepositoryURL` と同じ理由で Go 側に持つ — `000029` は `repositoryUrl` と
+// **隣り合う 2 行**で `feedbackUrl` の列 DEFAULT も設定しているが、どちらも GORM の
+// NULL 明示挿入に負ける。#2700 は前者だけを直したので、こちらは NULL のまま残っていた。
+//
+// 空だと `/about` のフィードバック行が消え (`v-if="instance.feedbackUrl"`)、**nodeinfo の
+// metadata からも欠ける** ので、他インスタンスや一覧サイトからも見えない (#2891)。
+//
+// 値は config.MkGoFeedbackURL と同じ。一致は meta_test.go の
+// TestDefaultFeedbackURLMatchesConfig で固定する。
+const defaultFeedbackURL = defaultRepositoryURL + "/issues/new"
+
 // MetaRepository provides data access for server metadata.
 type MetaRepository interface {
 	Fetch() (*model.Meta, error)
@@ -70,5 +98,11 @@ func (r *metaRepository) EnsureInitial(id string) error {
 	// Fetch からも呼ばれるので、同時に複数のリクエストがここへ入りうる。
 	// 本家 MetaService.fetch() が upsert を使っているのと同じ理由で、
 	// 主キー衝突を無視して冪等にする。
-	return r.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.Meta{ID: id}).Error
+	repositoryURL := defaultRepositoryURL
+	feedbackURL := defaultFeedbackURL
+	return r.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&model.Meta{
+		ID:            id,
+		RepositoryURL: &repositoryURL,
+		FeedbackURL:   &feedbackURL,
+	}).Error
 }

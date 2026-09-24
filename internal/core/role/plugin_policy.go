@@ -31,6 +31,19 @@ type policyProviderRuntime struct {
 	disabled  atomic.Bool
 	fallbacks atomic.Uint64
 
+	// logger は runtime を作った時点の slog.Default() を握る。
+	//
+	// **これは防御であって、観測された不具合の修正ではない。** #2867 で落ちて
+	// いた経路は上の disablePolicyProvider の lock 位置で、こちらではない。
+	// 毎回 `slog.Default()` を引くと「そのとき default だった誰か」に書くので、
+	// `slog.SetDefault` でグローバルを差し替えて出力を数えるテストと、遅れて
+	// 書く goroutine が組み合わさったときに紛れ込みうる。実際にその形が
+	// 成立する経路は本パッケージには見つかっていない。
+	//
+	// production では `cmd/misskey/main.go` が起動時に `slog.SetDefault` を
+	// 済ませてからプラグインを登録する (= runtime 生成はその後) ので挙動は同じ。
+	logger *slog.Logger
+
 	cacheMu      sync.Mutex
 	cache        map[policyProviderCacheKey]*list.Element
 	cacheLRU     list.List
@@ -46,6 +59,7 @@ func newPolicyProviderRuntime(cacheEntries int) *policyProviderRuntime {
 		cacheEntries = defaultEffectivePolicyProviderCacheEntries
 	}
 	runtime := &policyProviderRuntime{
+		logger:       slog.Default(),
 		token:        make(chan struct{}, 1),
 		cache:        make(map[policyProviderCacheKey]*list.Element),
 		cacheEntries: cacheEntries,
@@ -239,7 +253,9 @@ func (s *Service) resolvePolicies(userID string) (map[string]any, error) {
 				value = baseVal
 			}
 			value = clonePolicyValue(value)
-			contribs[c.Key] = append(contribs[c.Key], policyEntry{priority: c.Priority, value: value})
+			// UseDefault のときは base を積むだけなので explicit ではない
+			// (#2898、intersection の集約で「設定していない」と区別する)。
+			contribs[c.Key] = append(contribs[c.Key], policyEntry{priority: c.Priority, value: value, explicit: !c.UseDefault})
 		}
 	}
 
@@ -260,11 +276,23 @@ func (s *Service) resolvePolicies(userID string) (map[string]any, error) {
 	return out, nil
 }
 
+// log returns the logger captured when the runtime was built, falling back to
+// the process default.
+//
+// **nil を許すこと。** 内部テストは `policyProviderRuntime` を直接組み立てる
+// ので、コンストラクタを通らない値が存在する。
+func (runtime *policyProviderRuntime) log() *slog.Logger {
+	if runtime.logger != nil {
+		return runtime.logger
+	}
+	return slog.Default()
+}
+
 func recordPolicyProviderFallback(runtime *policyProviderRuntime) {
 	failures := runtime.fallbacks.Add(1)
 	// 1, 2, 4, 8...回だけ記録し、恒常障害でもlog volumeを有界に近づける。
 	if failures&(failures-1) == 0 {
-		slog.Warn("effective policy provider fallback", "failures", failures)
+		runtime.log().Warn("effective policy provider fallback", "failures", failures)
 	}
 }
 
@@ -275,31 +303,31 @@ func resolvePolicyProviderCached(provider policyProvider, req plugin.EffectivePo
 	key := policyProviderCacheKey{userID: req.UserID, roleIDs: encodePolicyProviderRoleIDs(req.RoleIDs)}
 
 	var flight *policyProviderFlight
-	for {
-		provider.runtime.cacheMu.Lock()
-		if provider.runtime.disabled.Load() {
-			provider.runtime.cacheMu.Unlock()
-			return nil, false
-		}
-		if cached, ok := provider.runtime.cacheGet(key); ok {
-			provider.runtime.cacheMu.Unlock()
-			return clonePolicyContributions(cached), true
-		}
-		if existing := provider.runtime.flights[key]; existing != nil && policyProviderFlightIsCurrent(provider.runtime, req.UserID, existing) {
-			provider.runtime.cacheMu.Unlock()
-			contributions, ok, _ := waitPolicyProviderFlight(existing, true)
-			return contributions, ok
-		}
-		flight = &policyProviderFlight{
-			done:        make(chan struct{}),
-			userEpoch:   provider.runtime.userEpoch[req.UserID],
-			globalEpoch: provider.runtime.globalEpoch,
-		}
-		provider.runtime.userFlights[req.UserID]++
-		provider.runtime.flights[key] = flight
+	// **ループではない。** 早期 return を持つ 1 回きりの区間で、`for` は
+	// 何も繰り返していなかった (staticcheck SA4004)。振る舞いは変えずに
+	// 構造だけ落としてある。
+	provider.runtime.cacheMu.Lock()
+	if provider.runtime.disabled.Load() {
 		provider.runtime.cacheMu.Unlock()
-		break
+		return nil, false
 	}
+	if cached, ok := provider.runtime.cacheGet(key); ok {
+		provider.runtime.cacheMu.Unlock()
+		return clonePolicyContributions(cached), true
+	}
+	if existing := provider.runtime.flights[key]; existing != nil && policyProviderFlightIsCurrent(provider.runtime, req.UserID, existing) {
+		provider.runtime.cacheMu.Unlock()
+		contributions, ok, _ := waitPolicyProviderFlight(existing, true)
+		return contributions, ok
+	}
+	flight = &policyProviderFlight{
+		done:        make(chan struct{}),
+		userEpoch:   provider.runtime.userEpoch[req.UserID],
+		globalEpoch: provider.runtime.globalEpoch,
+	}
+	provider.runtime.userFlights[req.UserID]++
+	provider.runtime.flights[key] = flight
+	provider.runtime.cacheMu.Unlock()
 
 	contributions, ok := invokePolicyProvider(provider, req, key, flight)
 	if ok {
@@ -505,16 +533,25 @@ func finishPolicyProviderInvocation(ctx context.Context, runtime *policyProvider
 }
 
 func disablePolicyProvider(runtime *policyProviderRuntime) {
+	// **warn を lock の中で出す** (#2867)。
+	//
+	// disable は 2 経路から呼ばれる — deadline を検出した requester と、
+	// あとから返ってきた provider の goroutine。CAS に勝ったほうだけが warn を
+	// 出す。warn を Unlock の後に置くと、goroutine が CAS を取ってから
+	// 実際に書くまでの間に requester が CAS に負けて先へ進めるので、
+	// **呼び出しから戻った時点でまだ何も記録されていない**状態が作れる。
+	// 出力を数えるテストはそこで 0 件を観測して落ちる (stall を注入して実証)。
+	//
+	// lock の中で出せば、負けたほうは Lock で待たされるため、記録が済むまで
+	// 戻れない。追加コストは無い — この lock は元から無条件で取っており、
+	// warn は CAS に守られて runtime 1 つにつき生涯 1 回しか出ない。
 	runtime.cacheMu.Lock()
-	disabled := runtime.disabled.CompareAndSwap(false, true)
-	if disabled {
+	if runtime.disabled.CompareAndSwap(false, true) {
 		runtime.globalEpoch++
 		runtime.cacheClear()
+		runtime.log().Warn("effective policy provider disabled after timeout")
 	}
 	runtime.cacheMu.Unlock()
-	if disabled {
-		slog.Warn("effective policy provider disabled after timeout")
-	}
 }
 
 func acquirePolicyProviderToken(ctx context.Context, runtime *policyProviderRuntime) bool {
@@ -616,6 +653,9 @@ func (s *Service) InvalidateUser(_ context.Context, userID string) error {
 
 func (s *Service) invalidateUserPolicyCaches(userID string) {
 	s.InvalidateUserRoleCache(userID)
+	// **他のワーカーにも伝える。** 伝えないと、剥奪を受け付けなかった側の
+	// ノードでは最大 roleCacheTTL (5 分) のあいだ古いロールで通り続ける。
+	defer s.notifyInvalidated()
 	if userID == "" {
 		return
 	}
@@ -643,6 +683,24 @@ func (s *Service) invalidateRolePolicyCaches(roleID string) {
 	if roleID == "" {
 		return
 	}
+	s.InvalidateAllCachesLocally()
+	// **他のワーカーにも伝える** (invalidateUserPolicyCaches と同じ理由)。
+	s.notifyInvalidated()
+}
+
+// InvalidateAllCachesLocally drops every cached role / policy input in **this**
+// process without telling the others.
+//
+// **他ワーカーからの通知を受けたときに呼ぶ入口。** ここから再通知すると、
+// ワーカー同士が通知を投げ合って止まらなくなる。ローカルの変更から呼ぶ経路は
+// `invalidateUserPolicyCaches` / `invalidateRolePolicyCaches` の方で、
+// そちらは通知する。
+//
+// **粒度は落として全消しにしてある。** 受信側は「誰の」「どのロールが」変わった
+// かを知らなくても正しく動く (余分なキャッシュミスが出るだけ) 一方、ロールは
+// conditional 評価があるので、ID を運んでも影響範囲は絞りきれない
+// (`InvalidateRolePolicies` の doc と同じ理由)。
+func (s *Service) InvalidateAllCachesLocally() {
 	s.InvalidateAllRoleCaches()
 	for _, provider := range s.snapshotPolicyProviders() {
 		provider.runtime.cacheMu.Lock()
@@ -650,5 +708,22 @@ func (s *Service) invalidateRolePolicyCaches(roleID string) {
 		provider.runtime.cacheClear()
 		clear(provider.runtime.userEpoch)
 		provider.runtime.cacheMu.Unlock()
+	}
+}
+
+// SetInvalidationHook registers fn, invoked after a **local** mutation has
+// dropped this process's role / policy caches.
+//
+// 配線は `internal/server/router.go` で、`internal:rolesUpdated` へ publish
+// する。meta (#1740) / antenna (#2752) と同じ形。
+//
+// **起動時専用。** リクエストを捌いている最中に差し替えると、読みとの間で
+// データ競合になる。
+func (s *Service) SetInvalidationHook(fn func()) { s.invalidationHook = fn }
+
+// notifyInvalidated fires the hook when one is wired.
+func (s *Service) notifyInvalidated() {
+	if s.invalidationHook != nil {
+		s.invalidationHook()
 	}
 }

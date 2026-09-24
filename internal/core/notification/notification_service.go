@@ -35,6 +35,11 @@ const (
 	// service 側からは発火しない (poll_service が呼ばないように disable
 	// 済み)。type 自体は永続化済み notification の互換のため残す。
 	TypePollVote Type = "pollVote"
+	// TypeGroupInvited: upstream の obsoleteNotificationTypes にある型。
+	// mk-go は produce しないが、upstream が filter 値として受け付けるので
+	// registry に載せる (#2898)。定数を置かず registry だけに文字列で書くと、
+	// 定数と registry を突き合わせるゲートが「登録漏れ」と区別できなくなる。
+	TypeGroupInvited Type = "groupInvited"
 	// TypePollEnded: アンケート期限切れ時の通知 (#690)。Misskey TS の
 	// EndedPollNotificationProcessor 相当。著者 + 投票者 (ローカルのみ) に
 	// 1 件ずつ作る。core/poll.ExpiryWorker が周期 ticker で発火させる。
@@ -43,6 +48,23 @@ const (
 	TypeFollowRequestAccept Type = "followRequestAccepted"
 	TypeExportCompleted     Type = "exportCompleted"
 	TypeImportCompleted     Type = "importCompleted"
+	// TypeEmojiApplicationProcessed tells an applicant that their custom
+	// emoji request was approved or rejected (#2934).
+	TypeEmojiApplicationProcessed Type = "emojiApplicationProcessed"
+	// TypeEmojiApplicationReceived tells the people who can review custom emoji
+	// requests that a new one arrived (#2987).
+	//
+	// **宛先は「審査できる人」で、モデレーターではない。** 審査 endpoint は
+	// `canManageCustomEmojis` で gate されており、`HasRolePolicy` が短絡する
+	// のは root と管理者だけ (モデレーターは短絡しない)。モデレーターへ配ると
+	// 「届いたのに押せない」「押せるのに届かない」が同時に起きる。
+	TypeEmojiApplicationReceived Type = "emojiApplicationReceived"
+	// TypeSignupApplicationReceived tells moderators that a new account signup
+	// request arrived (#2987).
+	//
+	// 審査 endpoint (`admin/signup-application/*`) は `RequireModerator` なので、
+	// 宛先は `GetModerators()` (モデレーター + 管理者 + root) とそのまま一致する。
+	TypeSignupApplicationReceived Type = "signupApplicationReceived"
 	// TypeScheduledNotePosted / TypeScheduledNotePostFailed は upstream
 	// Misskey TS の \`PostScheduledNoteProcessorService\` が発火する 2 種類
 	// の通知 (#1045 Phase 2-B)。posted は \`noteId\` を Extra (or NoteID) に
@@ -78,6 +100,16 @@ const (
 	// Extra["invitationId"] に invitation ID を持ち、entity 側で read 時に packed
 	// ChatRoomInvitation へ解決する (招待削除済なら通知を drop)。
 	TypeChatRoomInvitationReceived Type = "chatRoomInvitationReceived"
+	// TypeAbuseReport: 通報が作られた時にモデレーター / 管理者へ送る通知
+	// (#2868)。**mk-go 固有** — upstream は通報を email / system webhook /
+	// admin stream でしか流さず、通知欄に残る形を持たない。
+	//
+	// notifier は通報者。Extra に reportId / targetUserId を持ち、frontend は
+	// reportId で管理画面の該当通報へ飛ぶ。**通報コメントは持たない** —
+	// 定型フォームの全文が入るので通知欄では読めず、出さない以上 Redis に
+	// 本文の複製を残す理由が無い。read 時に現在の状態 (resolved / resolvedAs /
+	// assigneeId) を引き直して載せる。
+	TypeAbuseReport Type = "abuseReport"
 )
 
 // MaxPerUser caps how many notifications are kept per user in the Redis stream.
@@ -177,9 +209,22 @@ type Service struct {
 	keyPrefix           string // TS drop-in互換用 `<host>:` prefix
 	publisher           StreamingPublisher
 	mainStreamPublisher MainStreamPublisher
+	readAllPusher       ReadAllPusher
 	packer              Packer
 	noteUnreadRepo      repository.NoteUnreadRepository
 	unreadPublishDelay  time.Duration
+	policyResolver      PolicyResolver
+}
+
+// PolicyResolver reports the notification types a user has opted out of
+// through role policy (#2898).
+//
+// **狭い interface で受ける。** policy map をそのまま渡すと、この package が
+// policy のキー名と値の型を知ることになる。
+type PolicyResolver interface {
+	// OptOutNotificationTypes returns the opted-out type names for userID.
+	// An empty or nil result means "receive everything".
+	OptOutNotificationTypes(userID string) []string
 }
 
 // NewService constructs a new NotificationService.
@@ -216,6 +261,24 @@ func (s *Service) SetMainStreamPublisher(p MainStreamPublisher) {
 	s.mainStreamPublisher = p
 }
 
+// ReadAllPusher delivers the Web Push half of upstream's
+// postReadAllNotifications. Optional — nil disables the push.
+type ReadAllPusher interface {
+	PushReadAllNotifications(userID string)
+}
+
+// SetReadAllPusher attaches the Web Push sender used alongside the
+// `readAllNotifications` main stream event.
+//
+// upstream の postReadAllNotifications は main stream への publish と Web Push の
+// **2 つ**を送る (NotificationService.ts)。mk-go は前者しか送っておらず、
+// Service Worker 側の readAllNotifications 分岐 (表示中の OS 通知を閉じる) が
+// 一度も発火していなかった。sw_subscription の列も /api/sw/* の受け口も揃って
+// いるのに producer だけ無い状態だったので、設定を ON にしても何も起きなかった。
+func (s *Service) SetReadAllPusher(p ReadAllPusher) {
+	s.readAllPusher = p
+}
+
 // SetNoteUnreadRepo attaches a NoteUnreadRepository. When set, HasUnreadSpecifiedNotes
 // queries the note_unread table (本家相当) instead of scanning the notification
 // stream (#319). Optional — nil keeps the legacy proxy implementation which
@@ -231,6 +294,32 @@ func (s *Service) SetPacker(p Packer) {
 	s.packer = p
 }
 
+// SetPolicyResolver wires role-policy based notification opt-out (#2898).
+//
+// **router で配線しないと効かない。** 未配線なら全ての通知が通る
+// (fail-open) ので、配線漏れは「設定したのに効かない」形で現れる。
+// internal/entitycompat の wiring gate がそれを検出する。
+func (s *Service) SetPolicyResolver(r PolicyResolver) {
+	s.policyResolver = r
+}
+
+// passesRolePolicy reports whether the notifiee's roles permit receiving a
+// notification of the given type.
+//
+// 未配線 / 空の一覧は許可側に倒す。通知の取りこぼしより「切ったのに届く」
+// ほうが害が小さく、passesReceiveConfig (個人ごと) の fail-soft とも揃う。
+func (s *Service) passesRolePolicy(notifieeID string, typ Type) bool {
+	if s.policyResolver == nil {
+		return true
+	}
+	for _, t := range s.policyResolver.OptOutNotificationTypes(notifieeID) {
+		if t == string(typ) {
+			return false
+		}
+	}
+	return true
+}
+
 // Errors returned by Service.
 var (
 	// ErrSelfNotification is returned when attempting to create a notification where notifier == notifiee.
@@ -239,6 +328,11 @@ var (
 
 // Create writes a notification entry to the user's notification stream.
 // notifier == notifiee の場合は何もしない (Misskey本家の挙動を踏襲)。
+// Create persists a notification and publishes the stream events for it.
+//
+// **抑制されると (nil, nil) を返す。** ロール policy の opt-out
+// (SetPolicyResolver) に当たった場合で、エラーではない。戻り値の
+// Notification を使う呼び出し元は nil を確認すること。
 func (s *Service) Create(ctx context.Context, in CreateInput) (*Notification, error) {
 	return s.createWithPush(ctx, in, nil)
 }
@@ -259,6 +353,14 @@ func (s *Service) createWithPush(ctx context.Context, in CreateInput, pushFn fun
 	}
 	if in.NotifierID != "" && in.NotifierID == in.NotifieeID {
 		return nil, ErrSelfNotification
+	}
+	// ロール単位の opt-out (#2898)。**Hook ではなく Service に置く** —
+	// 固有の通知は API から直接 Create を呼ぶ経路があり、Hook 側の
+	// passesReceiveConfig (個人ごと) だけではそこを通らない。
+	//
+	// 抑制は (nil, nil)。エラーではないので呼び出し元のログに出さない。
+	if !s.passesRolePolicy(in.NotifieeID, in.Type) {
+		return nil, nil
 	}
 
 	now := time.Now()
@@ -520,17 +622,38 @@ func (s *Service) scheduleUnreadPublish(notifieeID, streamID string, packed any,
 }
 
 // MarkAllAsRead advances the user's notification read marker to the newest
-// stream entry and, only when the marker actually moves forward, publishes
-// `readAllNotifications` to the user's main stream. The publish guard
-// matches upstream TS NotificationService.readAllNotification — without it
-// every `notifications-grouped` fetch would re-emit `readAllNotifications`
-// and clobber any pending `unreadNotification` for the same user, leaving
-// the badge stuck at 0 (#420 follow-up).
+// stream entry and, unless force is set, publishes `readAllNotifications` to
+// the user's main stream only when the marker actually moves forward. The
+// publish guard matches upstream TS NotificationService.readAllNotification —
+// without it every `notifications-grouped` fetch would re-emit
+// `readAllNotifications` and clobber any pending `unreadNotification` for the
+// same user, leaving the badge stuck at 0 (#420 follow-up).
+//
+// force は upstream の `readAllNotification(userId, force = false)` と同じ役割で、
+// **明示的な既読操作からの復帰手段**にあたる (#2831)。バッジの数値はサーバーが
+// 持たず `$i.unreadNotificationsCount` というクライアント側のカウンタでしかない
+// ので、`readAllNotifications` を 1 度でも取りこぼす (WebSocket 切断中に publish
+// される。pubsub なので再送は無い) と、読み取り位置はもう最新まで進んでいて
+// guard に阻まれる。**恒久的に固まるわけではない** — 次の通知が届けば読み取り
+// 位置がまた古くなるので、それを読んだ時点で publish される。逆に言えば、次の
+// 通知が来るまでバッジは残ったままになる。upstream が
+// `notifications/mark-all-as-read` だけ force で呼ぶのはこのためで、mk-go は
+// これを移植しておらず**ボタンを押しても復帰できなかった**。暗黙既読
+// (i/notifications 系の maybeMarkAsRead / WebSocket の readNotification) は
+// upstream と同じく force を立てない。
 //
 // note_unread repository が注入されていれば同時にユーザー分の行を全削除し
 // (hasUnreadSpecifiedNotes / hasUnreadMentions を false に戻すため)、
 // Redis SET 失敗時は note_unread を温存して再試行で整合性を担保する。
-func (s *Service) MarkAllAsRead(ctx context.Context, userID string) error {
+func (s *Service) MarkAllAsRead(ctx context.Context, userID string, force bool) error {
+	// **既読位置を先に読む** (upstream readAllNotification と同じ順序)。逆にすると、
+	// 2 つの既読要求が並走したとき (WebSocket の readNotification と通知一覧の暗黙
+	// 既読は実際に同時に走る) 後発が書いた新しい位置を先発が読んでしまい、
+	// 「自分が見た最新 < 既読位置」で hadUnread が false に倒れる。判定が
+	// publish しない側へ偏るのは、まさにこのバグの失敗モードそのもの。
+	// `Get` の Redis Nil error は「初回 = 未読あり」として扱う。
+	prev, gerr := s.client.Get(ctx, s.readKey(userID)).Result()
+
 	res, err := s.client.XRevRangeN(ctx, s.streamKey(userID), "+", "-", 1).Result()
 	if err != nil {
 		return err
@@ -543,8 +666,6 @@ func (s *Service) MarkAllAsRead(ctx context.Context, userID string) error {
 	}
 	latestNotifID := res[0].ID
 	// 直前の既読 ID と比較して、実際に進む場合だけ publish する。
-	// `Get` の Redis Nil error は「初回 = 未読あり」として扱う。
-	prev, gerr := s.client.Get(ctx, s.readKey(userID)).Result()
 	hadUnread := gerr != nil || prev == "" || prev < latestNotifID
 	if err := s.client.Set(ctx, s.readKey(userID), latestNotifID, 0).Err(); err != nil {
 		return err
@@ -552,8 +673,16 @@ func (s *Service) MarkAllAsRead(ctx context.Context, userID string) error {
 	// Redis SET成功後にnote_unreadを消す (SET失敗時は温存して次回retryで
 	// 両方更新されることを期待する)。
 	s.clearNoteUnread(userID)
-	if hadUnread && s.mainStreamPublisher != nil {
-		s.mainStreamPublisher.PublishMainEvent(userID, "readAllNotifications", nil)
+	if force || hadUnread {
+		// upstream postReadAllNotifications と同じく main stream と Web Push の
+		// 両方へ送る。SW 側の readAllNotifications は表示中の OS 通知を閉じる
+		// だけで mark-all-as-read を呼び返さないのでループしない。
+		if s.mainStreamPublisher != nil {
+			s.mainStreamPublisher.PublishMainEvent(userID, "readAllNotifications", nil)
+		}
+		if s.readAllPusher != nil {
+			s.readAllPusher.PushReadAllNotifications(userID)
+		}
 	}
 	return nil
 }

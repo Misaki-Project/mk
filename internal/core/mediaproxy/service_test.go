@@ -1,15 +1,18 @@
 package mediaproxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -86,6 +89,22 @@ func makePNG() []byte {
 	return w.data
 }
 
+// makeBadgePNG builds a 100x100 image with a horizontal gradient, so the badge
+// pipeline's entropy guard (#2920) does not skip it. makePNG is a solid colour
+// and is intentionally kept that way — it exercises the skip path.
+func makeBadgePNG() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			v := uint8(x * 255 / 99)
+			img.Set(x, y, color.RGBA{R: v, G: v, B: v, A: 255})
+		}
+	}
+	w := &byteWriter{}
+	_ = png.Encode(w, img)
+	return w.data
+}
+
 type byteWriter struct {
 	data []byte
 }
@@ -104,6 +123,25 @@ func TestAuthorize_ValidHMAC(t *testing.T) {
 
 	err := s.Authorize(context.Background(), url, sig)
 	assert.NoError(t, err)
+}
+
+// **期限付きの署名も受ける (#3037)。** `/url` が発行する形。
+func TestAuthorize_ValidExpiringHMAC(t *testing.T) {
+	s := testService(map[string]bool{})
+	target := "https://evil.example/anything.png"
+
+	sig := SignURLUntil([]byte("test-secret"), target, time.Now().Add(time.Hour))
+	assert.NoError(t, s.Authorize(context.Background(), target, sig))
+}
+
+// **期限を過ぎたら allowlist に落ちる。** allowlist に無い URL なので
+// `ErrUnauthorized`。
+func TestAuthorize_ExpiredHMACIsUnauthorized(t *testing.T) {
+	s := testService(map[string]bool{})
+	target := "https://evil.example/anything.png"
+
+	sig := SignURLUntil([]byte("test-secret"), target, time.Now().Add(-time.Second))
+	assert.ErrorIs(t, s.Authorize(context.Background(), target, sig), ErrUnauthorized)
 }
 
 func TestAuthorize_InvalidHMAC_AllowlistedURL(t *testing.T) {
@@ -142,13 +180,13 @@ func TestFetch_RemoteImage(t *testing.T) {
 	imgData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/img.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -162,13 +200,13 @@ func TestFetch_RemoteImage_Emoji(t *testing.T) {
 	imgData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/emoji.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/emoji.png", ModeEmoji, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/emoji.png", ModeEmoji, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -179,13 +217,13 @@ func TestFetch_RemoteImage_Avatar(t *testing.T) {
 	imgData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/avatar.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/avatar.png", ModeAvatar, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/avatar.png", ModeAvatar, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -212,13 +250,13 @@ func TestFetch_RemoteImage_SniffsUnknownBinary(t *testing.T) {
 					// Go は書き込み時に自動で sniff するので、明示的に消す。
 					w.Header()["Content-Type"] = nil
 				}
-				w.Write(imgData)
+				_, _ = w.Write(imgData)
 			}))
 			defer ts.Close()
 
 			s := testService(map[string]bool{ts.URL + "/avatar.png": true})
 
-			result, err := s.Fetch(context.Background(), ts.URL+"/avatar.png", ModeAvatar, FormatWebP)
+			result, err := s.Fetch(context.Background(), ts.URL+"/avatar.png", ModeAvatar, FormatWebP, true)
 			require.NoError(t, err)
 			defer result.Body.Close()
 
@@ -242,13 +280,13 @@ func TestFetch_RemoteImage_Static(t *testing.T) {
 	imgData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/img.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeStatic, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeStatic, FormatWebP, false)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -259,13 +297,13 @@ func TestFetch_RemoteImage_Preview(t *testing.T) {
 	imgData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/img.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModePreview, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModePreview, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -273,16 +311,19 @@ func TestFetch_RemoteImage_Preview(t *testing.T) {
 }
 
 func TestFetch_RemoteImage_Badge(t *testing.T) {
-	imgData := makePNG()
+	// **単色だと entropy guard に落ちて 404 になる (#2920)。** グラデーションで
+	// 中身のある画像を使う。単色が 404 になること自体は
+	// TestProcessBadge_BlankImageIs404 が固定する。
+	imgData := makeBadgePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/img.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeBadge, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeBadge, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -296,13 +337,13 @@ func TestFetch_RemoteImage_AnimatedGIF_PassThroughOnEmoji(t *testing.T) {
 	gifData := []byte("GIF89a") // valid な animation でなくとも MIME type で判定される
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/gif")
-		w.Write(gifData)
+		_, _ = w.Write(gifData)
 	}))
 	defer ts.Close()
 	s := testService(map[string]bool{ts.URL + "/anim.gif": true})
 
 	for _, mode := range []ProxyMode{ModeEmoji, ModeAvatar, ModePreview} {
-		result, err := s.Fetch(context.Background(), ts.URL+"/anim.gif", mode, FormatWebP)
+		result, err := s.Fetch(context.Background(), ts.URL+"/anim.gif", mode, FormatWebP, true)
 		require.NoError(t, err, "mode=%v", mode)
 		assert.Equal(t, "image/gif", result.ContentType, "mode=%v should preserve animated MIME", mode)
 		result.Body.Close()
@@ -313,12 +354,12 @@ func TestFetch_RemoteImage_AnimatedAPNG_PassThroughOnEmoji(t *testing.T) {
 	pngData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/apng")
-		w.Write(pngData)
+		_, _ = w.Write(pngData)
 	}))
 	defer ts.Close()
 	s := testService(map[string]bool{ts.URL + "/anim.apng": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/anim.apng", ModeEmoji, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/anim.apng", ModeEmoji, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 	assert.Equal(t, "image/apng", result.ContentType)
@@ -342,7 +383,7 @@ func TestFetch_Remote404(t *testing.T) {
 
 	s := testService(map[string]bool{ts.URL + "/missing.png": true})
 
-	_, err := s.Fetch(context.Background(), ts.URL+"/missing.png", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), ts.URL+"/missing.png", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -358,7 +399,7 @@ func TestFetch_LocalFile(t *testing.T) {
 		nil,
 	)
 
-	result, err := s.Fetch(context.Background(), "https://example.com/files/abc123", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), "https://example.com/files/abc123", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -373,13 +414,13 @@ func TestFetch_FaviconWithIANAMIMETypeAccepted(t *testing.T) {
 	imgData := []byte{0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10} // bogus ico header
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/vnd.microsoft.icon")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/favicon.ico": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/favicon.ico", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/favicon.ico", ModeDefault, FormatWebP, true)
 	require.NoError(t, err, "image/vnd.microsoft.icon must pass through")
 	defer result.Body.Close()
 	assert.Equal(t, "image/vnd.microsoft.icon", result.ContentType)
@@ -391,13 +432,13 @@ func TestFetch_ContentTypeWithParameters(t *testing.T) {
 	imgData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/png; charset=binary")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/img.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeDefault, FormatWebP, true)
 	require.NoError(t, err, "media type should match after stripping parameters")
 	defer result.Body.Close()
 	assert.Equal(t, "image/png", result.ContentType)
@@ -408,13 +449,13 @@ func TestFetch_FaviconWithLegacyMIMETypeAccepted(t *testing.T) {
 	imgData := []byte{0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/x-icon")
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/favicon.ico": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/favicon.ico", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/favicon.ico", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 	assert.Equal(t, "image/x-icon", result.ContentType)
@@ -423,13 +464,13 @@ func TestFetch_FaviconWithLegacyMIMETypeAccepted(t *testing.T) {
 func TestFetch_UnsafeMIME_Rejected(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript")
-		w.Write([]byte("alert('xss')"))
+		_, _ = w.Write([]byte("alert('xss')"))
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/evil.js": true})
 
-	_, err := s.Fetch(context.Background(), ts.URL+"/evil.js", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), ts.URL+"/evil.js", ModeDefault, FormatWebP, true)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "rejected MIME type")
 }
@@ -506,13 +547,13 @@ func TestBrowsersafeMIMEs(t *testing.T) {
 func TestFetch_SVG_ReturnsDummyPNG(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/svg+xml")
-		w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>`))
+		_, _ = w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>`))
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/icon.svg": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/icon.svg", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/icon.svg", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -530,7 +571,7 @@ func TestFetch_LocalFile_NotFound(t *testing.T) {
 		nil,
 	)
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/nonexistent", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/nonexistent", ModeDefault, FormatWebP, true)
 	assert.Error(t, err)
 }
 
@@ -544,7 +585,7 @@ func TestFetch_LocalFile_EmptyAccessKey(t *testing.T) {
 		nil,
 	)
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrBadRequest)
 }
 
@@ -560,7 +601,7 @@ func TestFetch_LocalFile_WithPathSegments(t *testing.T) {
 	)
 
 	// /files/abc123/extra のようなパスでもabc123だけ使う
-	result, err := s.Fetch(context.Background(), "https://example.com/files/abc123/extra", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), "https://example.com/files/abc123/extra", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 	assert.Equal(t, "image/png", result.ContentType)
@@ -577,7 +618,7 @@ func TestFetch_LocalFile_Emoji(t *testing.T) {
 		nil,
 	)
 
-	result, err := s.Fetch(context.Background(), "https://example.com/files/emoji1", ModeEmoji, FormatWebP)
+	result, err := s.Fetch(context.Background(), "https://example.com/files/emoji1", ModeEmoji, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 	assert.Equal(t, "image/webp", result.ContentType)
@@ -591,7 +632,7 @@ func TestFetch_RemoteServerError(t *testing.T) {
 
 	s := testService(map[string]bool{ts.URL + "/error.png": true})
 
-	_, err := s.Fetch(context.Background(), ts.URL+"/error.png", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), ts.URL+"/error.png", ModeDefault, FormatWebP, true)
 	assert.Error(t, err)
 }
 
@@ -603,7 +644,7 @@ func TestFetch_RemoteGone(t *testing.T) {
 
 	s := testService(map[string]bool{ts.URL + "/deleted.png": true})
 
-	_, err := s.Fetch(context.Background(), ts.URL+"/deleted.png", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), ts.URL+"/deleted.png", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrNotFound)
 }
 
@@ -611,13 +652,13 @@ func TestFetch_RemoteNoContentType(t *testing.T) {
 	imgData := makePNG()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// Content-Typeヘッダなしで返す
-		w.Write(imgData)
+		_, _ = w.Write(imgData)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/img.png": true})
 
-	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/img.png", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 	// auto-detected from content
@@ -634,13 +675,15 @@ func TestProcessResize_NonConvertibleImage(t *testing.T) {
 	assert.Equal(t, "application/octet-stream", result.ContentType)
 }
 
+// **変換できない MIME は 404 (#2920)。** upstream は
+// `requiresImageConversion && !isConvertibleImage` で `Unexpected mime` を
+// 404 にする。**本番経路では Fetch 側の同じ判定が先に効く**ので挙動は変わらないが、
+// processBadge 単体の契約として揃えておく。
 func TestProcessBadge_NonConvertibleImage(t *testing.T) {
 	s := testService(nil)
 	data := []byte("not an image")
-	result, err := s.processBadge(data, "text/plain")
-	require.NoError(t, err)
-	defer result.Body.Close()
-	assert.Equal(t, "text/plain", result.ContentType)
+	_, err := s.processBadge(data, "text/plain")
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
 func TestResizeToHeight_SmallImage(t *testing.T) {
@@ -686,12 +729,12 @@ func TestFetch_PassThrough_JXR(t *testing.T) {
 	jxrBytes := []byte("II\xbc\x01" + "fakejxrpayload")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/jxr")
-		w.Write(jxrBytes)
+		_, _ = w.Write(jxrBytes)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/img.jxr": true})
-	result, err := s.Fetch(context.Background(), ts.URL+"/img.jxr", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/img.jxr", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -705,12 +748,12 @@ func TestFetch_PassThrough_MNG(t *testing.T) {
 	mngBytes := []byte("\x8aMNG\r\n\x1a\n" + "fakemngpayload")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "video/x-mng")
-		w.Write(mngBytes)
+		_, _ = w.Write(mngBytes)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/anim.mng": true})
-	result, err := s.Fetch(context.Background(), ts.URL+"/anim.mng", ModeDefault, FormatWebP)
+	result, err := s.Fetch(context.Background(), ts.URL+"/anim.mng", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer result.Body.Close()
 
@@ -788,7 +831,7 @@ func TestResizeFit_LargeImage(t *testing.T) {
 func TestFetch_Remote_InvalidURL(t *testing.T) {
 	s := testService(map[string]bool{"not://valid": true})
 
-	_, err := s.Fetch(context.Background(), "not://valid", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), "not://valid", ModeDefault, FormatWebP, true)
 	assert.Error(t, err)
 }
 
@@ -814,7 +857,7 @@ func TestProcessResize_HeightOnly(t *testing.T) {
 
 func TestProcessBadge_ValidImage(t *testing.T) {
 	s := testService(nil)
-	imgData := makePNG() // 100x100
+	imgData := makeBadgePNG() // 100x100 のグラデーション
 
 	result, err := s.processBadge(imgData, "image/png")
 	require.NoError(t, err)
@@ -822,8 +865,14 @@ func TestProcessBadge_ValidImage(t *testing.T) {
 	assert.Equal(t, "image/png", result.ContentType)
 }
 
-func TestAuthorize_AllowlistError(t *testing.T) {
-	// errorAllowlistはIsAllowedURLでエラーを返す
+// allowlist を**引けなかった**ことと「許可されていない」を分ける (#3036)。
+//
+// **潰すと handler が 403 + `Cache-Control: max-age=86400` で返す。**
+// PostgreSQL の瞬断のあいだ、`sig` を持たないすべてのプロキシ URL が 403 に
+// なり 1 日焼き付く。#2913 と同じ症状で #2792 にも反する。#3034 が直した
+// 「リモート取得の失敗を 404 に潰す」より影響が広い — あちらは 1 URL ずつ
+// だが、こちらは障害中の全 URL が同時に焼き付く。
+func TestAuthorize_AllowlistErrorIsNotUnauthorized(t *testing.T) {
 	s := NewService(
 		"https://example.com",
 		"Misskey/2026.5.1 (https://example.com)",
@@ -834,13 +883,172 @@ func TestAuthorize_AllowlistError(t *testing.T) {
 	)
 
 	err := s.Authorize(context.Background(), "https://example.com/img.png", "")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrAllowlistUnavailable)
+	assert.NotErrorIs(t, err, ErrUnauthorized, "DB 障害を 403 に潰している")
+	// **元の原因を捨てない。** 捨てるとログから障害の中身が消える。
+	assert.Contains(t, err.Error(), "db connection failed")
+}
+
+// 列に入りえない URL は DB を引く前に弾く (#3036、doctrine は #3025)。
+//
+// **未認証の利用者が 503 とエラーログを任意に生成できてしまう。**
+// `IsAllowedURL` は `?url` を無検査で 11 箇所に bind する (4 テーブルの UNION)
+// ので、PostgreSQL が受け付けないバイト列はクエリごと落とす。それを
+// `ErrAllowlistUnavailable` に流すと、この変更が守ろうとしている
+// 「監視で本物の障害が埋もれない」を自分で壊す。
+//
+// 実測 (実 PostgreSQL): 0xff と孤立サロゲートは SQLSTATE 22021。NUL は
+// **プロトコルで値が違う** — 本番の extended protocol では同じ 22021、
+// テストハーネスの simple protocol では 08P01。
+// 判定は `colfit.Storable` が NUL と不正な UTF-8 の両方を見る (以前は NUL しか
+// 見ておらず、この経路だけが `utf8.ValidString` を併記していた)。
+//
+// **このテスト自体は PostgreSQL に触らない** — 見ているのは「引く前に弾く」
+// ことだけで、上の実測は guard がなぜ要るかの根拠。
+func TestAuthorize_UnstorableURLIsRejectedBeforeQuery(t *testing.T) {
+	for name, raw := range map[string]string{
+		// バイト列は Go のエスケープではなく []byte で組む (ソースを ASCII に保つ)。
+		"NUL":            "https://example.com/a" + string([]byte{0x00}) + "b.png",
+		"invalid UTF-8":  "https://example.com/a" + string([]byte{0xff}) + "b.png",
+		"lone surrogate": "https://example.com/a" + string([]byte{0xed, 0xa0, 0x80}) + "b.png",
+	} {
+		t.Run(name, func(t *testing.T) {
+			// **呼ばれたら落ちる checker を渡す。** エラーを返すだけの
+			// checker だと、guard を `IsAllowedURL` の**後ろ**へ動かす変異が
+			// 素通りする (レビュー 2 周目で実測)。#3025 が
+			// 「guard の分岐が実際に return すること」「順序を見ること」と
+			// 書いているのと同じ形。
+			checker := &failingAllowlist{t: t}
+			s := NewService(
+				"https://example.com",
+				"Misskey/2026.5.1 (https://example.com)",
+				&mockStorage{files: map[string][]byte{}},
+				checker,
+				[]byte("test-secret"),
+				nil,
+			)
+
+			err := s.Authorize(context.Background(), raw, "")
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrUnauthorized,
+				"列に入りえない値を 503 に流している")
+			assert.NotErrorIs(t, err, ErrAllowlistUnavailable)
+			assert.False(t, checker.called, "DB を引いてしまっている")
+		})
+	}
+}
+
+// 署名があれば列に入りえない値でも先に通る (順序を変えていないこと)。
+func TestAuthorize_HMACStillWinsOverStorableCheck(t *testing.T) {
+	s := testService(nil)
+	raw := "https://example.com/a" + string([]byte{0x00}) + "b.png"
+	require.NoError(t, s.Authorize(context.Background(), raw, s.SignURL(raw)))
+}
+
+// 本当に許可されていないときは従来どおり ErrUnauthorized。
+//
+// **これが無いと「全部 503 にする」実装が緑で通る。** それをやると、
+// 許可していない URL まで 5 分ごとに引き直すことになる。
+func TestAuthorize_NotAllowedStaysUnauthorized(t *testing.T) {
+	s := testService(map[string]bool{"https://example.com/ok.png": true})
+
+	err := s.Authorize(context.Background(), "https://example.com/no.png", "")
+	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrUnauthorized)
+	assert.NotErrorIs(t, err, ErrAllowlistUnavailable)
+}
+
+// 利用者の離脱が DB 障害に化けないこと (#3036)。
+//
+// `IsAllowedURL` は ctx を取るので、離脱すると driver が
+// `context.Canceled` を返す。`%w` を落とすと handler が 499 に
+// 振り分けられなくなり、離脱の件数が 503 として監視に積み上がる。
+func TestAuthorize_ClientCancelSurvives(t *testing.T) {
+	s := NewService(
+		"https://example.com",
+		"Misskey/2026.5.1 (https://example.com)",
+		&mockStorage{files: map[string][]byte{}},
+		&ctxErrAllowlist{},
+		[]byte("test-secret"),
+		nil,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.Authorize(ctx, "https://example.com/img.png", "")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotErrorIs(t, err, ErrUnauthorized)
+}
+
+// 利用者の離脱を Error ログに混ぜない (#3036)。
+//
+// **DB 障害の指標が汚れる。** handler は離脱を 499 に分類して何も書かないのに、
+// service 側が Error を出すと、モバイル回線のスクロール離脱が
+// 「allowlist lookup failed」として積み上がる。
+func TestAuthorize_CancelDoesNotLogError(t *testing.T) {
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	s := NewService(
+		"https://example.com",
+		"Misskey/2026.5.1 (https://example.com)",
+		&mockStorage{files: map[string][]byte{}},
+		&ctxErrAllowlist{},
+		[]byte("test-secret"),
+		nil,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.Error(t, s.Authorize(ctx, "https://example.com/img.png", ""))
+	assert.NotContains(t, buf.String(), "allowlist lookup failed",
+		"利用者の離脱を DB 障害として記録している")
+
+	// **DB 障害のほうは残る** (抑止しすぎていないこと)。
+	buf.Reset()
+	s2 := NewService(
+		"https://example.com",
+		"Misskey/2026.5.1 (https://example.com)",
+		&mockStorage{files: map[string][]byte{}},
+		&errorAllowlist{},
+		[]byte("test-secret"),
+		nil,
+	)
+	require.Error(t, s2.Authorize(context.Background(), "https://example.com/img.png", ""))
+	assert.Contains(t, buf.String(), "allowlist lookup failed")
+}
+
+// failingAllowlist fails the test if the query is reached at all.
+//
+// **「引く前に弾く」を検査するにはこれが要る。** エラーを返すだけの
+// checker では、guard を後ろへ動かしても結果の error が同じになるので
+// 変異が素通りする。
+type failingAllowlist struct {
+	t      *testing.T
+	called bool
+}
+
+func (e *failingAllowlist) IsAllowedURL(_ context.Context, url string) (bool, error) {
+	e.called = true
+	e.t.Errorf("IsAllowedURL が呼ばれた (引く前に弾けていない): %q", url)
+	return false, nil
 }
 
 type errorAllowlist struct{}
 
 func (e *errorAllowlist) IsAllowedURL(_ context.Context, _ string) (bool, error) {
 	return false, fmt.Errorf("db connection failed")
+}
+
+// ctxErrAllowlist mirrors a driver that surfaces the caller's cancellation.
+type ctxErrAllowlist struct{}
+
+func (e *ctxErrAllowlist) IsAllowedURL(ctx context.Context, _ string) (bool, error) {
+	return false, ctx.Err()
 }
 
 func TestFetch_LocalFile_TooLarge(t *testing.T) {
@@ -855,7 +1063,7 @@ func TestFetch_LocalFile_TooLarge(t *testing.T) {
 		nil,
 	)
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/big", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/big", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrTooLarge)
 }
 
@@ -870,7 +1078,7 @@ func TestFetch_Remote_ContentLengthExceedsMax(t *testing.T) {
 
 	s := testService(map[string]bool{ts.URL + "/huge.png": true})
 
-	_, err := s.Fetch(context.Background(), ts.URL+"/huge.png", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), ts.URL+"/huge.png", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrTooLarge)
 }
 
@@ -881,13 +1089,13 @@ func TestFetch_Remote_BodyExceedsMaxNoContentLength(t *testing.T) {
 	bigBody := make([]byte, maxDownload+100)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
-		w.Write(bigBody)
+		_, _ = w.Write(bigBody)
 	}))
 	defer ts.Close()
 
 	s := testService(map[string]bool{ts.URL + "/huge.png": true})
 
-	_, err := s.Fetch(context.Background(), ts.URL+"/huge.png", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), ts.URL+"/huge.png", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrTooLarge)
 }
 

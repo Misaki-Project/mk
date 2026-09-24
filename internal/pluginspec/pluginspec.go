@@ -26,7 +26,7 @@ const DefaultDir = "plugin"
 //
 // **plugintest も対象にする。** 公開パッケージである以上、export が増えれば
 // semver の対象になる。テスト用だからと外すと、そこだけ黙って育つ。
-var TrackedDirs = []string{"plugin", "plugin/plugintest"}
+var TrackedDirs = []string{"plugin", "plugin/imagedecode", "plugin/peercache", "plugin/plugintest"}
 
 // DefaultGolden is where the snapshot lives.
 const DefaultGolden = "internal/entitycompat/testdata/golden_plugin_surface.txt"
@@ -54,19 +54,29 @@ func SurfaceAll(root string, dirs []string) ([]string, error) {
 // 「引数が 1 つ増えた」ような破壊的変更を検出できない。
 func Surface(dir string) ([]string, error) {
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	// **`parser.ParseDir` は使わない** (Go 1.25 で非推奨)。非推奨の理由は
+	// 「build tag を見ないので package とファイルの対応が不正確」だが、ここは
+	// ディレクトリ内の **.go を全部見たい**ので、その不正確さがむしろ要件に合う。
+	// 代替として案内される `go/packages` は `go list` を起動するぶん重く、package
+	// 単位で解決するのでディレクトリを直接列挙したいここには合わない (型チェックは
+	// `NeedTypes` か `NeedTypesInfo` を渡したときだけ走るので、そこは理由にならない)。
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("%s を解析できません: %w", dir, err)
 	}
 
 	var out []string
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			for _, decl := range file.Decls {
-				out = append(out, declEntries(fset, decl)...)
-			}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			return nil, fmt.Errorf("%s を解析できません: %w", dir, err)
+		}
+		for _, decl := range file.Decls {
+			out = append(out, declEntries(fset, decl)...)
 		}
 	}
 	sort.Strings(out)

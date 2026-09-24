@@ -35,9 +35,12 @@ type Meta struct {
 	CacheRemoteSensitiveFiles bool `gorm:"column:cacheRemoteSensitiveFiles;default:true" json:"cacheRemoteSensitiveFiles"`
 	EmailRequiredForSignup    bool `gorm:"column:emailRequiredForSignup;default:false" json:"emailRequiredForSignup"`
 	// ApprovalRequiredForSignup turns on approval-based registration (#2554)。
-	// mk-go 独自。**単体では登録を止めない** — 実際のゲートは
-	// disableRegistration + 招待コードで、承認は内部で registration_ticket を
-	// 発行して通す。両方を設定する運用が前提。
+	// mk-go 独自。**これ自体がゲート** (#2557) — 有効時は `/api/signup` を 403 で
+	// 閉じ、申請と承認を経た `/api/signup-application/register` だけを入口にする
+	// (メール必須の構成では、実際にアカウントができるのは確認リンクを踏んだ
+	// `/api/signup-pending`)。
+	// `disableRegistration` と重ねると承認制の入口まで閉じる (`approvalOpen` が
+	// 503) ので、有効にする更新では同じ更新で登録を開放する (#2565 / #2803)。
 	ApprovalRequiredForSignup bool `gorm:"column:approvalRequiredForSignup;default:false" json:"approvalRequiredForSignup"`
 	// SignupApplicationForm is the admin-defined application form (#2570)。
 	// 要素の配列で、各要素は {label, type, required, maxLength}。
@@ -57,11 +60,11 @@ type Meta struct {
 	// Email
 	EnableEmail bool    `gorm:"column:enableEmail;default:false" json:"enableEmail"`
 	Email       *string `gorm:"column:email;type:varchar(1024)" json:"email"`
-	SmtpSecure  bool    `gorm:"column:smtpSecure;default:false" json:"smtpSecure"`
-	SmtpHost    *string `gorm:"column:smtpHost;type:varchar(1024)" json:"smtpHost"`
-	SmtpPort    *int    `gorm:"column:smtpPort" json:"smtpPort"`
-	SmtpUser    *string `gorm:"column:smtpUser;type:varchar(1024)" json:"smtpUser"`
-	SmtpPass    *string `gorm:"column:smtpPass;type:varchar(1024)" json:"smtpPass"`
+	SMTPSecure  bool    `gorm:"column:smtpSecure;default:false" json:"smtpSecure"`
+	SMTPHost    *string `gorm:"column:smtpHost;type:varchar(1024)" json:"smtpHost"`
+	SMTPPort    *int    `gorm:"column:smtpPort" json:"smtpPort"`
+	SMTPUser    *string `gorm:"column:smtpUser;type:varchar(1024)" json:"smtpUser"`
+	SMTPPass    *string `gorm:"column:smtpPass;type:varchar(1024)" json:"smtpPass"`
 
 	// Service Worker
 	EnableServiceWorker bool    `gorm:"column:enableServiceWorker;default:false" json:"enableServiceWorker"`
@@ -122,7 +125,7 @@ type Meta struct {
 
 	// Feature flags
 	EnableFanoutTimeline           bool `gorm:"column:enableFanoutTimeline;default:true" json:"enableFanoutTimeline"`
-	EnableFanoutTimelineDbFallback bool `gorm:"column:enableFanoutTimelineDbFallback;default:true" json:"enableFanoutTimelineDbFallback"`
+	EnableFanoutTimelineDBFallback bool `gorm:"column:enableFanoutTimelineDbFallback;default:true" json:"enableFanoutTimelineDbFallback"`
 	ProxyRemoteFiles               bool `gorm:"column:proxyRemoteFiles;default:true" json:"proxyRemoteFiles"`
 	// ProxyAccountID is the user.id designated for instance proxy operations.
 	// Managed via admin/update-proxy-account.
@@ -199,6 +202,12 @@ type Meta struct {
 	// default:(-) で「DB 側のデフォルトに任せる」ことを GORM に指示する。
 	PreservedUsernames           StringArray `gorm:"column:preservedUsernames;type:varchar(1024)[];default:(-)" json:"preservedUsernames"`
 	ProhibitedWordsForNameOfUser StringArray `gorm:"column:prohibitedWordsForNameOfUser;type:varchar(1024)[];default:'{}'" json:"prohibitedWordsForNameOfUser"`
+	// MinimumUsernameLength は新規登録で取れる username の最小文字数 (#3015)。
+	// **mk-go 独自** — upstream の `localUsernameSchema` は `^\w{1,20}$` 固定で
+	// 設定できない。既定 1 なので既存インスタンスの挙動は変わらない。
+	// 上限側は設定可能にしない (20 を超えると TS へ戻した瞬間に frontend で
+	// 弾かれる。#800 と同型)。
+	MinimumUsernameLength int `gorm:"column:minimumUsernameLength;default:1" json:"minimumUsernameLength"`
 
 	// DeepL (2)
 	DeeplAuthKey *string `gorm:"column:deeplAuthKey;type:varchar(1024)" json:"deeplAuthKey"`

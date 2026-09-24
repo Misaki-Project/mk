@@ -14,8 +14,8 @@
 | 連合テスト | mk-go ↔ 本物の Misskey TS の AP 通信 | Docker Compose多段 | `make federation-misskey-e2e` (起動から撤去まで通し。個別に叩くなら `-up` → `-test` → `-down`) |
 | Drop-in e2e (pytest) | TS-A backend を mk-A に差し替えて state preservation 検証 | TS 2 instance + mk overlay | `make dropin-swap-test` (#365 / #367 / #372 / #374、詳細は[dropin-e2e.md](dropin-e2e.md)) |
 | Drop-in frontend e2e (cypress) | 3 TS instance + mk overlay swap で frontend 視点の互換 | cypress + 3 TS + mk-A | `make dropin-frontend-swap-test` (#380 / #381 / #387 / #394、詳細は[dropin-frontend-e2e.md](dropin-frontend-e2e.md)) |
-| Playwright e2e | mk-go と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、290 spec ファイル。PR ごとに mk-go、upstream 追従時に TS backend) |
-| 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体無改変で mk-go に向けて実行 | PostgreSQL / Redis + mk-go バイナリ | `make upstream-e2e` (#2347、25 ファイル 1245 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
+| Playwright e2e | mk-go と Misskey TS の両 backend で API/frontend 統合互換を検証 | Docker Compose 全部 | `tests/playwright/` 配下 (#744、298 spec ファイル。PR ごとに mk-go、upstream 追従時に TS backend) |
+| 本家 backend e2e | Misskey 本家の `test/e2e/**` をテスト本体無改変で mk-go に向けて実行 | PostgreSQL / Redis + mk-go バイナリ | `make upstream-e2e` (#2347、25 ファイル 1256 テスト。詳細は[upstream-backend-e2e.md](upstream-backend-e2e.md)) |
 
 ## 手元の準備
 
@@ -48,8 +48,13 @@ make test
 go test ./internal/api/notes/...
 
 # レース検出 + カバレッジ (CIと同条件)
-go test -race -count=1 -timeout 10m \
+go test -race -count=1 -shuffle=3 -timeout 10m \
   -coverprofile=coverage.out -covermode=atomic ./...
+
+# `make test` はこのうち -race / -count=1 / -shuffle=3 の 3 つが同じ (#2841)。
+# **カバレッジは取らない**ので、閾値の検査には上のコマンドを使うこと。
+# **`-race` は cgo を要求する**ので、CGO_ENABLED=0 や C コンパイラの無い環境では
+# `make test-fast` を使う (ただしそれはコミット前の検査にならない)。
 
 # カバレッジHTMLレポート
 go tool cover -html=coverage.out
@@ -69,6 +74,14 @@ go tool cover -html=coverage.out
 
 CIではパッケージごとにカバレッジを計測し、閾値未達のパッケージがあればジョブが失敗する。CI は **4-way matrix shard** で並列実行され、ImportPath 順 modulo 分配で決定的にパッケージを割り当てる (約 4.7 分 → 1.5-2 分に短縮)。
 
+CI は **`-shuffle=3` を全 shard 共通の固定値として**回す。`on` (毎回ランダム) は失敗を手元で再現できず、required check の `test` が不定期に赤くなる。**shard 番号も使わない** — shard 配属は`NR % 4` なので、テストパッケージが 1 つ増えるだけで既存パッケージの seed が変わり、順序が丸ごと入れ替わる (無関係な PR が未実行の順序を引いて赤くなる)。落ちたら`go test -race -count=1 -shuffle=3 ./<package>/` でそのまま再現する (`make test` も同条件で走る、#2841)。
+
+**1 パッケージが試す順序は 1 通り**なので、`-shuffle` だけで全ての順序依存が見つかるわけではない。seed の値を時々変えると新しい順序を試せる。
+
+**カバレッジは順序に依存しうる。** 実測で 173 パッケージ中 3 つ (`internal/core/reversi` / `internal/core/role` / `internal/testutil`) が seed によって 0.1-0.5pt 動いた。いずれも閾値まで 2pt 以上あるので現状は落ちないが、閾値ぎりぎりのパッケージを 90.0% 台で放置すると seed 変更で落ちうる。
+
+**プロセス共有の状態を張り替えるテストは必ず戻すこと。** `internal/server` の `newServer` / `New` はグローバルを 12 個 (`entity` の 7 つ: `SetMediaURLContext` / `SetAvatarDecorationLookup` / `SetCanChatLookup` / `SetUserRolesLookup` / `SetShowRemoteBadgesLookup` / `SetInstanceIconURLLookup` / `SetSilencedLookup`、加えて `notehide.SetFollowingRepo` / `coretwofactor.SetTestMode` / `meself.SetEnricher` / `password.SetCost` / `corenote.SetHookConcurrency`) 差し替える。1 度きりの起動を模したテストが戻さなかったため、後続の `avatar` / `emoji_redirect` が素の URL ではなく署名付きプロキシURL を受け取って落ちていた (5 seed すべてで失敗)。`internal/server/global_state_test.go` の `restoreProcessGlobals` を使う。`frontendutil` の loader キャッシュも同様で、fixture は `t.TempDir()` に置くので**ディレクトリが消えた後もキャッシュに内容が残る**。
+
 ## DB を使うテストの分離 (#2450)
 
 `testutil.OpenTestDB` / `MustOpenTestDB` は**呼び出し元のパッケージ専用の PostgreSQL schema** に接続する (`internal/api/gallery` なら `internal_api_gallery`)。schema 名は呼び出し元から自動で決まるので、新しいパッケージも何もしなくても隔離される。
@@ -79,6 +92,8 @@ CIではパッケージごとにカバレッジを計測し、閾値未達のパ
 
 - **DB を読み書きするテストで `OpenSharedTestDB` を使わない。** これは `internal/db` のように接続処理そのものを試すテスト専用
 - schema が分かれているので `DELETE FROM "user"` のような無条件の削除は書いてよい。ただし**それは自分の schema に閉じている前提**に依存するので、`search_path` を跨ぐ生 SQL (`public.` 明示など) を書かない
+- **システムカタログも `search_path` に従わない (#2777)。** 参照は `pg_catalog` で解決されるが、**返る行は全 schema 分**。必ず自分の schema に絞る: `pg_indexes` は `schemaname = current_schema()`、`information_schema.columns` / `.tables` は `table_schema = current_schema()` (このリポジトリで最も多いのはこちら)、`pg_class` は `pg_namespace` を join して `n.nspname = current_schema()` (`pg_class` は schema を oid で持ち `schemaname` 列が無い。`pg_attribute` は relation の oid しか持たないので `pg_class` 経由の 2 段 join になる)。**`information_schema.schemata` は対象外** — schema の一覧そのものなので絞る概念が無い。絞らないと 2 つ壊れる — (a) 他 schema の同名オブジェクトを自分のものと取り違えて regression guard が空振りし、(b) 他パッケージの `ApplyMigrations` が DDL 中だと `could not open relation with OID (SQLSTATE XX000)` で落ちる。**CI でも起きる** — shard は PostgreSQL を 1 つしか立てないので手元と同じ条件が揃い、required check の `test` が不定期に赤くなる
+- **複数行が返りうるクエリを `Scan(&string)` で受けない (#2777)。** GORM は `*string` に対し**全行を走査して dest を上書きし続ける**ので、複数行が返ると**最後の 1 行**が残る。実測では `pg_indexes` の絞りを外すと 17 件中 17 番目 (`internal_repository_ts`) の定義が返り、**それでもテストが緑のまま通っていた** — 上の (a) の実例。slice で受けて件数と schema 名を確かめる (`internal/repository/index_lookup_test.go` の `indexDef` が例)
 - 行の投入は**戻り値を検査する** (`require.NoError(t, db.Create(x).Error)`)。捨てると FK 違反が黙って流れ、「200 のはずが 400」のような原因から遠い症状に化ける
 
 migration で enum を作るときは `EXCEPTION WHEN duplicate_object THEN NULL` を使う。`pg_type WHERE typname = ...` は **schema を見ない**ため、別 schema に同名の型があるだけで作成を飛ばし、直後の `CREATE TABLE` が落ちる。
@@ -98,7 +113,7 @@ PostgreSQL は `DROP COLUMN` した列も **1 テーブル 1600 列**の上限�
 # したもので、兄弟 schema は `<package>_<suffix>` になる。
 PGPASSWORD=mk psql -h localhost -U mk -d misskey_test \
   -c 'DROP SCHEMA IF EXISTS "internal_repository" CASCADE' \
-  -c 'DROP SCHEMA IF EXISTS "internal_repository_ts" CASCADE'
+  -c 'DROP SCHEMA IF EXISTS "internal_repository_ts" CASCADE''
 ```
 
 **テストが途中で死んで schema が壊れたときも同じ手順**。`internal/core/fsck` (schema は `internal_core_fsck`) にはテーブルを一時的に rename したり制約を落として `t.Cleanup` で戻すテストがあり、プロセスが殺されると戻らない (`relation "drive_file" does not exist` 等になる)。
@@ -242,11 +257,11 @@ make federation-misskey-down
 
 `tests/playwright/` 配下の spec を mk-go と Misskey TS の **両 backend** で並列実行し、drop-in 互換 regression を PR ごとに検出する基盤。
 
-- 範囲: 290 spec ファイル (ui 194 / api 96) / 39 directory
+- 範囲: 298 spec ファイル (upstream 290 = ui 194 / api 96、mkgo 8) / 40 directory (spec を直接含むもの。`find ... -printf '%h\n' | sort -u | wc -l`)
 - トリガー: `pull_request` (paths フィルタ) + `workflow_dispatch`。**nightly ではない** (#2291 で移行)。`.github/workflows/playwright.yml`
 - **4 シャード並列** (`--shard=i/4`、`fail-fast: false`)。1 スタックに対しては直列でしか回せない (共有の root と instance meta を spec が取り合う) ので、並列度はシャードごとに独立した stack を立てて稼ぐ (#2609)
 - **TS backend は `workflow_dispatch` 専用**で PR では回らない。upstream が変わらない限り答えも変わらないため、submodule bump のタイミングだけ回す
-- spec は **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化
+- spec は原則 **backend-agnostic** (= URL 切替だけで両 backend で動く)、spec 失敗 = drop-in 互換 regression として issue 化。例外は `specs/mkgo/` の 8 件 (mk-go 独自機能を見るので公式 image では通らない)。`make playwright-ts-test` が `specs/upstream` に絞ることで除外している
 
 ### spec を書くときの注意: root の per-user quota
 

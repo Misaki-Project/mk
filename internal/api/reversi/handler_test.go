@@ -3,6 +3,7 @@ package reversi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
@@ -21,7 +23,14 @@ import (
 	"gorm.io/datatypes"
 )
 
-var errMock = assert.AnError
+// **not-found を模す。** 汎用 error だと #2792 の「DB 障害は 500」に引っかかる。
+// repository は GORM の error をそのまま返すので、テストもそれに揃える。
+var errMock = repository.ErrNotFound
+
+// errBoom is a generic failure for write paths. **not-found とは分けること** —
+// 同じ値を使い回すと、将来 write path に `IsNotFound` の分岐が入ったときに
+// これらのテストが黙って別の枝を通る (#2792)。
+var errBoom = errors.New("db down")
 
 type mockReversiRepo struct {
 	games     map[string]*model.ReversiGame
@@ -90,6 +99,27 @@ func (m *mockReversiRepo) ListByUser(userID string, limit int) ([]*model.Reversi
 		}
 	}
 	return result, nil
+}
+
+// FindPendingInvitation mirrors the repository's SQL: newest not-yet-started
+// row with User1 = inviter and User2 = invitee.
+func (m *mockReversiRepo) FindPendingInvitation(inviteeID, inviterID string) (*model.ReversiGame, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	var found *model.ReversiGame
+	for _, g := range m.games {
+		if g.IsStarted || g.IsEnded {
+			continue
+		}
+		if g.User1ID != inviterID || g.User2ID != inviteeID {
+			continue
+		}
+		if found == nil || g.ID > found.ID {
+			found = g
+		}
+	}
+	return found, nil
 }
 
 func (m *mockReversiRepo) ListByUserCursor(userID, sinceID, untilID string, limit int) ([]*model.ReversiGame, error) {
@@ -353,7 +383,7 @@ func TestMatch_AcctSelfTarget(t *testing.T) {
 
 func TestMatch_CreateError(t *testing.T) {
 	h, repo := newTestHandler()
-	repo.createErr = errMock
+	repo.createErr = errBoom
 	rec := post(h.Match, `{"userId":"u2"}`, u1)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -781,35 +811,6 @@ func TestSetFederation(t *testing.T) {
 	assert.NotNil(t, h.deliverer)
 }
 
-// stubFedCache implements just enough of the FederationIDCache interface for
-// testing handler.Match / handler.Surrender without touching Redis.
-type stubFedCache struct {
-	sessionToGame map[string]string
-	gameToSession map[string]string
-}
-
-func (s *stubFedCache) Set(_ context.Context, federationID, gameID string) {
-	s.sessionToGame[federationID] = gameID
-	s.gameToSession[gameID] = federationID
-}
-
-func (s *stubFedCache) Get(_ context.Context, federationID string) (string, error) {
-	if v, ok := s.sessionToGame[federationID]; ok {
-		return v, nil
-	}
-	return "", errMock
-}
-
-func (s *stubFedCache) GetSessionByGame(_ context.Context, gameID string) (string, bool) {
-	v, ok := s.gameToSession[gameID]
-	return v, ok
-}
-
-func (s *stubFedCache) Delete(_ context.Context, federationID, gameID string) {
-	delete(s.sessionToGame, federationID)
-	delete(s.gameToSession, gameID)
-}
-
 func TestMatch_WithRemoteUser(t *testing.T) {
 	// Use a real (nil-redis) FederationIDCache; Set/Get are no-ops which lets
 	// the handler still fire DeliverToUser via federation branch.
@@ -856,7 +857,7 @@ func TestSurrender_WithRemoteUser(t *testing.T) {
 
 func TestMatch_CreateErrorWithRemote(t *testing.T) {
 	h, repo := newTestHandler()
-	repo.createErr = errMock
+	repo.createErr = errBoom
 	d := &mockDeliverer{}
 	userRepo := testutil.NewMockUserRepository()
 	host := "remote.example"

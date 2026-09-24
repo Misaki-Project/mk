@@ -334,7 +334,10 @@ func (h *Handler) List(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -458,7 +461,10 @@ func (h *Handler) Notes(c echo.Context) error {
 		requesterID = user.ID
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -565,6 +571,13 @@ func (h *Handler) SetNoteMaterializer(m NoteMaterializer) {
 // failed. 通常のノートでは Redis を一切引かない。
 func (h *Handler) materializeIfMissing(noteID string, lookupErr error) bool {
 	if lookupErr == nil || h.materializer == nil {
+		return false
+	}
+	// **DB 障害では materialize しない** (#2799)。`RequireVisible` は not-found と
+	// 非可視を `ErrNoteNotFound` に集約し、接続断だけ raw error を返す。種別を
+	// 見ずに走らせると、DB 断のあいだ 1 リクエストごとに outbound の
+	// remote-note fetch が 1 発出る。
+	if !errors.Is(lookupErr, corenote.ErrNoteNotFound) {
 		return false
 	}
 	_, err := h.materializer.EnsureNote(context.Background(), noteID)

@@ -19,6 +19,7 @@
 import { readFileSync } from 'node:fs';
 import { expect, test } from '@playwright/test';
 import { callApi } from '../../../fixtures/api';
+import { isTsBackend } from '../../../fixtures/backend';
 import { type RootFixture, uiSigninAsRoot } from '../../../fixtures/ui_auth';
 import { clickSwitchByLabel } from '../../../fixtures/ui_click';
 
@@ -40,10 +41,16 @@ test.describe('UI: /admin/moderation emailRequiredForSignup toggle flow', () => 
   }) => {
     // setup: 両方を既知 state (false) に reset する。approvalRequiredForSignup
     // も揃えるのは、押し間違いを下の assert で検出できるようにするため。
+    //
+    // **disableRegistration も明示する (#2803)。** 承認制を ON→OFF にする更新で
+    // 明示が無いと、サーバー側が「ゲートが 1 つも無い全開」を避けて
+    // disableRegistration を true に倒す。押し間違いで承認制が on のまま来た
+    // ときにここが登録を閉じてしまい、以降の signup spec が全滅する。
     await callApi(request, 'admin/update-meta', {
       i: root.token,
       emailRequiredForSignup: false,
       approvalRequiredForSignup: false,
+      disableRegistration: false,
     });
 
     try {
@@ -65,16 +72,21 @@ test.describe('UI: /admin/moderation emailRequiredForSignup toggle flow', () => 
       expect(metaResp.status()).toBe(200);
       const meta = await metaResp.json();
       expect(meta.emailRequiredForSignup).toBe(true);
-      expect(meta.approvalRequiredForSignup).toBe(false);
+      // approvalRequiredForSignup は mk-go 独自の field で、TS には無い。
+      if (!isTsBackend) {
+        expect(meta.approvalRequiredForSignup).toBe(false);
+      }
     } finally {
       // cleanup: 必ず false に戻す。emailRequiredForSignup が残ると以降の
       // signup spec が INVALID_PARAM (emailAddress required)、
-      // approvalRequiredForSignup が残ると APPROVAL_REQUIRED (403) で
-      // 全滅する。pass / fail どちらでも cleanup を実行する。
+      // approvalRequiredForSignup が残ると APPROVAL_REQUIRED (403)、
+      // disableRegistration が残ると登録が閉じたままで全滅する。
+      // pass / fail どちらでも cleanup を実行する。
       await callApi(request, 'admin/update-meta', {
         i: root.token,
         emailRequiredForSignup: false,
         approvalRequiredForSignup: false,
+        disableRegistration: false,
       });
     }
   });

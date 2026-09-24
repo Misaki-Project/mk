@@ -11,15 +11,20 @@ import (
 )
 
 var defaults = map[string]any{
-	"gtlAvailable":               true,
-	"ltlAvailable":               true,
-	"canPublicNote":              true,
-	"mentionLimit":               20,
-	"canInvite":                  false,
-	"inviteLimit":                0,
-	"inviteLimitCycle":           10080,
-	"inviteExpirationTime":       0,
-	"canManageCustomEmojis":      false,
+	"gtlAvailable":          true,
+	"ltlAvailable":          true,
+	"canPublicNote":         true,
+	"mentionLimit":          20,
+	"canInvite":             false,
+	"inviteLimit":           0,
+	"inviteLimitCycle":      10080,
+	"inviteExpirationTime":  0,
+	"canManageCustomEmojis": false,
+	// 絵文字の登録申請 (#2934)。**default true** — 登録は必ずモデレーターの
+	// 承認を通るので、申請そのものを既定で塞ぐ必要が無い。canCreateChannel と
+	// 同じく、絞りたい運営者が role で false にする。
+	// canManageCustomEmojis を持つ人は申請ではなく直接登録できる。
+	"canRequestCustomEmojis":     true,
 	"canManageAvatarDecorations": false,
 	"canSearchNotes":             false,
 	"canSearchUsers":             true,
@@ -57,6 +62,39 @@ var defaults = map[string]any{
 	"canUseChunkedUpload":                true,
 	"chunkedUploadMaxConcurrentSessions": 4,
 	"chunkedUploadMaxPendingMb":          1024,
+	// カスタム絵文字申請の期間上限 (#2958、mk-go独自)。**0は無制限**。
+	// ローリング期間 (過去24時間 / 7日 / 30日) で数える — 固定暦にすると
+	// タイムゾーン依存になり、切り替わり直前と直後に連続で申請できる。
+	//
+	// 既定は0 (無制限)。既存インスタンスの挙動を変えないため。
+	// 申請そのものを止めるのはcanRequestCustomEmojisの仕事。
+	"emojiApplicationMaxPerDay":   0,
+	"emojiApplicationMaxPerWeek":  0,
+	"emojiApplicationMaxPerMonth": 0,
+	// 同時に審査待ちにできる件数 (#2977)。**上の期間上限とは数え方が逆**で、
+	// pendingだけを数えるので却下・取り下げ・承認で枠が戻る。既定は0 (無制限)。
+	"emojiApplicationMaxPending": 0,
+	// カスタム絵文字をアバターデコレーションとして重ねられるか (#2975、mk-go独自)。
+	// **個数は専用のpolicyを持たず、既存のavatarDecorationLimitに合算する** —
+	// 管理者が登録したデコレーションと同じ場所に並ぶので、別枠にすると
+	// 「1つしか付けられない」と言いながら合計2つ付いている状態になる。
+	//
+	// 既定はtrue。ローカル絵文字は本文・リアクションで既に誰にでも見えており、
+	// センシティブなものは設定時にも表示時にも弾く。canCreateChannelと同じく、
+	// 絞りたい運営者がroleでfalseにする。
+	"canUseEmojiAsAvatarDecoration": true,
+	// IP から関連アカウントを引く権限 (#3104)。**default false** — upstream の
+	// `admin/get-user-ips` は requireAdmin なので、既定では同じ「管理者のみ」に
+	// なる。モデレーターへ開きたい運営者だけがロールで true にする。
+	"canSearchIpHistory": false,
+	// optOutNotificationTypesはmk-go独自 (#2898)。ロール単位で受け取らない通知
+	// タイプを列挙する。型ごとにcanReceiveXxxを増やす形にすると、固有通知を
+	// 足すたびにpolicyが増えるので1キーにまとめている。
+	//
+	// **集約はintersection** (role_service.goのaggregatePolicyValues)。
+	// uploadableFileTypesと同じset unionにすると、複数ロールに属するほど通知が
+	// 減る = 厳しい方に倒れ、upstreamの「緩い方に倒す」思想と食い違う。
+	"optOutNotificationTypes": []string{},
 }
 
 // Defaults returns a mutable copy of the host's native policy defaults.
@@ -65,7 +103,12 @@ func Defaults() map[string]any {
 	result := make(map[string]any, len(defaults))
 	for key, value := range defaults {
 		if values, ok := value.([]string); ok {
-			result[key] = append([]string(nil), values...)
+			// **`append([]string(nil), 空...)` は nil を返す。** 空の既定を持つ
+			// policy (optOutNotificationTypes) がそのまま JSON の `null` になり、
+			// meta.policies を読む frontend が配列を期待して壊れる (#2898 の
+			// 本番確認で実際に `null` が返っていた)。uploadableFileTypes は
+			// 既定が非空なので露見していなかった。
+			result[key] = append(make([]string, 0, len(values)), values...)
 			continue
 		}
 		result[key] = value
@@ -120,6 +163,54 @@ func declaresKey(keys []string, key string) bool {
 		if declared == key {
 			return true
 		}
+	}
+	return false
+}
+
+// ValidatePolicyValue reports whether value has the type the policy expects.
+//
+// **管理者が入れる値にも型検査が要る (#3037)。** policy の consumer は
+// `if limit, ok := role.PolicyNumber(v); ok { ...gate... }` の形で読むので、
+// 数値の policy に `"10"` のような**文字列が入ると ok が false になり、
+// 上限違反で弾かれるのではなく上限そのものが消える** (#2611 と同じ壊れ方)。
+// `admin/roles/create` / `update` / `update-default-policies` は値の型を
+// 見ていないので、管理画面の外から 1 回叩けばその状態を作れた。
+//
+// **未知のキーは通す。** upstream は JS の object lookup なので、既定に無い
+// キーは誰も読まない = 何の影響も無い。ここで弾くと、upstream が新しい
+// policy を足したときに mk-go だけがその設定を拒否する側になる。
+func ValidatePolicyValue(key string, value any) bool {
+	native, ok := Defaults()[key]
+	if !ok {
+		return true
+	}
+	// **空文字を含む文字列配列は弾かない (#3037 レビュー)。**
+	//
+	// `valueValid` はプラグインの contribution 用で、そちらは「宣言した値を
+	// そのまま使う」前提なので空要素を拒否している。管理画面の入力は違う —
+	// `uploadableFileTypes` の編集 UI は `MkTextarea` を `split('\n')` する
+	// だけなので、**末尾で Enter を押す / 欄を空にするだけ**で `[""]` が飛ぶ。
+	// 受け側の `aggregateStringSetUnion` は元から「trim して空は読み飛ばす」
+	// fail-soft なので、書き込み時に拒否するのは**今まで通っていた入力を
+	// 落とす回帰**になる。
+	if _, isStrings := native.([]string); isStrings {
+		return stringSliceValue(value)
+	}
+	return valueValid(key, native, value)
+}
+
+// stringSliceValue reports whether value is a list of strings (空要素可)。
+func stringSliceValue(value any) bool {
+	switch v := value.(type) {
+	case []string:
+		return true
+	case []any:
+		for _, item := range v {
+			if _, ok := item.(string); !ok {
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }

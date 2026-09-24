@@ -404,6 +404,20 @@ func (s *Service) IsSilenced(host string) bool {
 	return HostMatchesAny(meta.SilencedHosts, host)
 }
 
+// ProhibitedWords returns meta.prohibitedWords.
+//
+// 連合の note 取り込み (`federation.Resolver`) がローカル投稿経路と同じ禁止語
+// 判定を掛けるために読む。meta が読めない場合は nil を返す (= 判定を skip)。
+// IsBlocked / IsAllowed と同じベストエフォート方針で、一時的な DB error で
+// inbound が止まらないようにする。
+func (s *Service) ProhibitedWords() []string {
+	meta, err := s.metaRepo.Fetch()
+	if err != nil {
+		return nil
+	}
+	return []string(meta.ProhibitedWords)
+}
+
 // IsMediaSilenced reports whether the host matches an entry in
 // meta.mediaSilencedHosts. Used by reaction gating to reject custom emoji
 // reactions from media-silenced remote hosts (#1538).
@@ -557,6 +571,40 @@ func (s *Service) ShouldSkipDelivery(host string) bool {
 	return s.shouldSkipBySuspend(host)
 }
 
+// CanFetchOptionalRemoteData reports whether this instance may make an
+// outbound request to host for data it does not need.
+//
+// **`ShouldSkipDelivery` と違い fail-closed。** あちらは配送なので meta が
+// 読めないときに止めると連合そのものが止まる (drop-in 互換の劣化) が、
+// こちらは「取れなくても表示が少し寂しくなるだけ」の付加情報なので、
+// 判定できないなら出さないほうが安全。**出してしまうと defederate した
+// 相手に「誰をいつ見たか」が漏れる。**
+//
+// 判定の内容 (`federation` モード / `blockedHosts` / `suspensionState`) は
+// `ShouldSkipDelivery` と同じ。
+func (s *Service) CanFetchOptionalRemoteData(host string) bool {
+	if host == "" {
+		return false
+	}
+	meta, err := s.metaRepo.Fetch()
+	if err != nil {
+		s.warnMetaFetchFailed(host, err)
+		return false
+	}
+	switch meta.Federation {
+	case "none":
+		return false
+	case "specified":
+		if !HostMatchesAny(meta.FederationHosts, host) {
+			return false
+		}
+	}
+	if HostMatchesAny(meta.BlockedHosts, host) {
+		return false
+	}
+	return !s.shouldSkipBySuspend(host)
+}
+
 // shouldSkipBySuspend returns the cached suspend decision for host, looking it
 // up from the repository only on a cache miss or after cacheTTL has elapsed.
 // deliver hot path の FindByHost DB 往復を cacheTTL の間だけ省く (#1407)。
@@ -682,6 +730,10 @@ func (s *Service) Suspend(host string, state model.SuspensionState) error {
 		return errors.New("host is required")
 	}
 	if _, err := s.repo.FindByHost(host); err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrInstanceNotFound
 	}
 	if err := s.repo.UpdateFields(host, map[string]any{
@@ -700,6 +752,10 @@ func (s *Service) UpdateModerationNote(host, note string) error {
 		return errors.New("host is required")
 	}
 	if _, err := s.repo.FindByHost(host); err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return err
+		}
 		return ErrInstanceNotFound
 	}
 	return s.repo.UpdateFields(host, map[string]any{

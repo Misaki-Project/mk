@@ -68,7 +68,7 @@ func TestNew_QueueOnlyRegistersEffectivePolicyBeforePluginJobs(t *testing.T) {
 	cfg := &config.Config{
 		URL: "http://example.test", Host: "example.test", Hostname: "example.test",
 		Scheme: "http", WsScheme: "ws", ID: "aidx", TestMode: true,
-		JobQueueDriver: "asynq", MediaProxySecret: []byte("test-secret"),
+		JobQueueDriver: "mkq", MediaProxySecret: []byte("test-secret"),
 		Redis: redisOptions, RedisForPubsub: redisOptions, RedisForJobQueue: redisOptions,
 		RedisForTimelines: redisOptions, RedisForReactions: redisOptions,
 	}
@@ -126,6 +126,8 @@ func TestNew_QueueOnlyRegistersEffectivePolicyBeforePluginJobs(t *testing.T) {
 	}
 
 	cleanupCalls := 0
+	// **`newServer` はプロセス共有の状態を張り替える** (#2795)。
+	restoreProcessGlobals(t)
 	srv, err := newServer(cfg, db, redisClients, []plugin.Definition{def}, noopStorage, func(s *Server) {
 		s.pluginGoStarter = func(fn func()) { fn() }
 		s.beforePluginGoRelease = func() { finalized = true }
@@ -193,7 +195,7 @@ func TestNew_PluginSetupFailureRollsBackConstructionResources(t *testing.T) {
 			cfg.WsScheme = "ws"
 			cfg.ID = "aidx"
 			cfg.TestMode = true
-			cfg.JobQueueDriver = "asynq"
+			cfg.JobQueueDriver = "mkq"
 			cfg.MediaProxySecret = []byte("test-secret")
 			cfg.Redis = redisOptions
 			cfg.RedisForPubsub = redisOptions
@@ -250,6 +252,8 @@ func TestNew_PluginSetupFailureRollsBackConstructionResources(t *testing.T) {
 			workerStopped := make(chan struct{})
 			var failedServer *Server
 			var closeDriver *constructionCloseDriver
+			// **`newServer` はプロセス共有の状態を張り替える** (#2795)。
+			restoreProcessGlobals(t)
 			srv, err := newServer(cfg, db, redisClients, plugins, nil, func(s *Server) {
 				failedServer = s
 				s.pluginGoStarter = func(fn func()) { fn() }

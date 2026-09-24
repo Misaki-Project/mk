@@ -23,10 +23,16 @@ var mockLocalUsernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_]{1,20}$`)
 
 // MockUserRepository is a test double for repository.UserRepository.
 type MockUserRepository struct {
-	Users                 map[string]*model.User        // keyed by ID
-	Tokens                map[string]*model.User        // keyed by token
-	Profiles              map[string]*model.UserProfile // keyed by userID
-	FindByUsernameLowerFn func(username string, host *string) (*model.User, error)
+	// CountLocalUsersErr forces CountLocalUsers to fail (fail-closed の枝用)。
+	CountLocalUsersErr error
+	// EmailInUseErr forces EmailVerifiedInUse to fail (fail-closed の枝用)。
+	EmailInUseErr             error
+	Users                     map[string]*model.User        // keyed by ID
+	Tokens                    map[string]*model.User        // keyed by token
+	Profiles                  map[string]*model.UserProfile // keyed by userID
+	FindByUsernameLowerFn     func(username string, host *string) (*model.User, error)
+	UpdatePasswordIfCurrentFn func(userID, currentHash, newHash string) (bool, error)
+	RemoveBackupCodeFn        func(userID, code string) error
 	// RecommendationFollowing maps viewerID -> list of followeeIDs to exclude
 	// from ListUserRecommendations. Set by tests to emulate the "already
 	// following" filter.
@@ -38,6 +44,30 @@ type MockUserRepository struct {
 	// can exercise lookup-failure branches. **行が無いケースとは別物** で、
 	// 呼び出し側は ErrRecordNotFound と実エラーを区別することがある。
 	FindProfileErr error
+	// FindErr, when non-nil, is returned by FindByID. Same intent as
+	// FindProfileErr: a DB failure must not be collapsed into not-found (#2792).
+	FindErr error
+	// FindByURIErr, when non-nil, is returned by FindByURI.
+	//
+	// **FindErr とは別にしてある。** 同じ関数が id と URI の 2 経路で利用者を
+	// 引くとき、片方だけ guard する形 (#3025 が名指しした失敗形) は 1 つの
+	// hook では書き分けられない。
+	FindByURIErr error
+	// FindByURIHook, when non-nil, decides FindByURI's error per call (#3116)。
+	// 非 nil を返した回だけ失敗する。
+	//
+	// **1 つの経路に同じ lookup が複数あるときに要る。** inbox は入口で
+	// 「凍結済み actor か」を同じ `FindByURI` で見るので、`FindByURIErr` を
+	// 立てると**手前で落ちて目的の分岐に到達しない** — テストは通るが、
+	// 見たかった箇所を一度も実行していない (実測)。呼び出し順で書き分ける。
+	FindByURIHook func(uri string) error
+	// FindManyByIDsErr, when non-nil, is returned by FindManyByIDs. 同上 —
+	// 一括解決の失敗を「その利用者は居ない」に潰さないことを検査するために要る。
+	FindManyByIDsErr error
+	// UpdateProfileFn, when non-nil, replaces UpdateProfile entirely. Used to
+	// assert on the fields a caller writes (e.g. 2FA backup codes must be
+	// consumed with RemoveBackupCode, never written back as a snapshot).
+	UpdateProfileFn func(userID string, fields map[string]any) error
 }
 
 func NewMockUserRepository() *MockUserRepository {
@@ -218,6 +248,9 @@ func (m *MockUserRepository) Create(u *model.User) error {
 }
 
 func (m *MockUserRepository) FindByID(id string) (*model.User, error) {
+	if m.FindErr != nil {
+		return nil, m.FindErr
+	}
 	u, ok := m.Users[id]
 	if !ok {
 		return nil, ErrNotFound
@@ -226,6 +259,14 @@ func (m *MockUserRepository) FindByID(id string) (*model.User, error) {
 }
 
 func (m *MockUserRepository) FindByURI(uri string) (*model.User, error) {
+	if m.FindByURIHook != nil {
+		if err := m.FindByURIHook(uri); err != nil {
+			return nil, err
+		}
+	}
+	if m.FindByURIErr != nil {
+		return nil, m.FindByURIErr
+	}
 	for _, u := range m.Users {
 		if u.URI != nil && *u.URI == uri {
 			return u, nil
@@ -246,12 +287,15 @@ func (m *MockUserRepository) FindByUsernameLower(username string, host *string) 
 	if m.FindByUsernameLowerFn != nil {
 		return m.FindByUsernameLowerFn(username, host)
 	}
-	// **本番の repository と同じ意味論にする** (#2704)。揃えないと、mock を使う
-	// テストだけが通って本番との差が隠れる。完全一致を優先するのも同じ理由
-	// (host 表記の違う 2 行が共存しうる)。
-	var fallback *model.User
+	// **本番の repository と同じ意味論にする** (#2704 / #2996)。揃えないと、mock を
+	// 使うテストだけが通って本番との差が隠れる。
+	//
+	// **username も小文字化して比べる。** 本番は `"usernameLower" = lower(?)` で、
+	// 呼び出し側は打たれたままの綴りで来る (`ExtractMentionStructs` は小文字化しない
+	// ので、`@Alice@remote.example` は `Alice` のまま届く)。
+	lowered := strings.ToLower(username)
 	for _, u := range m.Users {
-		if u.UsernameLower != username {
+		if u.UsernameLower != lowered {
 			continue
 		}
 		if host == nil {
@@ -263,26 +307,22 @@ func (m *MockUserRepository) FindByUsernameLower(username string, host *string) 
 		if u.Host == nil {
 			continue
 		}
-		if *u.Host == *host {
+		// **正規形の完全一致だけ (#2996)。** 生の形にも当てる互換経路は撤去した。
+		if hostMatches(*host, *u.Host) {
 			return u, nil
 		}
-		if fallback == nil && hostMatches(*host, *u.Host) {
-			fallback = u
-		}
-	}
-	if fallback != nil {
-		return fallback, nil
 	}
 	return nil, ErrNotFound
 }
 
-// hostMatches mirrors repository.hostMatch: the stored value matches either the
-// normalized form of the query or the query as given.
+// hostMatches mirrors repository.hostMatch: the query is normalized and then
+// compared exactly.
 //
-// **backfill 前の行は非正規化のまま**なので、正規化形だけで比べると非正規化で保存された
-// 行が引けなくなる。本番と同じ両当たりにしておく (#2704 review)。
+// **生の形にも当てる互換経路は #2996 で撤去した。** 保存側も #2706 で正規化する
+// ので、正規形どうしの完全一致で引ける。非正規化のまま残っている行は引けなく
+// なる (それが撤去の意味で、`backfill-remote-host` を流してから上げる前提)。
 func hostMatches(query, stored string) bool {
-	return stored == query || stored == idnhost.Puny(query)
+	return stored == idnhost.Puny(query)
 }
 
 // FindManyByUsernamesAndHost mirrors the production repo: case-insensitive
@@ -307,26 +347,13 @@ func (m *MockUserRepository) FindManyByUsernamesAndHost(usernames []string, host
 			out = append(out, u)
 		}
 	}
-	if host == nil {
-		return out, nil
-	}
-	// **本番と同じく username ごとに 1 行へ畳む** (#2704)。畳まないと、呼び出し側
-	// (mention 解決) が `m[usernameLower] = id` で後勝ちに潰すので、mock 経由の
-	// テストが map の反復順に依存して非決定になる。完全一致を優先するのも本番と同じ。
-	best := make(map[string]*model.User, len(out))
-	for _, u := range out {
-		cur, ok := best[u.UsernameLower]
-		if !ok || (*u.Host == *host && *cur.Host != *host) {
-			best[u.UsernameLower] = u
-		}
-	}
-	folded := out[:0]
-	for _, u := range out {
-		if best[u.UsernameLower] == u {
-			folded = append(folded, u)
-		}
-	}
-	return folded, nil
+	// **本番と同じく畳まない (#2996)。** `hostMatches` が正規形の完全一致になり、
+	// `(usernameLower, host)` は一意制約で高々 1 行なので、本番側も畳む処理を
+	// 撤去した。mock だけ畳むと「fixture が同じ組を 2 行持っていても mock では
+	// 通る」という差を隠すことになる。**`m.Users` は map なので `out` の順序は
+	// 非決定** — 畳んでも先頭がどれになるかは決まらず、決定性は元から得られない
+	// (#2704 のときは完全一致を優先する規則がその役目を持っていた)。
+	return out, nil
 }
 
 func (m *MockUserRepository) FindProfileByUserID(userID string) (*model.UserProfile, error) {
@@ -343,6 +370,9 @@ func (m *MockUserRepository) FindProfileByUserID(userID string) (*model.UserProf
 // FindManyByIDs mirrors the production repo: missing rows are skipped silently.
 // Order is unspecified (production does not guarantee it either).
 func (m *MockUserRepository) FindManyByIDs(ids []string) ([]*model.User, error) {
+	if m.FindManyByIDsErr != nil {
+		return nil, m.FindManyByIDsErr
+	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -386,6 +416,19 @@ func (m *MockUserRepository) FindProfileByEmail(email string) (*model.UserProfil
 		}
 	}
 	return nil, ErrNotFound
+}
+
+// EmailVerifiedInUse reports whether a confirmed profile already uses email.
+func (m *MockUserRepository) EmailVerifiedInUse(email string) (bool, error) {
+	if m.EmailInUseErr != nil {
+		return false, m.EmailInUseErr
+	}
+	for _, p := range m.Profiles {
+		if p.Email != nil && *p.Email == email && p.EmailVerified {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (m *MockUserRepository) IncrementFollowingCount(userID string, delta int) error {
@@ -678,6 +721,12 @@ func (m *MockUserRepository) CountOnlineUsers() (int64, error) {
 
 // CountLocalUsers counts non-deleted local users in the mock store.
 func (m *MockUserRepository) CountLocalUsers() (int64, error) {
+	// **error を注入できるようにしてある。** 呼び出し側に fail-closed の枝が
+	// あるとき (admin/accounts/create の初回セットアップ判定)、それを踏めないと
+	// 「数えられなくても窓を開ける」実装に戻しても緑のまま通る。
+	if m.CountLocalUsersErr != nil {
+		return 0, m.CountLocalUsersErr
+	}
 	var n int64
 	for _, u := range m.Users {
 		if u.Host == nil && !u.IsDeleted {
@@ -776,6 +825,9 @@ func (m *MockUserRepository) ListUserRecommendations(viewerID string, activeSinc
 }
 
 func (m *MockUserRepository) UpdateProfile(userID string, fields map[string]any) error {
+	if m.UpdateProfileFn != nil {
+		return m.UpdateProfileFn(userID, fields)
+	}
 	if m.UpdateProfileErr != nil {
 		return m.UpdateProfileErr
 	}
@@ -797,6 +849,42 @@ func (m *MockUserRepository) UpdateProfile(userID string, fields map[string]any)
 	*p = next
 	m.Profiles[userID] = p
 	return nil
+}
+
+// RemoveBackupCode mirrors the SQL `array_remove` semantics: it deletes the
+// code from whatever is stored now, not from a caller-supplied snapshot.
+func (m *MockUserRepository) RemoveBackupCode(userID, code string) error {
+	if m.RemoveBackupCodeFn != nil {
+		return m.RemoveBackupCodeFn(userID, code)
+	}
+	p := m.Profiles[userID]
+	if p == nil {
+		return nil
+	}
+	out := make(model.StringArray, 0, len(p.TwoFactorBackupSecret))
+	for _, c := range p.TwoFactorBackupSecret {
+		if c != code {
+			out = append(out, c)
+		}
+	}
+	p.TwoFactorBackupSecret = out
+	return nil
+}
+
+func (m *MockUserRepository) UpdatePasswordIfCurrent(userID, currentHash, newHash string) (bool, error) {
+	if m.UpdatePasswordIfCurrentFn != nil {
+		return m.UpdatePasswordIfCurrentFn(userID, currentHash, newHash)
+	}
+	if m.UpdateProfileErr != nil {
+		return false, m.UpdateProfileErr
+	}
+	p, ok := m.Profiles[userID]
+	if !ok || p.Password == nil || *p.Password != currentHash {
+		return false, nil
+	}
+	next := newHash
+	p.Password = &next
+	return true, nil
 }
 
 // applyUserFields は単純な型の代表例にだけ対応する。新しいフィールドを使う場合はここに追加する。
@@ -1191,6 +1279,17 @@ type MockNoteRepository struct {
 	// ExistingOnPrimaryErr, when set, is returned by ExistingNoteIDsOnPrimary
 	// so callers can exercise the fail-safe path (#2719).
 	ExistingOnPrimaryErr error
+	// ListRenoteOrReplyErr, when set, is returned by
+	// ListRenoteOrReplyRemoteUserIDs so callers can exercise the lookup
+	// failure path (#2995).
+	ListRenoteOrReplyErr error
+	// FindByURIErr forces FindByURI to fail with a non-not-found error, for
+	// exercising the paths that must retry instead of acking (#3115).
+	FindByURIErr error
+	// FindErr forces FindByID (and the wrappers that delegate to it) to fail
+	// with a non-not-found error, for exercising the paths that must retry
+	// instead of acking (#3121).
+	FindErr error
 	// Following は ListByUserIDFiltered の visibility push-down (followers note
 	// の follow 判定) に使う followerID -> followeeIDs map。未設定なら follow
 	// なし扱い (= 非 follower viewer)。testutil は core/note を import すると
@@ -1251,6 +1350,9 @@ func (m *MockNoteRepository) Create(note *model.Note) error {
 }
 
 func (m *MockNoteRepository) FindByID(id string) (*model.Note, error) {
+	if m.FindErr != nil {
+		return nil, m.FindErr
+	}
 	n, ok := m.Notes[id]
 	if !ok {
 		return nil, ErrNotFound
@@ -1289,6 +1391,10 @@ func (m *MockNoteRepository) FindByIDWithRelations(id string) (*model.Note, erro
 }
 
 func (m *MockNoteRepository) FindByURI(uri string) (*model.Note, error) {
+	// FindByURIErr は not-found でない error を返させる口 (#3115)。
+	if m.FindByURIErr != nil {
+		return nil, m.FindByURIErr
+	}
 	for _, n := range m.Notes {
 		if n.URI != nil && *n.URI == uri {
 			return n, nil
@@ -1385,6 +1491,34 @@ func (m *MockNoteRepository) ListRenotesOf(noteID, viewerID, untilID, sinceID st
 		}
 		return n.RenoteID != nil && *n.RenoteID == noteID
 	}, untilID, sinceID, limit), nil
+}
+
+// ListRenoteOrReplyRemoteUserIDs returns the distinct ids of remote users who
+// renoted or replied to noteID (#2995)。`note.userHost` が非 NULL の行だけを見る
+// のは本物の SQL と同じ。
+func (m *MockNoteRepository) ListRenoteOrReplyRemoteUserIDs(noteID string) ([]string, error) {
+	if m.ListRenoteOrReplyErr != nil {
+		return nil, m.ListRenoteOrReplyErr
+	}
+	if noteID == "" {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var ids []string
+	for _, n := range m.Notes {
+		if n == nil || n.UserHost == nil || *n.UserHost == "" {
+			continue
+		}
+		if (n.RenoteID == nil || *n.RenoteID != noteID) && (n.ReplyID == nil || *n.ReplyID != noteID) {
+			continue
+		}
+		if _, dup := seen[n.UserID]; dup {
+			continue
+		}
+		seen[n.UserID] = struct{}{}
+		ids = append(ids, n.UserID)
+	}
+	return ids, nil
 }
 
 // ListRepliesOf returns notes whose replyId equals noteID.
@@ -1861,6 +1995,10 @@ func (m *MockNoteRepository) ListPublicNotes(filter model.PublicNotesFilter, lim
 
 func (m *MockNoteRepository) DeleteExpiredRemoteNotes(_, _ int) (int64, error) {
 	return 0, nil
+}
+
+func (m *MockNoteRepository) DeleteExpiredRemoteNotesAfter(_, _ int, _ string) (int64, int, string, error) {
+	return 0, 0, "", nil
 }
 
 func (m *MockNoteRepository) DeleteByUserBatch(userID string, batchSize int) (int64, error) {
@@ -2401,6 +2539,9 @@ type MockEmojiRepository struct {
 	// without persisting. Used to exercise upsertEmojis error handling paths.
 	CreateErr error
 	UpdateErr error
+	// DeleteErr forces Delete to return the given error (#2966 の補償処理で
+	// 「絵文字は消せなかったが drive の複製は片付ける」経路を作るため)。
+	DeleteErr error
 }
 
 func NewMockEmojiRepository() *MockEmojiRepository {
@@ -2547,6 +2688,9 @@ func (m *MockEmojiRepository) FindManyByNamesAndHost(names []string, host *strin
 }
 
 func (m *MockEmojiRepository) Delete(id string) error {
+	if m.DeleteErr != nil {
+		return m.DeleteErr
+	}
 	for k, e := range m.Emojis {
 		if e.ID == id {
 			delete(m.Emojis, k)
@@ -2913,6 +3057,13 @@ type MockMetaRepository struct {
 	mu         sync.Mutex
 	Meta       *model.Meta
 	FetchCalls int
+	// LastUpdateFields is the field map handed to the most recent Update.
+	// 実 repo は key をそのまま列識別子として UPDATE に載せるので、
+	// 「何が渡ったか」自体が検査対象になる。
+	LastUpdateFields map[string]any
+	// FetchErr forces Fetch to fail. 「DB が読めない窓」を再現するために使う
+	// (判定できないときに fail-open していないかを見るテスト)。
+	FetchErr error
 }
 
 func NewMockMetaRepository() *MockMetaRepository {
@@ -2923,6 +3074,9 @@ func (m *MockMetaRepository) Fetch() (*model.Meta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.FetchCalls++
+	if m.FetchErr != nil {
+		return nil, m.FetchErr
+	}
 	if m.Meta == nil {
 		return nil, ErrNotFound
 	}
@@ -2932,6 +3086,13 @@ func (m *MockMetaRepository) Fetch() (*model.Meta, error) {
 func (m *MockMetaRepository) Update(fields map[string]any) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// **渡された field をそのまま記録する。** 実 repo は key をそのまま列
+	// 識別子として UPDATE に載せるので、「何が渡ったか」自体が検査対象になる
+	// (列でないキーを落としているか、など)。
+	m.LastUpdateFields = make(map[string]any, len(fields))
+	for k, v := range fields {
+		m.LastUpdateFields[k] = v
+	}
 	if m.Meta == nil {
 		m.Meta = &model.Meta{ID: "x"}
 	}
@@ -3160,6 +3321,11 @@ func (m *MockMetaRepository) Update(fields map[string]any) error {
 			setStrArr(&m.Meta.BannedEmailDomains, k, v)
 		case "preservedUsernames":
 			setStrArr(&m.Meta.PreservedUsernames, k, v)
+		// 新規登録の username の最小文字数 (#3015)。
+		case "minimumUsernameLength":
+			if f, ok := v.(float64); ok {
+				m.Meta.MinimumUsernameLength = int(f)
+			}
 		}
 	}
 	return firstErr
@@ -3396,6 +3562,15 @@ type MockUserNotePiningRepository struct {
 	// ReplaceErr forces ReplaceByUser to fail, for exercising the
 	// best-effort paths that must not abort actor resolution.
 	ReplaceErr error
+	// CountErr forces CountByUser to fail, for exercising the paths that must
+	// not silently skip the pin cap when the count is unavailable.
+	CountErr error
+	// FindErr forces FindByPair to fail with a non-not-found error, for
+	// exercising the paths that must retry instead of acking (#3115).
+	FindErr error
+	// DeleteErr forces Delete to fail, for exercising the paths that must not
+	// swallow the write failure after deciding to unpin (#3115).
+	DeleteErr error
 }
 
 func NewMockUserNotePiningRepository() *MockUserNotePiningRepository {
@@ -3408,11 +3583,17 @@ func (m *MockUserNotePiningRepository) Create(p *model.UserNotePining) error {
 }
 
 func (m *MockUserNotePiningRepository) Delete(p *model.UserNotePining) error {
+	if m.DeleteErr != nil {
+		return m.DeleteErr
+	}
 	delete(m.Pinings, p.ID)
 	return nil
 }
 
 func (m *MockUserNotePiningRepository) FindByPair(userID, noteID string) (*model.UserNotePining, error) {
+	if m.FindErr != nil {
+		return nil, m.FindErr
+	}
 	for _, p := range m.Pinings {
 		if p.UserID == userID && p.NoteID == noteID {
 			return p, nil
@@ -3451,6 +3632,9 @@ func (m *MockUserNotePiningRepository) ReplaceByUser(userID string, pins []*mode
 }
 
 func (m *MockUserNotePiningRepository) CountByUser(userID string) (int, error) {
+	if m.CountErr != nil {
+		return 0, m.CountErr
+	}
 	count := 0
 	for _, p := range m.Pinings {
 		if p.UserID == userID {
@@ -3463,6 +3647,9 @@ func (m *MockUserNotePiningRepository) CountByUser(userID string) (int, error) {
 // MockPollRepository is a test double for repository.PollRepository.
 type MockPollRepository struct {
 	Polls map[string]*model.Poll
+	// FindErr, when non-nil, is returned by FindByNoteID. not-found ではない
+	// 障害を ack していないことを試すために要る (#3116)。
+	FindErr error
 }
 
 func NewMockPollRepository() *MockPollRepository {
@@ -3475,6 +3662,9 @@ func (m *MockPollRepository) Create(poll *model.Poll) error {
 }
 
 func (m *MockPollRepository) FindByNoteID(noteID string) (*model.Poll, error) {
+	if m.FindErr != nil {
+		return nil, m.FindErr
+	}
 	p, ok := m.Polls[noteID]
 	if !ok {
 		return nil, ErrNotFound
@@ -4372,6 +4562,9 @@ type MockPageRepository struct {
 	Pages     map[string]*model.Page
 	CreateErr error
 	UpdateErr error
+	// UpdateFieldsCalls は UpdateFields に渡された field map を順に記録する。
+	// jsonb 列へ `[]byte` を渡していないか等、**値の型そのもの**を検査する用。
+	UpdateFieldsCalls []map[string]any
 }
 
 // NewMockPageRepository creates an empty MockPageRepository.
@@ -4418,6 +4611,11 @@ func (m *MockPageRepository) FindByUserAndName(userID, name string) (*model.Page
 }
 
 func (m *MockPageRepository) UpdateFields(pageID string, fields map[string]any) error {
+	// **渡された field map をそのまま記録する。** 実 repo は値の型を driver へ
+	// そのまま流すので、jsonb 列に `[]byte` を載せると bytea として送られて
+	// SQLSTATE 22P02 で落ちる。in-memory の値を見るだけでは型の誤りを
+	// 検出できないので、呼び出し側が何を渡したか自体を検査対象にする。
+	m.UpdateFieldsCalls = append(m.UpdateFieldsCalls, fields)
 	if m.UpdateErr != nil {
 		return m.UpdateErr
 	}
@@ -6967,6 +7165,24 @@ func (m *MockAbuseReportRepository) List(resolved *bool, reporterOrigin, targetU
 	return result, nil
 }
 
+// FindStatesByIDs returns the scalar resolution state of the given reports
+// (#2868). 存在しない ID は map から単に落とす。
+func (m *MockAbuseReportRepository) FindStatesByIDs(ids []string) (map[string]model.AbuseReportState, error) {
+	out := make(map[string]model.AbuseReportState, len(ids))
+	for _, id := range ids {
+		r, ok := m.Reports[id]
+		if !ok {
+			continue
+		}
+		out[id] = model.AbuseReportState{
+			Resolved:   r.Resolved,
+			ResolvedAs: r.ResolvedAs,
+			AssigneeID: r.AssigneeID,
+		}
+	}
+	return out, nil
+}
+
 func (m *MockAbuseReportRepository) UpdateFields(id string, fields map[string]any) error {
 	r, ok := m.Reports[id]
 	if !ok {
@@ -7386,6 +7602,21 @@ func (m *MockUserPendingRepository) Create(p *model.UserPending) error {
 	return nil
 }
 
+// DeleteOlderThan removes rows whose id sorts before thresholdID.
+//
+// **実データに合わせて件数を返す。** 常に 0 を返すと、掃除を検査するテストが
+// 空虚になる (#3037)。
+func (m *MockUserPendingRepository) DeleteOlderThan(thresholdID string) (int64, error) {
+	var n int64
+	for id := range m.Rows {
+		if id < thresholdID {
+			delete(m.Rows, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *MockUserPendingRepository) FindByCode(code string) (*model.UserPending, error) {
 	for _, r := range m.Rows {
 		if r.Code == code {
@@ -7649,6 +7880,9 @@ func (m *MockAuthSessionRepository) ListAppsByUserID(userID string, limit, offse
 type MockUserPublickeyRepository struct {
 	// keyed by userID
 	Keys map[string]*model.UserPublickey
+	// FindByKeyIDErr forces FindByKeyID to fail with a non-not-found error,
+	// for exercising the paths that must retry instead of dropping (#3121).
+	FindByKeyIDErr error
 }
 
 // NewMockUserPublickeyRepository creates an empty MockUserPublickeyRepository.
@@ -7672,6 +7906,9 @@ func (m *MockUserPublickeyRepository) FindByUserID(userID string) (*model.UserPu
 // LD-Signature verify は signature.creator (= keyId) で lookup するため、
 // userID baseの map を線形 search する (= mock なのでコスト OK)。
 func (m *MockUserPublickeyRepository) FindByKeyID(keyID string) (*model.UserPublickey, error) {
+	if m.FindByKeyIDErr != nil {
+		return nil, m.FindByKeyIDErr
+	}
 	for _, pk := range m.Keys {
 		if pk.KeyID == keyID {
 			return pk, nil
@@ -8724,6 +8961,31 @@ func (m *MockRegistrationTicketRepository) MarkUsed(ticketID, userID string) err
 	t.UsedByID = &uid
 	now := time.Now()
 	t.UsedAt = &now
+	return nil
+}
+
+// ClaimForSignup mirrors the real conditional UPDATE in memory.
+func (m *MockRegistrationTicketRepository) ClaimForSignup(ticketID string, emailRequired bool) (bool, error) {
+	t, ok := m.Tickets[ticketID]
+	if !ok || t.UsedByID != nil {
+		return false, nil
+	}
+	now := time.Now()
+	if t.UsedAt != nil && (!emailRequired || t.UsedAt.After(now.Add(-30*time.Minute))) {
+		return false, nil
+	}
+	t.UsedAt = &now
+	return true, nil
+}
+
+// ReleaseClaim mirrors the real conditional UPDATE in memory.
+func (m *MockRegistrationTicketRepository) ReleaseClaim(ticketID string) error {
+	t, ok := m.Tickets[ticketID]
+	if !ok || t.UsedByID != nil {
+		return nil
+	}
+	t.UsedAt = nil
+	t.PendingID = nil
 	return nil
 }
 

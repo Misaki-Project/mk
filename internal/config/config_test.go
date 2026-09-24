@@ -435,6 +435,68 @@ redis:
 	}
 }
 
+// mediaProxyConcurrency は未設定/0 を「実行時の既定に委ねる」意味の 0 にする (#3032)。
+//
+// **負値を素通しさせない。** そのまま semaphore の容量になると 0 枠になり、
+// リサイズ系のリクエストが 1 本も通らなくなる (全部 503 に落ちる)。
+func TestLoad_MediaProxyConcurrency(t *testing.T) {
+	base := `
+url: https://example.com
+port: 3000
+db:
+  host: localhost
+  port: 5432
+  db: misskey
+  user: postgres
+  pass: secret
+redis:
+  host: localhost
+  port: 6379
+`
+	for name, tc := range map[string]struct {
+		line string
+		want int
+	}{
+		"未設定は 0 (実行時の既定)": {"", 0},
+		"正の値はそのまま":        {"mediaProxyConcurrency: 6", 6},
+		"0 はそのまま":         {"mediaProxyConcurrency: 0", 0},
+		"負値は 0 に落とす":      {"mediaProxyConcurrency: -5", 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeTestConfig(t, base+tc.line+"\n")
+			cfg, err := Load(path)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.MediaProxyConcurrency)
+		})
+	}
+}
+
+// mediaProxyConcurrency が MK_ で上書きできること (#3032)。
+//
+// **bindEnvKeys に登録しないと、設定ファイルに書いていない環境では
+// 環境変数だけでは作れない** (CLAUDE.md Section 9)。運用で緊急に絞りたい
+// ときに効かないと困るので、登録そのものを固定する。
+func TestLoad_MediaProxyConcurrencyFromEnv(t *testing.T) {
+	base := `
+url: https://example.com
+port: 3000
+db:
+  host: localhost
+  port: 5432
+  db: misskey
+  user: postgres
+  pass: secret
+redis:
+  host: localhost
+  port: 6379
+`
+	t.Setenv("MK_MEDIAPROXYCONCURRENCY", "3")
+	path := writeTestConfig(t, base)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 3, cfg.MediaProxyConcurrency)
+}
+
 // queueStuckWorkerSeconds は 0 = キューごとの既定、負値 = 機能ごと無効。
 //
 // **負値を素通しさせる。** 隣の noteHookConcurrency / queueIdlePollSeconds は
@@ -1206,9 +1268,7 @@ func TestResolveJobQueueDriver(t *testing.T) {
 			want string
 		}{
 			// 空 string の default は mkq (#571 audit で asynq → mkq に変更)。
-			// asynq は legacy / future-deprecation candidate。
 			{"", "mkq"},
-			{"asynq", "asynq"},
 			{"mkq", "mkq"},
 			{"  mkq  ", "mkq"},
 			{"MKQ", "mkq"},
@@ -1223,13 +1283,44 @@ func TestResolveJobQueueDriver(t *testing.T) {
 	})
 	t.Run("unknown value rejected", func(t *testing.T) {
 		// Unknown values (typos like "mkqq") must error so a YAML
-		// typo does not silently downgrade the operator's intent
-		// to asynq. internal/server/queue_factory.go also rejects
-		// unknown drivers; surfacing the failure here keeps the
-		// two layers consistent.
+		// typo does not silently fall back to the default.
+		// internal/server/queue_factory.go also rejects unknown
+		// drivers; surfacing the failure here keeps the two layers
+		// consistent.
 		_, err := resolveJobQueueDriver("mkqq")
 		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "#2985",
+			"typo は削除済み driver の案内ではなく未知値として落とす")
 	})
+	t.Run("removed asynq driver rejected with migration hint", func(t *testing.T) {
+		// **黙って mkq へ倒さない。** 明示的に asynq を選んでいた運用は
+		// 意図的なので、driver が入れ替わったことに気付けないまま起動
+		// させるほうが危ない (#2985)。
+		for _, raw := range []string{"asynq", "  ASYNQ  "} {
+			_, err := resolveJobQueueDriver(raw)
+			require.Error(t, err, raw)
+			// 移行方法が読み取れることまで見る。「未知の値」で片付けると
+			// operator は何を書けばよいのか分からない。
+			assert.Contains(t, err.Error(), "removed")
+			assert.Contains(t, err.Error(), "mkq")
+			// **片道であることも伝える。** 新ビルドは起動を拒むので、
+			// asynq の未処理ジョブを捌く機会はこのメッセージを読んだ
+			// 時点しか無い (#2985)。
+			assert.Contains(t, err.Error(), "asynq:{<queue>}:*")
+			assert.Contains(t, err.Error(), "drain")
+		}
+	})
+}
+
+// TestLoad_JobQueueDriver_AsynqRejected pins the removal at the Load
+// boundary: an existing deployment that still pins the legacy driver must
+// fail to start rather than boot on a different queue implementation.
+func TestLoad_JobQueueDriver_AsynqRejected(t *testing.T) {
+	yml := testYAML + "\njobQueueDriver: asynq\n"
+	path := writeTestConfig(t, yml)
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "asynq")
 }
 
 func TestLoad_JobQueueDriver_Invalid(t *testing.T) {
@@ -1243,7 +1334,7 @@ func TestLoad_JobQueueDriver_Default(t *testing.T) {
 	path := writeTestConfig(t, testYAML)
 	cfg, err := Load(path)
 	require.NoError(t, err)
-	// #571 audit で default を asynq → mkq に変更。
+	// #571 audit で default を asynq → mkq に変更、#2985 で唯一の driver に。
 	assert.Equal(t, "mkq", cfg.JobQueueDriver)
 }
 

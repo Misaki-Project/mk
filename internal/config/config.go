@@ -14,13 +14,56 @@ import (
 
 // MkGoVersion is the mk-go version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MkGoVersion=1.2.1"
-var MkGoVersion = "1.2.1"
+//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MkGoVersion=1.4.0"
+var MkGoVersion = "1.4.0"
 
 // MisskeyVersion is the compatible Misskey version. Override at build time via:
 //
-//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MisskeyVersion=2026.7.0"
-var MisskeyVersion = "2026.7.0"
+//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MisskeyVersion=2026.9.1"
+var MisskeyVersion = "2026.9.1"
+
+// MkGoCommit is the source revision this binary was built from (short hash).
+//
+// **空になることがある。** 埋めるのはビルド側 (`make build` / Dockerfile の
+// build-arg) で、`go build ./...` や `go run` では入らない。読む側は空を
+// 「不明」として扱い、表示しないこと。Override at build time via:
+//
+//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MkGoCommit=abc1234"
+var MkGoCommit = ""
+
+// MkGoFrontendVersion is the version of the fork frontend bundled with this
+// build (`third_party/misskey`), typically its git tag such as "2026.9.0-mk.3".
+//
+// **frontend を bind mount で差し替えている構成では実物とずれうる。** これが
+// 名乗るのは「このバイナリをビルドしたときの submodule pin」で、`make uds-rebuild`
+// のように両方を同時にビルドする経路でしか一致は保証されない。MkGoCommit と同じく
+// 空になりうる。Override at build time via:
+//
+//	go build -ldflags "-X github.com/shiroha-a/mk/internal/config.MkGoFrontendVersion=2026.9.0-mk.3"
+var MkGoFrontendVersion = ""
+
+// MkGoRepositoryURL is the canonical source repository of mk-go itself.
+//
+// AGPL-3.0 section 13 で求められる「動いているコードに対応するソース」の案内は
+// meta.repositoryUrl (operator が改変版を指せる) が担うが、その既定値と
+// nodeinfo の software.repository はどちらも mk-go 本体を指すため、値をここに
+// 一本化する (#2700)。
+const MkGoRepositoryURL = "https://github.com/shiroha-a/mk"
+
+// MkGoFeedbackURL is the default destination of `meta.feedbackUrl`.
+//
+// **これは「ソフトウェアへのフィードバック先」** で、upstream が列 DEFAULT に
+// `.../misskey/issues/new` を置いているのと同じ位置づけ。「このサーバーへの
+// フィードバック」を受けたい operator は admin 画面の**ブランディング**で上書きする
+// (`repositoryUrl` は「全般 → 情報」だが、`feedbackUrl` の入力欄はそちらに無い、#2891)。
+//
+// **`internal/repository` からは参照されない** — あちらは config に依存しない方針なので
+// 値を持ち直しており、一致は `TestDefaultFeedbackURLMatchesConfig` が固定する。この定数は
+// その突き合わせ先として置いてある (未使用に見えても消さないこと)。
+//
+// **`/issues/new` の組み立ては GitHub / Codeberg 前提。** ホストを移すときは
+// `MkGoRepositoryURL` だけ変えても成立しない (GitLab 系は `/-/issues/new`)。
+const MkGoFeedbackURL = MkGoRepositoryURL + "/issues/new"
 
 // RedisOptions represents Redis connection configuration.
 type RedisOptions struct {
@@ -129,6 +172,11 @@ type Source struct {
 	// NoteHookConcurrency は投稿後のベストエフォートフックを種別ごとに
 	// 何本まで同時に走らせるか。未設定なら GOMAXPROCS x 2。
 	NoteHookConcurrency *int `mapstructure:"noteHookConcurrency"`
+	// MediaProxyConcurrency は media proxy の画像処理 (decode/resize/encode)
+	// を同時に何本走らせてよいか (#3032)。未設定なら GOMAXPROCS / 2 (最低 1)。
+	// 同時に走る本数がそのまま同時に確保される中間バッファの本数になるので、
+	// これがプロキシのピークメモリの上限を決める。
+	MediaProxyConcurrency *int `mapstructure:"mediaProxyConcurrency"`
 	// QueueIdlePollSeconds はジョブが無いときに worker が marker を待つ秒数の
 	// 下限。空振りのたびに mkq が待ちを倍にし 30 秒で頭打ちにするので、
 	// これは初回の待ちにあたる。未設定なら mkq の既定。mkq driver のみ有効。
@@ -163,7 +211,7 @@ type Source struct {
 	Meilisearch               *MeilisearchOptions    `mapstructure:"meilisearch"`
 	SetupPassword             string                 `mapstructure:"setupPassword"`
 	Proxy                     string                 `mapstructure:"proxy"`
-	ProxySmtp                 string                 `mapstructure:"proxySmtp"`
+	ProxySMTP                 string                 `mapstructure:"proxySmtp"`
 	ProxyBypassHosts          []string               `mapstructure:"proxyBypassHosts"`
 	AllowedPrivateNetworks    []string               `mapstructure:"allowedPrivateNetworks"`
 	MaxFileSize               *int64                 `mapstructure:"maxFileSize"`
@@ -233,9 +281,10 @@ type Source struct {
 	AutoScaleCooldownSeconds *int `mapstructure:"autoScaleCooldownSeconds"`
 
 	// JobQueueDriver selects the worker / inspector implementation
-	// behind internal/queue. "mkq" (default, recommended) uses the
-	// BullMQ-compatible shiroha-a/mkq library; "asynq" is the legacy
-	// hibiken/asynq driver. Empty / unset = "mkq".
+	// behind internal/queue. "mkq" (the only driver) uses the
+	// BullMQ-compatible shiroha-a/mkq library. Empty / unset = "mkq".
+	// The legacy "asynq" value was removed in #2985 and now fails at
+	// startup with a migration hint.
 	JobQueueDriver string `mapstructure:"jobQueueDriver"`
 
 	MediaProxy              string `mapstructure:"mediaProxy"`
@@ -329,14 +378,21 @@ type Source struct {
 	// it to the frontend bundle. map[string]any keeps the YAML shape as-is.
 	SentryForFrontend map[string]any `mapstructure:"sentryForFrontend"`
 
-	// PublishTarballInsteadOfProvideRepositoryUrl mirrors the upstream Misskey
+	// PublishTarballInsteadOfProvideRepositoryURL mirrors the upstream Misskey
 	// YAML flag. When true, the frontend treats the release as a tarball
 	// distribution rather than pointing at the source repository URL. Exposed
 	// via /api/meta.providesTarball.
-	PublishTarballInsteadOfProvideRepositoryUrl bool `mapstructure:"publishTarballInsteadOfProvideRepositoryUrl"`
+	PublishTarballInsteadOfProvideRepositoryURL bool `mapstructure:"publishTarballInsteadOfProvideRepositoryUrl"`
 }
 
 // Config represents the resolved application configuration.
+//
+// **この型を JSON へ marshal しないこと。** struct tag を 1 つも持たないので、Go の
+// フィールド名がそのまま wire の形になる (`ProxySMTP` のような名前が出る)。しかも
+// `SetupPassword` / `DB.Pass` / `MediaProxySecret` のような秘密も一緒に出るので、
+// 1 行足すだけで設定一式が漏れる。設定を外へ見せる経路は
+// `internal/server/config_dump.go` だけにしてあり、あちらはキーをリテラルで書き
+// (= フィールド名の変更が wire に波及しない)、秘密は `secretValue()` でマスクする。
 type Config struct {
 	Version string
 	URL     string
@@ -361,6 +417,8 @@ type Config struct {
 	BcryptCost  int
 	// NoteHookConcurrency: 0 なら実行時に既定 (GOMAXPROCS x 2) を使う。
 	NoteHookConcurrency int
+	// MediaProxyConcurrency: 0 なら実行時に既定 (GOMAXPROCS / 2、最低 1) を使う。
+	MediaProxyConcurrency int
 	// QueueIdlePollSeconds: 0 なら driver 既定。
 	QueueIdlePollSeconds int
 	// QueueStuckWorkerSeconds: 0 ならキューごとの既定、負値で無効。
@@ -387,7 +445,7 @@ type Config struct {
 	ID string
 
 	Proxy                  string
-	ProxySmtp              string
+	ProxySMTP              string
 	ProxyBypassHosts       []string
 	AllowedPrivateNetworks []string
 
@@ -420,7 +478,9 @@ type Config struct {
 	MaxWorkersGlobal         *int
 	AutoScaleCooldownSeconds *int
 
-	// JobQueueDriver is one of "mkq" (default) or "asynq" (legacy).
+	// JobQueueDriver is always "mkq" (#2985 removed the legacy asynq
+	// driver). Kept as a string so an unknown value is still
+	// distinguishable from the normalised default at the wiring layer.
 	JobQueueDriver string
 
 	MediaProxy                   string
@@ -478,9 +538,27 @@ type Config struct {
 	// for YAML compatibility; the Go backend itself does not consume it).
 	SentryForFrontend map[string]any
 
-	// PublishTarballInsteadOfProvideRepositoryUrl is exposed to clients via
+	// PublishTarballInsteadOfProvideRepositoryURL is exposed to clients via
 	// /api/meta.providesTarball. See the Source struct for details.
-	PublishTarballInsteadOfProvideRepositoryUrl bool
+	PublishTarballInsteadOfProvideRepositoryURL bool
+}
+
+// ProvidesTarball reports whether this server serves a source tarball at
+// /tarball/misskey-<version>.tar.gz.
+//
+// **常に false を返す。** upstream は ClientServerService が `built/tarball` を
+// `/tarball/` に静的配信するが、mk-go にはそのルートが無い。**代わりに SPA の
+// catchall (`GET /*`) が拾うので、404 にすらならず HTML が 200 で返る** — 設定を
+// そのまま公開すると、frontend が出す「ソースコード (Tarball)」のリンクは
+// `misskey-<version>.tar.gz` という名前の HTML をダウンロードさせる。AGPL 13 条の
+// 案内としては、壊れた tarball を掴ませるより repositoryUrl だけのほうが正しい (#2700)。
+//
+// **frontend 側は 2 箇所ある** (`about-misskey.vue` の tarball リンクと
+// `about.overview.vue` の `repositoryUrl || /tarball/...` フォールバック)。ルートを
+// 実装したときはこのメソッドを直すだけでは足りず、mk-go 独自の `about-mkgo.vue` にも
+// tarball の分岐を足す必要がある (現状は意図的に持っていない)。
+func (c *Config) ProvidesTarball() bool {
+	return false
 }
 
 const defaultMaxFileSize int64 = 262144000
@@ -545,6 +623,7 @@ func bindEnvKeys(v *viper.Viper) {
 		"disableHsts",
 		"bcryptCost",
 		"noteHookConcurrency",
+		"mediaProxyConcurrency",
 		"queueIdlePollSeconds",
 		"queueStuckWorkerSeconds",
 		"queueHandlerDeadlineSeconds",
@@ -616,6 +695,16 @@ func resolve(src *Source) (*Config, error) {
 			slog.Warn("noteHookConcurrency が負なので既定値を使います", "value", *src.NoteHookConcurrency)
 		} else {
 			noteHookConcurrency = *src.NoteHookConcurrency
+		}
+	}
+
+	// 同上。0 以下は実行時の既定 (GOMAXPROCS / 2) に委ねる。
+	mediaProxyConcurrency := 0
+	if src.MediaProxyConcurrency != nil {
+		if *src.MediaProxyConcurrency < 0 {
+			slog.Warn("mediaProxyConcurrency が負なので既定値を使います", "value", *src.MediaProxyConcurrency)
+		} else {
+			mediaProxyConcurrency = *src.MediaProxyConcurrency
 		}
 	}
 
@@ -698,6 +787,7 @@ func resolve(src *Source) (*Config, error) {
 		DisableHSTS:                 src.DisableHSTS,
 		BcryptCost:                  bcryptCost,
 		NoteHookConcurrency:         noteHookConcurrency,
+		MediaProxyConcurrency:       mediaProxyConcurrency,
 		QueueIdlePollSeconds:        queueIdlePollSeconds,
 		QueueStuckWorkerSeconds:     queueStuckWorkerSeconds,
 		QueueHandlerDeadlineSeconds: queueHandlerDeadlineSeconds,
@@ -721,7 +811,7 @@ func resolve(src *Source) (*Config, error) {
 		ID: src.ID,
 
 		Proxy:                  src.Proxy,
-		ProxySmtp:              src.ProxySmtp,
+		ProxySMTP:              src.ProxySMTP,
 		ProxyBypassHosts:       src.ProxyBypassHosts,
 		AllowedPrivateNetworks: src.AllowedPrivateNetworks,
 
@@ -780,7 +870,7 @@ func resolve(src *Source) (*Config, error) {
 		SentryForBackend:  src.SentryForBackend,
 		SentryForFrontend: src.SentryForFrontend,
 
-		PublishTarballInsteadOfProvideRepositoryUrl: src.PublishTarballInsteadOfProvideRepositoryUrl,
+		PublishTarballInsteadOfProvideRepositoryURL: src.PublishTarballInsteadOfProvideRepositoryURL,
 	}
 
 	if cfg.TestMode {
@@ -792,6 +882,14 @@ func resolve(src *Source) (*Config, error) {
 
 	if cfg.EnablePprof {
 		slog.Warn("config: EnablePprof is enabled; /debug/pprof/* endpoints expose runtime internals. DO NOT enable this in production.",
+			"url", cfg.URL)
+	}
+
+	if cfg.PublishTarballInsteadOfProvideRepositoryURL {
+		// 設定は読むが効かない。黙って無視すると operator は「tarball を配って
+		// いる」と思ったまま、frontend が壊れたリンクを出す状態に気付けない。
+		// **404 で気付ける類ではない** — SPA catchall が拾うので HTML が 200 で返る。
+		slog.Warn("config: publishTarballInsteadOfProvideRepositoryUrl is enabled but mk-go does not serve /tarball/ (the SPA catchall would return HTML with a .tar.gz name); providesTarball is reported as false. Set meta.repositoryUrl instead.",
 			"url", cfg.URL)
 	}
 
@@ -914,26 +1012,36 @@ func resolveRedisOrDefault(opts *RedisOptions, fallback RedisOptions, host strin
 }
 
 // resolveJobQueueDriver normalises the jobQueueDriver config value.
-// Empty / whitespace falls back to "mkq" (recommended driver、#571 audit)。
+// Empty / whitespace falls back to "mkq", the only driver (#2985)。
 // Unknown non-empty values return an error: silently swapping a typo
 // (e.g. "mkqq") for the default hides operator intent, especially given
 // that internal/server/queue_factory.go also rejects unknown driver
 // names — surfacing the failure here keeps the two layers consistent
 // and the boot log readable.
 //
-// asynq driver は legacy / future-deprecation candidate。mkq の安定性が
-// 確保され次第削除予定なので、新規 deploy は明示的に "asynq" を選ぶ
-// 必要はない。default が mkq に変更されたが、既存運用で "asynq" を明示
-// 指定している operator は影響を受けない。
+// **"asynq" だけは専用の文面で落とす。** 既定が mkq になった後も明示的に
+// asynq を選んでいた運用は意図的なので、typo と同じ「未知の値」で片付けると
+// 何が起きたのか分からない。かといって黙って mkq で起動するのも避ける —
+// driver が変わると予約投稿の可否やレート上限の効き方まで変わるので、警告
+// 1 行で流してよい変更ではない (#2985)。
+//
+// **移行が片道であることも書く。** asynq の未処理ジョブは `asynq:{<queue>}:*`
+// に居り mkq (`bull:*`) からは見えない。新しいビルドは起動を拒むので、
+// **後から捌く手段が無い** — 旧ビルドで空にしてから上げるしかない。それを
+// 知らせる機会はこのエラーしか無いので、案内をここに入れる。
 func resolveJobQueueDriver(raw string) (string, error) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	switch v {
 	case "":
 		return "mkq", nil
-	case "asynq", "mkq":
+	case "mkq":
 		return v, nil
+	case "asynq":
+		return "", fmt.Errorf("config: jobQueueDriver %q has been removed (#2985); set it to \"mkq\" or delete the line to use the default. "+
+			"Migrating is one-way: jobs still queued under Redis keys \"asynq:{<queue>}:*\" are invisible to mkq (\"bull:*\"), "+
+			"so drain them with the previous mk-go build before upgrading", raw)
 	default:
-		return "", fmt.Errorf("config: unknown jobQueueDriver %q (expected \"asynq\" or \"mkq\")", raw)
+		return "", fmt.Errorf("config: unknown jobQueueDriver %q (expected \"mkq\")", raw)
 	}
 }
 

@@ -36,7 +36,9 @@ type chatPageParams struct {
 
 // cursor normalizes the 4 cursor params to (sinceID, untilID) via
 // id.NormalizeCursor (sinceDate/untilDate を aidx prefix へ変換)。
-func (p chatPageParams) cursor() (string, string) {
+//
+// ok=false は列に入らないカーソルで、呼び出し側は 400 を返すこと (#3025)。
+func (p chatPageParams) cursor() (string, string, bool) {
 	return id.NormalizeCursor(p.SinceID, p.UntilID, p.SinceDate, p.UntilDate)
 }
 
@@ -323,6 +325,16 @@ func (h *Handler) packRoomWithCreatedAt(r *model.ChatRoom) map[string]any {
 //
 // caller が meID を渡せない場面 (例: federation 経由の eager pack や
 // 内部用途) では packRoomWithCreatedAt をそのまま使う。
+//
+// **owner の特別扱いは維持する** (#2858 で検討した結果)。これは upstream
+// ChatEntityService.ts:251-252 の `me.id !== room.ownerId` ガードの写しであって、
+// transfer-ownership が membership 行を残していたことへの回避策ではない。
+//
+// **membership を見る形に統一してはいけない。** owner の行が残っている DB
+// (000082 適用前) では `isMuted: true` を返すことになるが、フロントは owner に
+// ミュートのスイッチを出さない (`room.info.vue` の `v-if="!isOwner"`) ため、
+// 利用者からは**解除できない設定**として見える。owner never-muted で固定して
+// おけば、行が残っていても API の見え方は壊れない。
 func (h *Handler) packRoomDetailed(r *model.ChatRoom, meID string) map[string]any {
 	result := h.packRoomWithCreatedAt(r)
 	isMuted := false
@@ -533,6 +545,10 @@ func (h *Handler) AttachedChatMessages(c echo.Context) error {
 		return c.JSON(http.StatusOK, []any{})
 	}
 	file, err := h.fileRepo.FindByID(req.FileID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || file == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "Some files are not found.", "485ce26d-f5d2-4313-9783-e689d131eafb"))
 	}
@@ -542,7 +558,10 @@ func (h *Handler) AttachedChatMessages(c echo.Context) error {
 	if !isMod && (file.UserID == nil || *file.UserID != user.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "Some files are not found.", "485ce26d-f5d2-4313-9783-e689d131eafb"))
 	}
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	msgs, err := h.repo.ListMessagesByFileID(req.FileID, untilID, sinceID, req.Limit)
 	if err != nil {
 		return apierr.JSONInternalError(c)
@@ -600,6 +619,10 @@ func (h *Handler) RoomsShow(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "roomId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
 	}
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		// upstream chat/rooms/show.ts:30 の noSuchRoom id に揃える (#1771)。
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "857ae02f-8759-4d20-9adb-6e95fffe4fd7"))
@@ -630,6 +653,10 @@ func (h *Handler) RoomsUpdate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "name or description is too long.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
 	}
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || room.OwnerID != user.ID {
 		// upstream chat/rooms/update.ts:30 の noSuchRoom id に揃える (#1771)。
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "fcdb0f92-bda6-47f9-bd05-343e0e020932"))
@@ -656,6 +683,10 @@ func (h *Handler) RoomsDelete(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "roomId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
 	}
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "d4e3753d-97bf-4a19-ab8e-21080fbc0f4b"))
 	}
@@ -685,7 +716,10 @@ func (h *Handler) RoomsOwned(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req chatPageParams
 	_ = c.Bind(&req)
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	rooms, _ := h.repo.ListRoomsByOwner(user.ID, sinceID, untilID, req.clampedLimit(30))
 	result := make([]map[string]any, len(rooms))
 	for i, r := range rooms {
@@ -702,7 +736,10 @@ func (h *Handler) RoomsJoined(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req chatPageParams
 	_ = c.Bind(&req)
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	rooms, _ := h.repo.ListJoinedRooms(user.ID, sinceID, untilID, req.clampedLimit(30))
 	result := make([]map[string]any, len(rooms))
 	for i, r := range rooms {
@@ -748,6 +785,10 @@ func (h *Handler) RoomsMute(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "roomId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
 	}
 	m, err := h.repo.FindMembership(user.ID, req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		// upstream mute.ts は membership 不在で noSuchRoom を返す (以前は 204)。
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "c2cde4eb-8d0f-42f1-8f2f-c4d6bfc8e5df"))
@@ -786,11 +827,77 @@ func (h *Handler) RoomsTransferOwnership(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "roomId and userId are required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
 	}
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || room.OwnerID != user.ID {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "6ab4d7df-5043-57b9-bd5d-ff9908288473"))
 	}
-	room.OwnerID = req.UserID
-	_ = h.repo.UpdateRoom(room)
+	if req.UserID == user.ID {
+		// 自分への譲渡は何も変えない。repository 側にも同じガードがあるが、
+		// ここで返すことで下の room-full 検査も含めて丸ごと省ける。
+		return c.NoContent(http.StatusNoContent)
+	}
+	// **譲渡先は room の既存メンバーに限る。**
+	//
+	// 非メンバーへ渡せると、旧 owner に membership 行を作るこの実装では
+	// **同意していない相手の room に投稿し続けられる**。相手は owner なので
+	// fan-out で never-muted 扱いになり (core/chat/service.go)、membership 行を
+	// 持たないため `rooms/mute` も 400 になる。つまり止める手段が room ごと
+	// 消すことしかない一方通行の経路になる。譲渡前の実装では旧 owner が
+	// 締め出されるため、この形は成立しなかった。
+	//
+	// メンバーに限ると副次的に 2 つ消える。membership 行数が動かないので
+	// room-full の上限がずれず、行がある以上 user も実在するので NO_SUCH_USER の
+	// 検査も要らない (`chat_room."ownerId"` の FK 違反による 500 も起きない)。
+	//
+	// upstream Misskey にこの endpoint は無いので parity 上の制約は無く、
+	// fork frontend と misskey-js のどちらにも caller が無い。
+	if _, err := h.repo.FindMembership(req.UserID, room.ID); err != nil {
+		if !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_MEMBER", "Not a member.", "05af3d8f-a5d9-4282-8cf0-4fcc5f4e1734"))
+	}
+	// **譲渡先はローカル利用者に限る (#2994)。** リモート利用者は
+	// `AddMemberViaAP` でこちらの room のメンバーになれるので、この endpoint は
+	// **ローカルの room の owner をリモート利用者にできてしまう**。そうなると
+	// 「owner がリモート = 取り込んだ copy」という前提が崩れ、
+	// `chat_room.host` / `uri` の backfill がこちらの room に偽のリモート URI を
+	// 刻む。以後その room 宛の Accept / Reject / group message は
+	// `resolveRoomByAPURI` に弾かれて恒久的に drop され、配送側は存在しない
+	// リモート URI を名乗る。
+	//
+	// 譲る意味も無い — リモート利用者はこちらの API を叩けないので、owner に
+	// なっても room を管理できない。upstream にこの endpoint は無いので parity 上の
+	// 制約も無い。
+	if h.userRepo == nil {
+		// 未配線では譲渡先がローカルか確かめられない。素通しにしない。
+		return apierr.JSONInternalError(c)
+	}
+	target, terr := h.userRepo.FindByID(req.UserID)
+	if terr != nil {
+		if !repository.IsNotFound(terr) {
+			return apierr.JSONInternalError(c)
+		}
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_MEMBER", "Not a member.", "05af3d8f-a5d9-4282-8cf0-4fcc5f4e1734"))
+	}
+	if !target.IsLocal() {
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_MEMBER", "Not a member.", "05af3d8f-a5d9-4282-8cf0-4fcc5f4e1734"))
+	}
+	// **owner の membership 行を入れ替える。** ownerId を書き換えるだけだと
+	// 新 owner は解除できない mute を抱え、旧 owner は room から締め出される
+	// (repository.TransferRoomOwnership のコメントに詳しい)。
+	if err := h.repo.TransferRoomOwnership(room.ID, user.ID, req.UserID, h.idGen.Generate(time.Now())); err != nil {
+		if repository.IsNotFound(err) {
+			// 同時に別の譲渡が確定した場合。もう自分の room ではないので、
+			// 上の owner 検査と同じ応答に揃える。
+			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "6ab4d7df-5043-57b9-bd5d-ff9908288473"))
+		}
+		return apierr.JSONInternalError(c)
+	}
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -827,6 +934,10 @@ func (h *Handler) MessagesCreate(c echo.Context) error {
 	// マップされ、検証順も逆だった、#1771)。
 	if toRoom && h.repo != nil {
 		if _, err := h.repo.FindRoomByID(*req.ToRoomID); err != nil {
+			if !repository.IsNotFound(err) {
+				// **DB 障害を not-found に丸めない** (#2792)。
+				return apierr.JSONInternalError(c)
+			}
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "8098520d-2da5-4e8f-8ee1-df78b55a4ec6"))
 		}
 	}
@@ -857,6 +968,10 @@ func (h *Handler) MessagesCreate(c echo.Context) error {
 	// fileRepo 未配線 (legacy test) は素通しする。
 	if fileID != "" && h.fileRepo != nil {
 		f, ferr := h.fileRepo.FindByID(fileID)
+		if ferr != nil && !repository.IsNotFound(ferr) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		if ferr != nil || f.UserID == nil || *f.UserID != user.ID {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", noSuchFileID))
 		}
@@ -883,6 +998,10 @@ func (h *Handler) MessagesCreate(c echo.Context) error {
 		// いた、#1771)。user-timeline と同じ status/code/id に揃える。
 		if h.userRepo != nil {
 			if _, ferr := h.userRepo.FindByID(*req.ToUserID); ferr != nil {
+				if !repository.IsNotFound(ferr) {
+					// **DB 障害を not-found に丸めない** (#2792)。
+					return apierr.JSONInternalError(c)
+				}
 				return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "11795c64-40ea-4198-b06e-3c873ed9039d"))
 			}
 		}
@@ -958,7 +1077,22 @@ func (h *Handler) MessagesShow(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "messageId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
 	}
 	msg, err := h.repo.FindMessageByID(req.MessageID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_MESSAGE", "No such message.", "006d73c9-dada-5b5d-a0f5-00b01f70bc3c"))
+	}
+	// **当事者か moderator でなければ返さない。** upstream show.ts と同じ判定
+	// (`message.fromUserId !== me.id && message.toUserId !== me.id && !isModerator`)。
+	// room 宛のメッセージは `toUserId` が null なので、投稿者本人以外はここで
+	// 落ちる — room の発言を読む経路は messages/room-timeline のほうで、
+	// そちらは member かどうかを見ている。
+	//
+	// 応答は not-found と同じにする。区別すると messageId を総当たりして
+	// 「その id が存在するか」を引き出せる。
+	if msg.FromUserID != user.ID && (msg.ToUserID == nil || *msg.ToUserID != user.ID) && !h.isModerator(user.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_MESSAGE", "No such message.", "006d73c9-dada-5b5d-a0f5-00b01f70bc3c"))
 	}
 	return c.JSON(http.StatusOK, h.packMessageDetailed(msg, user.ID))
@@ -977,6 +1111,10 @@ func (h *Handler) MessagesUpdate(c echo.Context) error {
 	if h.svc == nil {
 		// legacy fallback
 		msg, err := h.repo.FindMessageByID(req.MessageID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		if err != nil || msg.FromUserID != user.ID {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_MESSAGE", "No such message.", "006d73c9-dada-5b5d-a0f5-00b01f70bc3c"))
 		}
@@ -1007,6 +1145,10 @@ func (h *Handler) MessagesDelete(c echo.Context) error {
 	}
 	if h.svc == nil {
 		msg, err := h.repo.FindMessageByID(req.MessageID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		if err != nil || msg.FromUserID != user.ID {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_MESSAGE", "No such message.", "006d73c9-dada-5b5d-a0f5-00b01f70bc3c"))
 		}
@@ -1055,6 +1197,10 @@ func (h *Handler) Messages(c echo.Context) error {
 		// (member OR moderator)。これが無いと room-timeline を塞いでも本経路から
 		// 任意 room の発言を読めてしまう。
 		room, err := h.repo.FindRoomByID(req.RoomID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "c4d9f88c-9270-4632-b032-6ed8cee36f7f"))
 		}
@@ -1089,6 +1235,10 @@ func (h *Handler) MessagesSearch(c echo.Context) error {
 	// 同じ code)。
 	if req.RoomID != "" {
 		room, err := h.repo.FindRoomByID(req.RoomID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		if err != nil || !h.isRoomMember(room, user.ID) {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "460b3669-81b0-4dc9-a997-44442141bf83"))
 		}
@@ -1154,6 +1304,10 @@ func (h *Handler) InvitationsCreate(c echo.Context) error {
 	// (#1201 review)。upstream create.ts は findMyRoomById==null で先に noSuchRoom
 	// (404) を投げるため、yourself より前に owner-check を行う (error 種別を揃える)。
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || room.OwnerID != user.ID {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "916f9507-49ba-4e90-b57f-1fd4deaa47a5"))
 	}
@@ -1216,12 +1370,37 @@ func (h *Handler) InvitationsCreate(c echo.Context) error {
 }
 
 // InvitationsDelete handles POST /api/chat/rooms/invitations/delete.
+// ルームオーナーが自分の送った招待を取り消す。
+//
+// 招待された側は reject / ignore を使う。こちらは連合の Reject を送らないので、
+// 被招待者に開放すると remote room の招待を黙って消せてしまう。
 func (h *Handler) InvitationsDelete(c echo.Context) error {
+	user := middleware.GetUser(c)
 	var req struct {
 		InvitationID string `json:"invitationId"`
 	}
 	if err := c.Bind(&req); err != nil || req.InvitationID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "invitationId is required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+	}
+	// **招待の所在と権限の有無を応答で区別しない。** 区別すると invitationId を
+	// 総当たりして「その id が存在するか」だけを引き出せる。
+	inv, err := h.repo.FindInvitationByID(req.InvitationID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
+	if err == nil {
+		var room *model.ChatRoom
+		room, err = h.repo.FindRoomByID(inv.RoomID)
+		if err != nil && !repository.IsNotFound(err) {
+			return apierr.JSONInternalError(c)
+		}
+		if err == nil && room.OwnerID != user.ID {
+			err = repository.ErrNotFound
+		}
+	}
+	if err != nil {
+		return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_INVITATION", "No such invitation.", "9db2b511-acf0-46f0-9856-ce089fa63b23"))
 	}
 	_ = h.repo.DeleteInvitation(req.InvitationID)
 	return c.NoContent(http.StatusNoContent)
@@ -1241,8 +1420,25 @@ func (h *Handler) InvitationsAccept(c echo.Context) error {
 	// membership が作られ、任意 room owner へ未承諾 Accept が飛ぶ (#1206 review)。
 	// 招待なしの参加は別途 rooms/join を使う。
 	inv, err := h.repo.FindInvitation(user.ID, req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_INVITATION", "No such invitation.", "8c8f38f0-3b7e-4f5e-9c6d-2e3f4a5b6c7d"))
+	}
+	// **owner の招待は行を作らずに消費する** (#2858)。owner は暗黙のメンバーで
+	// membership 行を持たない。譲渡で owner 宛の招待が残っていた場合にここが
+	// 行を作ると、その不変条件が壊れる (rooms/joined に自分の room が出る、
+	// room-full の数が 1 ずれる、解除できない mute が生まれる)。
+	room, rerr := h.repo.FindRoomByID(req.RoomID)
+	if rerr != nil && !repository.IsNotFound(rerr) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
+	if rerr == nil && room.OwnerID == user.ID {
+		_ = h.repo.DeleteInvitation(inv.ID)
+		return c.NoContent(http.StatusNoContent)
 	}
 	// メンバーシップを作成して招待を消費する。
 	m := &model.ChatRoomMembership{
@@ -1270,6 +1466,10 @@ func (h *Handler) InvitationsReject(c echo.Context) error {
 	// pending invitation がある場合のみ reject できる (任意 room owner への
 	// 未承諾 Reject 送信を防ぐ、#1206 review)。
 	inv, err := h.repo.FindInvitation(user.ID, req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_INVITATION", "No such invitation.", "8c8f38f0-3b7e-4f5e-9c6d-2e3f4a5b6c7d"))
 	}
@@ -1282,13 +1482,25 @@ func (h *Handler) InvitationsReject(c echo.Context) error {
 }
 
 // MembersBan handles POST /api/chat/rooms/members/ban.
+// ルームオーナーのみが他メンバーを退出させられる。
 func (h *Handler) MembersBan(c echo.Context) error {
+	user := middleware.GetUser(c)
 	var req struct {
 		RoomID string `json:"roomId"`
 		UserID string `json:"userId"`
 	}
 	if err := c.Bind(&req); err != nil || req.RoomID == "" || req.UserID == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "roomId and userId are required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+	}
+	// **owner だけが実行できる。** 隣の members/update-membership と同じ形。
+	// room の所在と権限の有無を応答で区別しない (どちらも NO_SUCH_ROOM)。
+	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
+	if err != nil || room.OwnerID != user.ID {
+		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "1ebd1536-1c92-4e6b-9ee0-bf4d14998bdb"))
 	}
 	_ = h.repo.DeleteMembership(req.UserID, req.RoomID)
 	return c.NoContent(http.StatusNoContent)
@@ -1307,10 +1519,18 @@ func (h *Handler) MembersUpdateMembership(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || room.OwnerID != user.ID {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "b3926861-29ef-4df6-98b5-a7c640ad2b5a"))
 	}
 	mem, err := h.repo.FindMembership(req.UserID, req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusNotFound, apierr.Error("NO_SUCH_MEMBER", "Not a member.", "e3285385-56ee-4909-9ef4-4a0e6e2e614a"))
 	}
@@ -1354,10 +1574,17 @@ func (h *Handler) UserTimeline(c echo.Context) error {
 	// NO_SUCH_USER を返す。userRepo 未配線 (legacy test) は検証 skip。
 	if h.userRepo != nil {
 		if _, err := h.userRepo.FindByID(req.UserID); err != nil {
+			if !repository.IsNotFound(err) {
+				// **DB 障害を not-found に丸めない** (#2792)。
+				return apierr.JSONInternalError(c)
+			}
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "11795c64-40ea-4198-b06e-3c873ed9039d"))
 		}
 	}
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	msgs, err := h.repo.ListMessagesByUser(user.ID, req.UserID, sinceID, untilID, req.clampedLimit(10))
 	if err != nil {
 		return apierr.JSONInternalError(c)
@@ -1389,13 +1616,20 @@ func (h *Handler) RoomTimeline(c echo.Context) error {
 	// ない) は NO_SUCH_ROOM。これが無いと任意の認証ユーザーが任意 room の発言を
 	// 読めてしまう (security)。owner は isRoomMember で member 扱い。
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "c4d9f88c-9270-4632-b032-6ed8cee36f7f"))
 	}
 	if !h.isRoomMember(room, user.ID) && !h.isModerator(user.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "c4d9f88c-9270-4632-b032-6ed8cee36f7f"))
 	}
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	msgs, err := h.repo.ListMessagesByRoom(req.RoomID, sinceID, untilID, req.clampedLimit(10))
 	if err != nil {
 		return apierr.JSONInternalError(c)
@@ -1440,7 +1674,10 @@ func (h *Handler) InvitationsInbox(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req chatPageParams
 	_ = c.Bind(&req)
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	rows, err := h.repo.ListInvitationsByUser(user.ID, false, sinceID, untilID, req.clampedLimit(30))
 	if err != nil {
 		return apierr.JSONInternalError(c)
@@ -1470,10 +1707,17 @@ func (h *Handler) InvitationsOutbox(c echo.Context) error {
 	}
 	// 自分が所有するルームの招待一覧を返す
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil || room.OwnerID != user.ID {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "a3c6b309-9717-4316-ae94-a69b53437237"))
 	}
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	rows, err := h.repo.ListInvitationsByRoom(req.RoomID, sinceID, untilID, req.clampedLimit(30))
 	if err != nil {
 		return apierr.JSONInternalError(c)
@@ -1505,6 +1749,17 @@ func (h *Handler) RoomsJoin(c echo.Context) error {
 	inv, err := h.repo.FindInvitation(user.ID, req.RoomID)
 	if err != nil {
 		return apierr.JSONInternalError(c)
+	}
+	// **owner の招待は行を作らずに消費する** (#2858、InvitationsAccept と同じ)。
+	// owner は暗黙のメンバーなので membership 行を持たない。
+	joinRoom, rerr := h.repo.FindRoomByID(req.RoomID)
+	if rerr != nil && !repository.IsNotFound(rerr) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
+	if rerr == nil && joinRoom.OwnerID == user.ID {
+		_ = h.repo.DeleteInvitation(inv.ID)
+		return c.NoContent(http.StatusNoContent)
 	}
 	// UNIQUE 制約違反を避けるため既存メンバーは冪等に扱う。新規 join 時のみ
 	// MAX_ROOM_MEMBERS=50 を超える room を拒否する (upstream 'room is full')。
@@ -1538,7 +1793,10 @@ func (h *Handler) RoomsJoining(c echo.Context) error {
 	user := middleware.GetUser(c)
 	var req chatPageParams
 	_ = c.Bind(&req)
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	rows, err := h.repo.ListMembershipsByUser(user.ID, sinceID, untilID, req.clampedLimit(30))
 	if err != nil {
 		return apierr.JSONInternalError(c)
@@ -1564,13 +1822,20 @@ func (h *Handler) RoomsMembers(c echo.Context) error {
 	// room-timeline と違い moderator は許可しない)。member でない第三者に member
 	// 一覧を晒さない。
 	room, err := h.repo.FindRoomByID(req.RoomID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "7b9fe84c-eafc-4d21-bf89-485458ed2c18"))
 	}
 	if !h.isRoomMember(room, user.ID) {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_ROOM", "No such room.", "7b9fe84c-eafc-4d21-bf89-485458ed2c18"))
 	}
-	sinceID, untilID := req.cursor()
+	sinceID, untilID, cursorOK := req.cursor()
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	members, err := h.repo.ListMembersByRoomPaged(req.RoomID, sinceID, untilID, req.clampedLimit(30))
 	if err != nil {
 		return apierr.JSONInternalError(c)

@@ -21,9 +21,9 @@ import (
 	apiannouncements "github.com/shiroha-a/mk/internal/api/announcements"
 	"github.com/shiroha-a/mk/internal/api/antennas"
 	"github.com/shiroha-a/mk/internal/api/ap"
-	"github.com/shiroha-a/mk/internal/api/apierr"
 	apiapp "github.com/shiroha-a/mk/internal/api/app"
 	apiauth "github.com/shiroha-a/mk/internal/api/auth"
+	"github.com/shiroha-a/mk/internal/api/avatardecorations"
 	"github.com/shiroha-a/mk/internal/api/blocking"
 	apibubblegame "github.com/shiroha-a/mk/internal/api/bubblegame"
 	apichannels "github.com/shiroha-a/mk/internal/api/channels"
@@ -31,7 +31,9 @@ import (
 	apichat "github.com/shiroha-a/mk/internal/api/chat"
 	"github.com/shiroha-a/mk/internal/api/clips"
 	"github.com/shiroha-a/mk/internal/api/drive"
+	apiemojiapplications "github.com/shiroha-a/mk/internal/api/emojiapplications"
 	apiemojis "github.com/shiroha-a/mk/internal/api/emojis"
+	"github.com/shiroha-a/mk/internal/api/endpoints"
 	apifederation "github.com/shiroha-a/mk/internal/api/federation"
 	apifetchexternal "github.com/shiroha-a/mk/internal/api/fetchexternal"
 	apifetchrss "github.com/shiroha-a/mk/internal/api/fetchrss"
@@ -51,6 +53,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/notifications"
 	"github.com/shiroha-a/mk/internal/api/oauth"
 	"github.com/shiroha-a/mk/internal/api/pages"
+	"github.com/shiroha-a/mk/internal/api/promo"
 	apiproxy "github.com/shiroha-a/mk/internal/api/proxy"
 	"github.com/shiroha-a/mk/internal/api/renotemute"
 	apiresetpassword "github.com/shiroha-a/mk/internal/api/resetpassword"
@@ -58,6 +61,7 @@ import (
 	apiroles "github.com/shiroha-a/mk/internal/api/roles"
 	apisignin "github.com/shiroha-a/mk/internal/api/signin"
 	apisignup "github.com/shiroha-a/mk/internal/api/signup"
+	"github.com/shiroha-a/mk/internal/api/stats"
 	"github.com/shiroha-a/mk/internal/api/streaming"
 	apisw "github.com/shiroha-a/mk/internal/api/sw"
 	apitest "github.com/shiroha-a/mk/internal/api/test"
@@ -81,8 +85,10 @@ import (
 	coreclip "github.com/shiroha-a/mk/internal/core/clip"
 	"github.com/shiroha-a/mk/internal/core/deliveryhealth"
 	coredrive "github.com/shiroha-a/mk/internal/core/drive"
-	coreemail "github.com/shiroha-a/mk/internal/core/email"
+	"github.com/shiroha-a/mk/internal/core/driveusage"
+	"github.com/shiroha-a/mk/internal/core/emojiapplication"
 	coreemojiimport "github.com/shiroha-a/mk/internal/core/emojiimport"
+	"github.com/shiroha-a/mk/internal/core/emojimeta"
 	coreephemeral "github.com/shiroha-a/mk/internal/core/ephemeral"
 	"github.com/shiroha-a/mk/internal/core/event"
 	corefeatured "github.com/shiroha-a/mk/internal/core/featured"
@@ -91,6 +97,8 @@ import (
 	corefollowing "github.com/shiroha-a/mk/internal/core/following"
 	corehashtag "github.com/shiroha-a/mk/internal/core/hashtag"
 	coreinstance "github.com/shiroha-a/mk/internal/core/instance"
+	"github.com/shiroha-a/mk/internal/core/iplog"
+	"github.com/shiroha-a/mk/internal/core/iplookuplog"
 	coremediaproxy "github.com/shiroha-a/mk/internal/core/mediaproxy"
 	coremodlog "github.com/shiroha-a/mk/internal/core/moderationlog"
 	coremoderatoractivity "github.com/shiroha-a/mk/internal/core/moderatoractivity"
@@ -108,9 +116,9 @@ import (
 	corerole "github.com/shiroha-a/mk/internal/core/role"
 	coresearch "github.com/shiroha-a/mk/internal/core/search"
 	"github.com/shiroha-a/mk/internal/core/selfcheck"
-	"github.com/shiroha-a/mk/internal/core/serverstats"
 	coresignup "github.com/shiroha-a/mk/internal/core/signup"
 	"github.com/shiroha-a/mk/internal/core/signupapplication"
+	"github.com/shiroha-a/mk/internal/core/signupform"
 	coresystemaccount "github.com/shiroha-a/mk/internal/core/systemaccount"
 	coretimeline "github.com/shiroha-a/mk/internal/core/timeline"
 	coretransfer "github.com/shiroha-a/mk/internal/core/transfer"
@@ -168,6 +176,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 5 分 TTL の in-memory cache + mutation 時 invalidate で DB 負荷を消す
 	// (#300 3-6)。
 	emojiRepo := repository.NewCachedEmojiRepository(repository.NewEmojiRepository(s.db))
+	// 絵文字由来のアバターデコレーション (#2975) の解決に使う。**catalog と同じ形の
+	// TTL cache だが、載せるのはローカルかつ非センシティブなものだけ**で、その
+	// 条件がそのまま「表示してよいか」の判定になっている。絵文字をセンシティブに
+	// したり消したりすると、後始末なしに次の TTL で全プロフィールから消える。
+	//
+	// **`emojiRepo` より後・絵文字を変える配線より前に置く。** zip インポータと
+	// admin handler の両方がこの invalidator を受け取る。
+	emojiDecorationResolver := avatardecoration.NewEmojiResolver(emojiRepo)
 	blockingRepo := repository.NewBlockingRepository(s.db)
 	mutingRepo := repository.NewMutingRepository(s.db)
 	renoteMutingRepo := repository.NewRenoteMutingRepository(s.db)
@@ -189,6 +205,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		slog.Info("user_keypair を PKCS#8 に正規化した", "converted", converted)
 	}
 	keypairExtraRepo := repository.NewUserKeypairExtraRepository(s.db)
+	// 凍結の由来 (local / remote)。モデレーターの判断をリモートに巻き戻させない (#2973)。
+	suspensionOriginRepo := repository.NewUserSuspensionOriginRepository(s.db)
 	instanceRepo := repository.NewInstanceRepository(s.db)
 	// instance.{followersCount,followingCount} は following service の
 	// adjustInstanceCountsForFollowing (Follow/Unfollow/AcceptRequest) と
@@ -225,6 +243,10 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// userIPRepo は signin handler (Phase 6) と clean cron processor (#1563)
 	// の双方で使うため、他 repo と同じ早い段階で構築する。
 	userIPRepo := repository.NewUserIPRepository(s.db)
+	// 認証済みリクエストの IP を記録する (#3103)。**meta は呼び出しのたびに読む**
+	// ので、`enableIpLogging` の切り替えが再起動なしで効く (#3107)。重複排除の窓は
+	// upstream の `userIpHistories` に合わせて 1 時間。
+	ipLogService := iplog.NewService(userIPRepo, metaRepo, iplog.DedupeWindow)
 	chatRepo := repository.NewChatRepository(s.db)
 	channelFavoriteRepo := repository.NewChannelFavoriteRepository(s.db)
 	channelMutingRepo := repository.NewChannelMutingRepository(s.db)
@@ -412,12 +434,81 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// roleAssigned 通知 (#1559): local public role 割当時に発火し、entity 側で
 	// read 時に packed role へ解決する。lookup は role 削除済なら (nil,false)。
 	roleService.SetRoleAssignNotifier(notificationHook)
+	abuseReportRepoForNotif := repository.NewAbuseReportRepository(s.db)
 	roleNotifLookup := func(roleID string) (map[string]any, bool) {
 		r, err := roleRepo.FindByID(roleID)
 		if err != nil || r == nil {
 			return nil, false
 		}
 		return entity.PackRole(r, roleService.CountAssignedUsers(roleID), idGen, corerole.DefaultPolicies()), true
+	}
+	// abuseReport 通知の現在の状態を read 時に引く (#2868)。通知は作成時点しか
+	// 持たないので、他のモデレーターが対処しても通知欄は「未対応」のまま残る。
+	// 通報が消えていれば通知ごと drop する (roleAssigned と同じ形)。
+	//
+	// **REST は batch、WebSocket は 1 件。** 通知一覧はページあたり最大 100 件
+	// なので 1 件ずつ引くと数百 SELECT が直列に走る。realtime は 1 件ずつ届く
+	// ので同じ関数を 1 要素で呼ぶ。
+	// 絵文字の登録申請の結果を read 時に引く (#2934)。通知には applicationId
+	// しか積んでいないので、承認/却下と却下理由はここで解決する。
+	//
+	// **申請が消えていたら false を返して通知ごと落とす。** 経緯を辿れない
+	// 「処理されました」だけの通知は読んだ人に何も伝えない。
+	emojiApplicationRepoForNotif := repository.NewEmojiApplicationRepository(s.db)
+	emojiApplicationNotifLookup := func(applicationID string) (entity.EmojiApplicationStatus, bool) {
+		app, err := emojiApplicationRepoForNotif.FindByID(applicationID)
+		if err != nil {
+			if !repository.IsNotFound(err) {
+				// **DB 障害を「削除済み」に丸めない (#2792)。**
+				slog.Warn("notification: emoji application lookup failed",
+					"applicationId", applicationID, "err", err)
+			}
+			return entity.EmojiApplicationStatus{}, false
+		}
+		out := entity.EmojiApplicationStatus{Name: app.Name, Status: app.Status}
+		if app.RejectReason != nil {
+			out.RejectReason = *app.RejectReason
+		}
+		return out, true
+	}
+
+	// アカウントの登録申請の read 時の状態 (#2987)。**回答は載せない** —
+	// 運営者が定義した任意の項目で氏名や連絡先が入りうる。
+	signupApplicationRepoForNotif := repository.NewSignupApplicationRepository(s.db)
+	signupApplicationNotifLookup := func(applicationID string) (entity.SignupApplicationStatus, bool) {
+		app, err := signupApplicationRepoForNotif.FindByID(applicationID)
+		if err != nil {
+			if !repository.IsNotFound(err) {
+				// **DB 障害を「削除済み」に丸めない (#2792)。**
+				slog.Warn("notification: signup application lookup failed",
+					"applicationId", applicationID, "err", err)
+			}
+			return entity.SignupApplicationStatus{}, false
+		}
+		return entity.SignupApplicationStatus{Status: app.Status}, true
+	}
+
+	abuseNotifStates := abuseReportRepoForNotif.FindStatesByIDs
+	abuseNotifLookup := func(reportID string) (entity.AbuseReportStatus, bool) {
+		states, err := abuseNotifStates([]string{reportID})
+		if err != nil {
+			// **DB 障害を「削除済み」に丸めない (#2792)。** realtime はこの 1 件を
+			// 落とすしかないが、既読位置を動かさないので未読の合図は残る。
+			slog.Warn("notification: abuse report state lookup failed", "reportId", reportID, "err", err)
+			return entity.AbuseReportStatus{}, false
+		}
+		st, ok := states[reportID]
+		if !ok {
+			return entity.AbuseReportStatus{}, false
+		}
+		out := entity.AbuseReportStatus{Resolved: st.Resolved}
+		if st.ResolvedAs != nil {
+			out.ResolvedAs = *st.ResolvedAs
+		}
+		if st.AssigneeID != nil {
+			out.AssigneeID = *st.AssigneeID
+		}
+		return out, true
 	}
 	followingService.SetNotificationHook(notificationHook)
 	reactionService.SetNotificationHook(notificationHook)
@@ -463,6 +554,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	blockingService := coreblocking.NewService(userRepo, blockingRepo, followingRepo, idGen)
 	// Block→自動 unfollow 経路でも remote instance counter を更新 (#596)
 	blockingService.SetInstanceRepo(instanceRepo)
+	// block 時に保留中の follow request を双方向で取り消す。upstream
+	// UserBlockingService.block の cancelRequest 相当。
+	blockingService.SetFollowRequestCanceller(followingService)
 	mutingService := coremuting.NewService(userRepo, mutingRepo, idGen)
 	renoteMutingService := coremuting.NewRenoteService(userRepo, renoteMutingRepo, idGen)
 	followingService.SetBlockingChecker(blockingService)
@@ -481,8 +575,15 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// IS NULL を scan して著者 + ローカル投票者に発火する (#690)。Misskey TS
 	// は BullMQ delayed job で実装しているが mk-go では queue infra を経由
 	// せずに簡素な ticker で実現。partial index で空 scan のコストは最小。
-	pollExpiryWorker := corepoll.NewExpiryWorker(pollRepo, pollVoteRepo, noteRepo, userRepo, notificationService, 60*time.Second, 100)
-	s.startConstructionWorker(pollExpiryWorker.Run)
+	// **queue role でだけ回す (#2459)。** 常駐ワーカーは複数プロセス構成で
+	// 同じ行を拾う。`ListExpiredUnnotified` → 通知 → `MarkNotified` の順で
+	// ロックも CAS も無いので、server を N 台にすると同じ投票終了通知が N 回
+	// 飛ぶ (Web Push も)。同ファイルの reaction flush / deliveryhealth /
+	// retention aggregate は同じ理由で既にゲートされており、ここだけ漏れていた。
+	if s.role.RunsQueue() {
+		pollExpiryWorker := corepoll.NewExpiryWorker(pollRepo, pollVoteRepo, noteRepo, userRepo, notificationService, 60*time.Second, 100)
+		s.startConstructionWorker(pollExpiryWorker.Run)
+	}
 	// pollVoted を note の stream topic に publish して subscribe 中の
 	// frontend (note 詳細 / timeline) が reload なしで count を更新できる
 	// ようにする (#690)。streamPubSub は下方で生成されるため遅延配線。
@@ -596,7 +697,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	}
 
 	// Export / Import workers (Phase 9.4): drive に保存するエクスポートと
-	// drive から読み出すインポートを asynq 経由で非同期処理する。
+	// drive から読み出すインポートを queue 経由で非同期処理する。
 	exporter := coretransfer.NewExporter(coretransfer.ExporterDeps{
 		UserRepo:         userRepo,
 		NoteRepo:         noteRepo,
@@ -646,6 +747,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		Drive:     driveReader,
 		Uploader:  driveService,
 		IDGen:     idGen,
+		// zip インポートは publishEmoji* を通らないので、絵文字由来の
+		// アバターデコレーション (#2975) のキャッシュはここで捨てる。
+		DecorationCache: emojiDecorationResolver,
 	})
 	emojiImportProcessor := processors.NewImportCustomEmojisProcessor(emojiImporter)
 	s.queueServer.Handle(queue.TaskTypeImportCustomEmojis, emojiImportProcessor.Handle)
@@ -752,6 +856,10 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// で先に作られるため、media-silence checker はここで遅延注入する)。
 	reactionService.SetUserRolesProvider(roleService)
 	reactionService.SetMediaSilenceChecker(instanceService)
+	// **サイレンスしたホストからのフォローを承認制にする。** 未配線だと
+	// 未施錠アカウントが承認なしでフォローされ、followers 限定ノートが
+	// 配送される (upstream UserFollowingService の 4 つ目の OR 条件)。
+	followingService.SetSilencedHostChecker(instanceService)
 	// ホワイトリスト連合 (federation: specified) / blockedHosts に対する gate を
 	// resolver の入口 (fetchActor / resolveNoteOnce / IngestNoteWithCreated) に
 	// 適用する。deliver_service / inboxProcessor と同じ instanceService を共有。
@@ -785,12 +893,15 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// inbound ほど高頻度ではないので buffer を挟まない。
 	federationResolver.SetSignatureCapabilityDeclarer(sigCapRepo)
 
-	// AP delivery: DeliverService + フック登録 + asynq processor 登録
+	// AP delivery: DeliverService + フック登録 + queue processor 登録
 	deliverService := corefederation.NewDeliverService(s.queueClient, userRepo, followingRepo, keypairRepo, apURLs)
 	deliverService.SetHostBlockChecker(instanceService)
 	// FEP-521a Multikey 対応で recipient capable + sender Ed25519 鍵あり 経路で
 	// Ed25519 sign を試行できるよう wire (#1067 / #1071)。
 	deliverService.SetKeypairExtraRepo(keypairExtraRepo)
+	// **未配線だと actor の `toot:suspended` を読まない** — 由来を持てない状態で
+	// 自動凍結すると、モデレーターが解除しても次の refresh で無言で戻る (#2973)。
+	federationResolver.SetSuspensionOriginRepo(suspensionOriginRepo)
 	deliverService.SetPublickeyExtraRepo(repository.NewUserPublickeyExtraRepository(s.db))
 	// test (#780) で queue を bypass して同期 deliver する hook を後付けで
 	// 差し替えられるよう、Server から参照を保持する。
@@ -838,6 +949,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	blockingService.SetFederationHook(corefederation.NewBlockingDeliveryHook(deliverService, userRepo, apRenderer))
 	noteDeleteHook := corefederation.NewNoteDeleteDeliveryHook(deliverService, apRenderer, apURLs)
 	noteDeleteHook.SetUserRepo(userRepo)
+	noteDeleteHook.SetNoteRepo(noteRepo)
 	noteDeleteService.SetFederationHook(noteDeleteHook)
 	deliverProcessor := processors.NewDeliverProcessor(apClient)
 	// 配信結果に応じて instance.isNotResponding を更新する
@@ -849,6 +961,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 持つ (#1067 / #1071)。Ed25519 sign 失敗時 5min 同 host を RSA only に
 	// 縮退する safety net。
 	deliverProcessor.SetRedis(s.redis.Default)
+	// **署名鍵は payload に載せず、配送時に引く。** queue の job は
+	// `admin/queue/jobs` が moderator へ返すので、載せると鍵がそこから読める。
+	deliverProcessor.SetSigningKeySource(processors.NewRepoSigningKeySource(keypairRepo, keypairExtraRepo))
 	// Ed25519 署名の配送が 2xx を返した (= 同期的には拒否されなかった) ことを
 	// 記録する (#2393)。
 	deliverProcessor.SetSignatureCapabilityRecorder(sigCapBuffer)
@@ -889,15 +1004,26 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// (RegisterCleanRemoteNotesJob, 毎日 04:00, TS 'cleanRemoteNotes' 相当,
 	// #1563)。旧実装は 6h time.Ticker だった。Handle は常に登録し、processor が
 	// cfg.Enabled で gate する (起動時 meta から構築)。
-	cleanCfg := processors.CleanRemoteNotesConfig{}
-	if cleanMeta, err := metaRepo.Fetch(); err == nil {
-		cleanCfg = processors.CleanRemoteNotesConfig{
+	// **毎回読む。** 起動時に固定すると、運営者が管理画面で止めてもプロセスを
+	// 再起動するまで削除が走り続ける (不可逆な操作の唯一の停止手段)。
+	cleanCfgFn := func() processors.CleanRemoteNotesConfig {
+		cleanMeta, err := metaRepo.Fetch()
+		if err != nil || cleanMeta == nil {
+			// **読めなければ動かさない。** 判定材料が無いまま不可逆な削除を
+			// 続けるより、次の cron まで待つほうが安全。
+			return processors.CleanRemoteNotesConfig{}
+		}
+		return processors.CleanRemoteNotesConfig{
 			Enabled:              cleanMeta.EnableRemoteNotesCleaning,
 			ExpiryDays:           cleanMeta.RemoteNotesCleaningExpiryDaysForEachNotes,
 			MaxProcessingMinutes: cleanMeta.RemoteNotesCleaningMaxProcessingDurationInMinutes,
 		}
 	}
-	cleanProcessor := processors.NewCleanRemoteNotesProcessor(noteRepo, cleanCfg)
+	cleanProcessor := processors.NewCleanRemoteNotesProcessor(noteRepo, cleanCfgFn)
+	cleanProcessor.SetCursorStore(processors.RedisCursorStore{
+		Client: s.redis.Default,
+		Key:    s.config.Redis.KeyPrefix() + processors.CleanRemoteNotesCursorKey,
+	})
 	s.queueServer.Handle(queue.TaskTypeCleanRemoteNotes, cleanProcessor.Handle)
 
 	// リレー由来の孤児リモートユーザーの掃除 (#2340)。転送活動の LD-Signature
@@ -956,7 +1082,10 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// Daily generic clean (#1563): scheduler の cron (0 0 * * *) が enqueue する。
 	// user_ip 90 日 prune / 期限切れ role_assignment 削除 / reversi outdated game 削除 /
 	// 未使用 antenna の deactivate (#1604, deactivateAntennaThreshold ミリ秒)。
-	cleanGenericProcessor := processors.NewCleanProcessor(userIPRepo, roleAssignmentRepo, reversiRepo, idGen, antennaRepo, time.Duration(s.config.DeactivateAntennaThreshold)*time.Millisecond)
+	cleanGenericProcessor := processors.NewCleanProcessor(userIPRepo, roleAssignmentRepo, reversiRepo, idGen, antennaRepo, time.Duration(s.config.DeactivateAntennaThreshold)*time.Millisecond, repository.NewUserPendingRepository(s.db))
+	// IP 照会の監査記録にも保持期間を掛ける (#3106)。**この行が無いと記録が永久に
+	// 残り、`moderation_log` に IP を書くのと変わらなくなる。**
+	cleanGenericProcessor.SetIPLookupLogPruner(repository.NewIPLookupLogRepository(s.db))
 	s.queueServer.Handle(queue.TaskTypeClean, cleanGenericProcessor.Handle)
 
 	// 分割アップロードセッションの GC (#2313): scheduler の cron (*/15) が
@@ -1039,7 +1168,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	}, 0)
 	// Save の集約エラーを slog に出す。既定は no-op なので、配線しないと
 	// 「どの group が書けなかったか」が本番でどこにも残らない (#2651)。
-	chartMgmt.SetLogger(slog.Warn)
+	//
+	// **`slog.Warn` ではなく、いま解決した logger の Warn を渡す** (#2872)。
+	// パッケージ関数を渡すと、ticker goroutine が実際に書く時点の
+	// `slog.Default()` に出る。Chart 側と揃えて、配線した時点のものに固定する。
+	chartMgmt.SetLogger(slog.Default().Warn)
 	s.setChartManagement(chartMgmt)
 	chartHooks := charthook.New(charthook.Config{
 		Notes:            chartCharts.Notes,
@@ -1282,9 +1415,19 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		slog.Warn("test mode: rate limiting is disabled")
 	}
 	api.Use(rateLimiter.Middleware())
+	// 認証済みリクエストの IP を記録する (#3103)。**group の Use なので
+	// `auth.Authenticate()` (global) より後に走る** — 逆だと UserContextKey が
+	// まだ積まれておらず、常に何もしない middleware になる。
+	api.Use(middleware.RecordClientIP(ipLogService))
 
 	// Meta endpoint (public)
 	metaHandler := meta.NewHandler(s.config, metaRepo)
+	// **`requireSetup` をサーバー側の受け入れ条件と揃える (#3037)。**
+	// `admin/accounts/create` の初回セットアップ窓は「`rootUserId` 未設定
+	// **かつ**ローカル利用者 0」でしか開かないので、フロントの判定も同じに
+	// する。揃えないと、`rootUserId` が NULL で利用者ありの DB で
+	// **セットアップ画面が出続けて作成ボタンが必ず失敗する**。
+	meta.SetLocalUserCounter(func() (int64, error) { return userRepo.CountLocalUsers() })
 	metaHandler.SetAdRepo(repository.NewAdRepository(s.db))
 	proxyAccountResolver := newProxyAccountResolver(repository.NewSystemAccountRepository(s.db), userRepo)
 	metaHandler.SetProxyAccountResolver(proxyAccountResolver)
@@ -1344,51 +1487,17 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// Stats endpoint (public) — チャートの集計済み値から取得
 	notesChart := chartCharts.Notes
 	usersChart := chartCharts.Users
-	api.POST("/stats", func(c echo.Context) error {
-		ctx := c.Request().Context()
-		var notesCount, originalNotesCount, usersCount, originalUsersCount int64
-
-		if res, err := notesChart.GetChart(ctx, chart.SpanHour, 1, nil, ""); err == nil {
-			if v, ok := res["local.total"]; ok && len(v) > 0 {
-				originalNotesCount = v[0]
-			}
-			if v, ok := res["remote.total"]; ok && len(v) > 0 {
-				notesCount = originalNotesCount + v[0]
-			}
-		}
-		if res, err := usersChart.GetChart(ctx, chart.SpanHour, 1, nil, ""); err == nil {
-			if v, ok := res["local.total"]; ok && len(v) > 0 {
-				originalUsersCount = v[0]
-			}
-			if v, ok := res["remote.total"]; ok && len(v) > 0 {
-				usersCount = originalUsersCount + v[0]
-			}
-		}
-
-		var instancesCount int64
-		s.db.Model(&model.Instance{}).Count(&instancesCount)
-
-		// upstream stats.ts は reactionsCount を noteReactionsRepository.count() で
-		// 返す。mk-go は 0 固定だったので note_reaction の総数を集計する (#1777)。
-		var reactionsCount int64
-		s.db.Model(&model.NoteReaction{}).Count(&reactionsCount)
-
-		return c.JSON(http.StatusOK, map[string]any{
-			"notesCount":         notesCount,
-			"originalNotesCount": originalNotesCount,
-			"usersCount":         usersCount,
-			"originalUsersCount": originalUsersCount,
-			"instances":          instancesCount,
-			"driveUsageLocal":    0,
-			"driveUsageRemote":   0,
-			"reactionsCount":     reactionsCount,
-		})
-	})
+	statsHandler := stats.NewHandler(s.db, notesChart, usersChart)
+	api.POST("/stats", statsHandler.Stats)
 
 	// listRelationRepos は embed user に viewer 視点の relation block を付与する
-	// 共有 Repos。/users・/pinned-users の inline handler と mute/renote-mute/
-	// following/federation/hashtags handler が共有する (#1957-a)。Apply は
-	// 匿名 / self / 未配線で no-op。
+	// 共有 Repos。mute/renote-mute/following/federation/hashtags handler が
+	// 共有する (#1957-a)。Apply は匿名 / self / 未配線で no-op。
+	//
+	// **`/users` / `/pinned-users` はこれを使わない** (#2791 で移設した先の
+	// `usersHandler.viewerRelationRepos()` が同じ 6 つを組み立てる)。
+	// `userrelation.Repos` にフィールドを足すときは**両方に配線が要る** —
+	// 片方だけ更新すると explore と pinned-users から黙って欠ける。
 	listRelationRepos := userrelation.Repos{
 		Following:     followingRepo,
 		Blocking:      blockingRepo,
@@ -1398,104 +1507,24 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		Memo:          repository.NewUserMemoRepository(s.db),
 	}
 
-	// Users endpoint (public) — ユーザー一覧
-	api.POST("/users", func(c echo.Context) error {
-		var req struct {
-			Limit    int    `json:"limit"`
-			Offset   int    `json:"offset"`
-			Sort     string `json:"sort"`
-			State    string `json:"state"`
-			Origin   string `json:"origin"`
-			Hostname string `json:"hostname"`
-		}
-		if err := c.Bind(&req); err != nil {
-			return c.JSON(http.StatusOK, []any{})
-		}
-		// upstream users.ts:35 の state enum は ['all','alive'] (default 'all')。
-		// 範囲外 (moderator/admin 等の role state) は ajv が 400 で reject するので、
-		// public /users でも同じく弾く (ListUsers の role filter に到達させない、#1996)。
-		if !users.ValidListState(req.State) {
-			return apierr.JSONInvalidParam(c)
-		}
-		if req.Limit <= 0 {
-			req.Limit = 10
-		}
-		if req.Origin == "" {
-			req.Origin = "local"
-		}
-		viewer := middleware.GetUser(c)
-		viewerID := ""
-		if viewer != nil {
-			viewerID = viewer.ID
-		}
-		// upstream users.ts: base filter isExplorable=TRUE AND isSuspended=FALSE、
-		// hostname 絞り込み、認証時は mute/block 除外 (#1957-b)。
-		users, err := userRepo.ListUsers(model.UserListFilter{
-			State: req.State, Origin: req.Origin, Sort: req.Sort,
-			Limit: req.Limit, Offset: req.Offset,
-			Hostname:             req.Hostname,
-			ExplorableOnly:       true,
-			ExcludeRelatedTo:     viewerID,
-			UpdatedAtSortNonNull: true, // #1975: public /users は updatedAt sort で NULL updatedAt を除外
-		})
-		if err != nil {
-			return c.JSON(http.StatusOK, []any{})
-		}
-		ctx := c.Request().Context()
-		result := make([]any, 0, len(users))
-		for _, u := range users {
-			profile, _ := userRepo.FindProfileByUserID(u.ID)
-			// idGen を渡して createdAt を有効にする。未配線だと createdAt="" で
-			// misskey_dart の DateTimeConverter が FormatException で落ちる (#1251)。
-			d := entity.PackUserDetailed(u, profile, idGen)
-			// 認証 caller には viewer->user の relation block を付与 (#1957-a)。
-			listRelationRepos.Apply(&d, viewerID, u, profile)
-			// upstream の pack は isDetailed && isMe で MeDetailed を返す。
-			result = append(result, meself.Pack(ctx, d, u, profile, viewer))
-		}
-		return c.JSON(http.StatusOK, result)
-	})
-
-	// Pinned users (public)
-	//
-	// upstream pinned-users.ts は res が UserDetailed 配列で、各 pinnedUsers の
-	// acct を Acct.parse して host?? IsNull() で local/remote 両方を検索する
-	// (#1551)。mk-go も acct の host 部分を解決し UserDetailed で返す。
-	api.POST("/pinned-users", func(c echo.Context) error {
-		m, err := metaRepo.Fetch()
-		if err != nil || len(m.PinnedUsers) == 0 {
-			return c.JSON(http.StatusOK, []any{})
-		}
-		pinnedViewerID := ""
-		if v := middleware.GetUser(c); v != nil {
-			pinnedViewerID = v.ID
-		}
-		result := make([]entity.UserDetailed, 0, len(m.PinnedUsers))
-		for _, acct := range m.PinnedUsers {
-			username, host := parseAcct(acct, localHost)
-			if username == "" {
-				continue
-			}
-			u, err := userRepo.FindByUsernameLower(strings.ToLower(username), host)
-			if err != nil {
-				continue
-			}
-			profile, _ := userRepo.FindProfileByUserID(u.ID)
-			d := entity.PackUserDetailed(u, profile, idGen)
-			// 認証 caller には viewer->user の relation block を付与 (#1957-a)。
-			listRelationRepos.Apply(&d, pinnedViewerID, u, profile)
-			result = append(result, d)
-		}
-		return c.JSON(http.StatusOK, result)
-	})
-
 	// CAPTCHA service — meta から有効な provider を選択して構築する。
 	// meta 取得失敗時は captcha 無効として動作する (ログイン不能を避けるため)。
 	// siteverify は SSRF-safe transport + forward proxy 経由にする (#638)。
-	var captchaSvc *corecaptcha.Service
-	if serverMeta, err := metaRepo.Fetch(); err == nil {
-		captchaSvc = corecaptcha.NewServiceWithClient(serverMeta, s.outboundClient(10*time.Second))
+	//
+	// **起動時に meta を読めなくても service は作る (#3037)。** 以前は nil の
+	// ままにしていたので、`SetCaptcha` も呼ばれず `reloadCaptcha` も
+	// `captchaSvc == nil` で即 return し、**その後 meta が読めるようになっても
+	// captcha が永久に無効**だった。しかも `/api/meta` は DB を読むので
+	// フロントはウィジェットを描画し、運営者には ON に見える — この配線が
+	// 塞ごうとしている状態そのもの。空の meta で作っておけば、次の
+	// `metaUpdated` で provider が入る。
+	captchaMeta, captchaMetaErr := metaRepo.Fetch()
+	if captchaMetaErr != nil || captchaMeta == nil {
+		slog.Warn("captcha: meta unavailable at startup; starting disabled and waiting for metaUpdated",
+			"err", captchaMetaErr)
+		captchaMeta = &model.Meta{}
 	}
+	captchaSvc := corecaptcha.NewServiceWithClient(captchaMeta, s.outboundClient(10*time.Second))
 
 	// Signup (public)
 	userPendingRepo := repository.NewUserPendingRepository(s.db)
@@ -1530,14 +1559,37 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 承認制の登録 (#2554 / #2569)。本人性はクレームコードが担保するので、
 	// 外部サーバーには一切依存しない。
 	signupHandler.SetSignupApplications(signupApplicationService)
+	// 申請が出されたことをモデレーターへ知らせる (#2987)。**審査 endpoint が
+	// RequireModerator なので宛先は GetModerators と一致する。**
+	signupApplicationService.SetReceivedNotifier(
+		signupapplication.NewReceivedNotifier(notificationService, roleService))
 	signupHandler.SetTestMode(s.config.TestMode)
 	// emailRequiredForSignup フローの確認メール送信。常に sender を配線し、
 	// closure 内で毎回 meta を読み直すことで admin UI の SMTP 設定変更が
 	// 再起動なしに反映される (#1112)。smtpSecure も meta 経由で反映 (#1111)。
-	signupHandler.SetEmailSender(s.config.URL, miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySmtp))
+	signupHandler.SetEmailSender(s.config.URL, miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySMTP))
+	// captcha の実 provider が 1 つも無いときに申請 endpoint を守る署名付き
+	// フォームトークン (#2806)。**captcha の代替ではない** — 位置づけは
+	// core/signupform の doc を見ること。
+	//
+	// 鍵は instance_secret から取る (config 項目を増やさず、再起動とワーカー
+	// 跨ぎで一貫させる)。**取れなかったら配線しない** — 弱い鍵に fallback する
+	// と署名が意味を失うので、未配線として起動時に検出させるほうがよい。
+	//
+	// **nonce store は具象型のまま nil を見る。** interface に入れてから判定すると
+	// typed-nil で必ず非 nil になり、「未配線」を検出できない。
+	if nonces := signupform.NewRedisNonceStore(s.redis.Default); nonces == nil {
+		slog.Error("signup form token: redis unavailable, form tokens disabled")
+	} else if secret, err := repository.NewInstanceSecretRepository(s.db).
+		GetOrCreate(repository.SignupFormTokenKey); err != nil {
+		slog.Error("signup form token: secret unavailable, form tokens disabled", "err", err)
+	} else {
+		signupHandler.SetFormTokenIssuer(signupform.NewIssuer(secret, nonces))
+	}
 	api.POST("/signup", signupHandler.Signup)
 	// 承認制の登録 (#2554 / #2556)。認証は不要 — 本人確認は MiAuth が担う。
 	// 有効になっていない構成では 503 を返す。
+	api.POST("/signup-application/form-token", signupHandler.ApplicationFormToken)
 	api.POST("/signup-application/apply", signupHandler.ApplicationApply)
 	api.POST("/signup-application/status", signupHandler.ApplicationStatus)
 	api.POST("/signup-application/register", signupHandler.ApplicationRegister)
@@ -1551,48 +1603,32 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 弾かれるため INVALID_PARAM を返す。
 	usedUsernameRepo := repository.NewUsedUsernameRepository(s.db)
 	signupService.SetUsedUsernameRepo(usedUsernameRepo) // #2080: 削除済 username 再利用を弾く
-	api.POST("/username/available", func(c echo.Context) error {
-		var req struct {
-			Username string `json:"username"`
-		}
-		if err := c.Bind(&req); err != nil {
-			return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-		}
-		// format 検証 (upstream localUsernameSchema、paramDef レベル拒否相当)。
-		if !coresignup.ValidUsernameFormat(req.Username) {
-			return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-		}
-		lower := strings.ToLower(req.Username)
-		// (1) 既存 local user
-		_, userErr := userRepo.FindByUsernameLower(lower, nil)
-		existsUser := userErr == nil
-		// (2) used_usernames (過去に使われ解放された username)
-		usedExists, _ := usedUsernameRepo.Exists(lower)
-		// (3) preservedUsernames (予約 username)
-		preserved := false
-		if m, err := metaRepo.Fetch(); err == nil && m != nil {
-			preserved = coresignup.IsReservedUsername(lower, m.PreservedUsernames)
-		}
-		available := !existsUser && !usedExists && !preserved
-		return c.JSON(http.StatusOK, map[string]any{"available": available})
-	})
+	signupHandler.SetUsernameLookups(userRepo, usedUsernameRepo)
+	api.POST("/username/available", signupHandler.UsernameAvailable)
 
 	// Signin (Phase 6)
 	signinHandler := apisignin.NewHandler(userRepo)
 	if captchaSvc != nil {
 		signinHandler.SetCaptcha(captchaSvc)
 	}
-	// IP logging: meta.enableIpLogging が true のときだけ記録する。
-	if serverMeta, err := metaRepo.Fetch(); err == nil && serverMeta.EnableIPLogging {
-		signinHandler.SetIPLogger(userIPRepo, true)
-	}
+	// **signin 側にも testMode が要る (#3037 レビュー 2 周目)。** upstream
+	// `SigninApiService.ts:184` は signin の captcha 検証も
+	// `process.env.NODE_ENV !== 'test'` で囲っている。signup 側にだけ
+	// 配線されていたので、captcha を有効にした e2e 構成では signup だけ
+	// 通って signin が落ちる。
+	signinHandler.SetTestMode(s.config.TestMode)
+	// IP logging (#3103)。**起動時に meta を読んで配線するかどうかを決めない** —
+	// その形だと管理画面で有効にしても再起動するまで記録が始まらなかった (#3107)。
+	// 記録するかどうかは iplog.Service が呼び出しのたびに meta から判断する。
+	signinHandler.SetIPRecorder(ipLogService)
 	// signin履歴レコード注入
 	signinRepo := repository.NewSigninRepository(s.db)
 	signinHandler.SetSigninRepo(signinRepo, idGen)
 	signinHandler.SetLoginNotifier(notificationHook)
 	// new-login 通知メール (#2454)。SenderFromMeta が per-call で meta を読み直すので
 	// admin UI の SMTP 設定変更が再起動なしで効く。SMTP 未設定なら no-op。
-	signinHandler.SetEmailSender(s.config.URL, miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySmtp))
+	signinHandler.SetEmailSender(s.config.URL, miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySMTP))
+	signinHandler.SetMetaRepo(metaRepo)
 	// アカウント作成時も signin 副作用 (履歴 / login 通知 / main publish) を通す (#1804)。
 	signupHandler.SetSigninRecorder(signinHandler)
 	api.POST("/signin", signinHandler.Signin)
@@ -1605,7 +1641,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	resetHandler.SetServerURL(s.config.URL)
 	// password reset の確認メール送信。配線パターンは signup と同じく
 	// SenderFromMeta で per-call 再 Fetch、runtime 設定変更追従 (#1112)。
-	resetHandler.SetEmailSender(miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySmtp))
+	resetHandler.SetMetaRepo(metaRepo)
+	resetHandler.SetEmailSender(miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySMTP))
 	api.POST("/request-reset-password", resetHandler.RequestReset)
 	api.POST("/reset-password", resetHandler.Reset)
 
@@ -1631,6 +1668,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Emojis endpoints (public)
 	emojisHandler := apiemojis.NewHandler(emojiRepo)
+	emojisHandler.SetExportEnqueuer(s.queueClient)
 	api.POST("/emojis", emojisHandler.Emojis)
 	api.GET("/emojis", emojisHandler.Emojis)
 	api.POST("/emoji", emojisHandler.Emoji)
@@ -1700,7 +1738,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// gate が**丸ごと消えていた** (空文字は "none" でも "local" でもないので
 	// 素通し)。列は NOT NULL DEFAULT 'local' なので、失敗時も制限側の既定へ
 	// 倒す (#2708)。
-	notesHandler.SetUGCVisibility(metaUGCVisibility(metaRepo))
+	// **毎回読む。** 起動時に焼き込むと、運営者が管理画面で締めても
+	// プロセスを再起動するまで API に反映されない。
+	notesHandler.SetUGCVisibilityLookup(func() string { return metaUGCVisibility(metaRepo) })
 	if m, err := metaRepo.Fetch(); err == nil {
 		if m.DeeplAuthKey != nil && *m.DeeplAuthKey != "" {
 			notesHandler.SetTranslator(coretranslate.NewDeepL(*m.DeeplAuthKey, m.DeeplIsPro, s.outboundClient(10*time.Second)))
@@ -1758,7 +1798,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// note 化する。dependencies は既存 noteCreateService + userRepo + 上記
 	// noteDraftRepo を共有する。
 	postScheduledNoteProcessor := processors.NewPostScheduledNoteProcessor(noteDraftRepo, userRepo, noteCreateService)
-	// idempotency lock を Redis SETNX で配線 (#1045 Phase 2-A)。asynq の
+	// idempotency lock を Redis SETNX で配線 (#1045 Phase 2-A)。queue の
 	// at-least-once delivery で job が二重 fire しても重複 publish を防ぐ。
 	postScheduledNoteProcessor.SetLock(processors.NewRedisScheduledNoteLock(
 		s.redis.Default, s.config.Redis.KeyPrefix(), 0))
@@ -1777,12 +1817,16 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 
 	// Users endpoints
 	usersHandler := users.NewHandler(userService, followingService, noteRepo, idGen)
+	// /pinned-users は meta.pinnedUsers の acct を解決する (#2791 で router.go の
+	// inline closure から移設)。
+	usersHandler.SetMetaRepo(metaRepo)
+	usersHandler.SetLocalHost(localHost)
 	usersHandler.SetChartHook(chartHooks)
 	// users/notes (withChannelNotes) の post-fetch filter でチャンネルミュートを効かせる。
 	usersHandler.SetChannelMutingRepo(channelMutingRepo)
 	// #2106 S3: 匿名 visitor への remote profile 露出を ugcVisibilityForVisitor で gate。
 	// notes 側と同じ理由で無条件に配線する (#2708)。
-	usersHandler.SetUGCVisibility(metaUGCVisibility(metaRepo))
+	usersHandler.SetUGCVisibilityLookup(func() string { return metaUGCVisibility(metaRepo) })
 	usersHandler.SetFeaturedRanking(featuredService) // #1687: users/featured-notes ランキング
 	usersHandler.SetPiningRepo(piningRepo)
 	usersHandler.SetFollowingRepo(followingRepo)
@@ -1806,9 +1850,24 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	usersHandler.SetNoteFieldResolver(noteFieldResolver)
 	usersHandler.SetUserRepo(userRepo)
 	usersHandler.SetNoteReactionRepo(reactionRepo)
+	remoteStatsFetcher := corefederation.NewRemoteStatsFetcher(s.config.AllowedPrivateNetworks, s.config.UserAgent, s.outboundOpts()...)
+	// **連合を切った相手へ取りに行かない。** この経路は未認証の
+	// `/api/users/show` から呼ばれるので、放っておくと defederate した相手に
+	// 「誰をいつ見たか」が漏れる。
+	remoteStatsFetcher.SetHostAllowedChecker(instanceService.CanFetchOptionalRemoteData)
 	usersHandler.SetRemoteStatsFetcher(&remoteStatsFetcherAdapter{
-		fetcher: corefederation.NewRemoteStatsFetcher(s.config.AllowedPrivateNetworks, s.config.UserAgent, s.outboundOpts()...),
+		fetcher: remoteStatsFetcher,
 	})
+	// Users endpoint (public) — ユーザー一覧
+	api.POST("/users", usersHandler.List)
+
+	// Pinned users (public)
+	//
+	// upstream pinned-users.ts は res が UserDetailed 配列で、各 pinnedUsers の
+	// acct を Acct.parse して host?? IsNull() で local/remote 両方を検索する
+	// (#1551)。mk-go も acct の host 部分を解決し UserDetailed で返す。
+	api.POST("/pinned-users", usersHandler.PinnedUsers)
+
 	api.POST("/users/show", usersHandler.Show)
 	// upstream search.ts:15-16 は requireCredential:false + requiredRolePolicy:
 	// canSearchUsers。canSearchUsers の base default は true なので匿名も検索でき、
@@ -1874,7 +1933,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// SMTP メール送信を i/update-email 用に注入する。meta の SMTP 設定に従い、
 	// SenderFromMeta が closure 内で per-call 再 Fetch するため admin UI の
 	// 設定変更は即座に反映される (#1112)。smtpSecure 反映は #1111。
-	iHandler.SetEmailSender(miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySmtp))
+	iHandler.SetEmailSender(miscsmtp.SenderFromMeta(metaRepo, s.config.ProxySMTP))
 	if webauthnSvc != nil {
 		iHandler.SetWebAuthn(webauthnSvc, userSecurityKeyRepo)
 	}
@@ -1954,6 +2013,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// admin 管理で低頻度更新のため 30s TTL の in-memory cache で十分。
 	avatarDecorationResolver := avatardecoration.NewResolver(avatarDecorationRepo)
 	entity.SetAvatarDecorationLookup(avatarDecorationResolver)
+	entity.SetEmojiDecorationLookup(emojiDecorationResolver)
 	// PackUserLite の canChat を role policy 由来 (= upstream
 	// `chatAvailability === "available"`) に揃える (#988)。roleService 自体
 	// が in-memory cache を持つ (#761) ので追加 DB 負荷は実質ゼロ。
@@ -1999,6 +2059,17 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		s.config.ExternalMediaProxyEnabled,
 		proxyRemoteFiles,
 	)
+	// **毎回読む。** 起動時の値を焼き込むと、運営者が管理画面で切り替えても
+	// プロセスを再起動するまで反映されない。これは閲覧者の IP がリモートへ
+	// 漏れるかどうかを決める設定なので、締めたつもりで漏れ続ける形になる。
+	mediaURLCtx.SetProxyRemoteFilesLookup(func() bool {
+		m, err := metaRepo.Fetch()
+		if err != nil || m == nil {
+			// 読めないときは起動時の値に倒す (既定 true = プロキシ経由)。
+			return proxyRemoteFiles
+		}
+		return m.ProxyRemoteFiles
+	})
 	// オブジェクトストレージの公開ドメインは instance ドメインと別なので、
 	// これを教えないと自分が保存したファイルまで remote 判定されて media proxy
 	// を経由してしまう (#2315)。設定は admin が変更しうるので都度引く。
@@ -2070,10 +2141,16 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	notificationsHandler.SetFollowRequestRepo(followRequestRepo)
 	notificationsHandler.SetInstanceRepo(instanceRepo)
 	notificationsHandler.SetEmojiRepo(emojiRepo)
+	// abuseReport 通知は read 時に権限を再確認する (#2868)。**未配線だと
+	// fail-closed で abuseReport が誰にも返らない** ので、機能ごと死ぬ。
+	notificationsHandler.SetModeratorChecker(roleService)
 	// read 時 valid-notifier filter (now-muted notifier の除外) 用 (#1775)。
 	notificationsHandler.SetMutingRepo(mutingRepo)
 	notificationsHandler.SetTestNotifier(notificationHook)
 	notificationsHandler.SetRoleLookup(roleNotifLookup)
+	notificationsHandler.SetAbuseReportLookup(abuseNotifStates)
+	notificationsHandler.SetEmojiApplicationLookup(emojiApplicationNotifLookup)
+	notificationsHandler.SetSignupApplicationLookup(signupApplicationNotifLookup)
 	// 通知に埋め込む note の files / channel / myReaction を埋める (#2735)。
 	notificationsHandler.SetNoteFieldResolver(noteFieldResolver)
 	// notifications/create の 'app' 通知で header/icon を token.name/iconUrl に
@@ -2093,7 +2170,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.POST("/i/apps", iHandler.Apps, middleware.RequireAuth(), middleware.RequireSecure())
 	api.POST("/i/authorized-apps", iHandler.AuthorizedApps, middleware.RequireAuth(), middleware.RequireSecure())
 	api.POST("/i/signin-history", iHandler.SigninHistory, middleware.RequireAuth(), middleware.RequireSecure())
-	api.POST("/i/revoke-token", iHandler.RevokeToken, middleware.RequireAuth(), middleware.RequireSecure())
+	// upstream c07ce75281: サードパーティアプリが自身のアクセストークンを失効
+	// できるよう secure を外した。**RequireAuth も付けない** — upstream は
+	// requireCredential を外して endpoint 固有の CREDENTIAL_REQUIRED を投げるので、
+	// 汎用 middleware に任せると error id が食い違う。認証と「自分のトークン以外は
+	// 403」はどちらも handler 側で見る。
+	api.POST("/i/revoke-token", iHandler.RevokeToken)
 	api.POST("/i/update-email", iHandler.UpdateEmail, middleware.RequireAuth(), middleware.RequireSecure())
 	api.POST("/verify-email", iHandler.VerifyEmail)
 	api.POST("/i/move", iHandler.Move, middleware.RequireAuth(), middleware.RequireNotMoved(), middleware.RequireSecure())
@@ -2239,6 +2321,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		s.config.AllowedPrivateNetworks,
 		s.outboundOpts()...,
 	)
+	// 画像処理の同時実行枠 (#3032)。0 なら mediaproxy 側の既定
+	// (GOMAXPROCS / 2、最低 1)。**配線しないと設定キーが黙って効かない。**
+	proxyService.SetCPUConcurrency(s.config.MediaProxyConcurrency)
 	// Local drive file の thumbnail / webpublic 変種を proxy 側で再 encode
 	// せず直接返せるようにする (#637 M1)。
 	proxyService.SetDriveLookup(driveFileLookupAdapter{repo: driveFileRepo})
@@ -2380,6 +2465,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// 検索対象にしない。
 	s.echo.GET("/tags/:tag", ssrMeta.NoIndexPage)
 	s.echo.GET("/user-tags/:tag", ssrMeta.NoIndexPage)
+	// 連合先の情報ページ (#3030)。upstream は SSR していないので SPA shell が
+	// そのまま index される。**自鯖の情報ではないものを検索結果に出す意味が
+	// 無い**うえ、連合先の数だけ URL が増えて検索のノイズになる。
+	// `:host` で自ホストも指せるが、あれも運用者向けの詳細ページなので分けない。
+	s.echo.GET("/instance-info/:host", ssrMeta.NoIndexPage)
 	s.echo.GET("/play/:id", ssrMeta.FlashPage)
 	s.echo.GET("/gallery/:post", ssrMeta.GalleryPage)
 
@@ -2402,6 +2492,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	s.echo.GET("/.well-known/host-meta.json", wellknownHandler.HostMetaJSON)
 	s.echo.GET("/.well-known/nodeinfo", wellknownHandler.NodeInfoDiscovery)
 	s.echo.GET("/.well-known/oauth-authorization-server", wellknownHandler.OAuthAuthorizationServer)
+	// W3C "A Well-Known URL for Changing Passwords"。パスワードマネージャが
+	// 変更画面を機械的に見つけるために引く (upstream PR 17901)。
+	s.echo.GET("/.well-known/change-password", wellknownHandler.ChangePassword)
 	// upstream `fastify.options('/.well-known/*')` 相当。
 	s.echo.OPTIONS("/.well-known/*", wellknownHandler.Preflight)
 
@@ -2413,7 +2506,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		oauth.NewRedisStore(s.redis.Default),
 		&http.Client{
 			Timeout:   10 * time.Second,
-			Transport: oauthDiscoveryTransport(s.config.AllowedPrivateNetworks, s.config.TestMode),
+			Transport: oauthDiscoveryTransport(s.config.AllowedPrivateNetworks, s.config.TestMode, s.outboundOpts()...),
 		},
 		userRepo,
 		repository.NewAccessTokenRepository(s.db),
@@ -2503,13 +2596,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// admin overview から `misskeyApiGet` で叩かれるため GET も登録 (#421)。
 	api.POST("/federation/stats", federationHandler.Stats)
 	api.GET("/federation/stats", federationHandler.Stats)
-	// #2106 N29/N10: upstream update-remote-user.ts は requireCredential:false の公開
-	// endpoint で、frontend get-user-menu はリモートユーザーメニューの「リモート情報を
-	// 更新」を全ログインユーザーに無条件表示する。RequireModerator だと非モデレーターが
-	// 403 ROLE_PERMISSION_DENIED になり frontend 機能が壊れるため緩和する。匿名トリガー
-	// 可能な AP 再 fetch (amplification) を防ぐため、upstream の anonymous 許可までは
-	// 開けず RequireAuth に留める (frontend は menu 表示にログイン必須なので互換性は保つ)。
-	api.POST("/federation/update-remote-user", federationHandler.UpdateRemoteUser, middleware.RequireAuth())
+	// upstream 2026.9.1 で `requireCredential: true` / `kind: 'read:account'` /
+	// 1 時間 30 回になった (それまでは未認証でも叩けた)。mk-go は #2106 で先に
+	// RequireAuth を付けていたので、scope とレート制限 (ratelimit_defs.go) を足して
+	// 揃える。RequireModerator にしないのは、frontend がリモートユーザーの
+	// メニューで全ログインユーザーに出すため。
+	api.POST("/federation/update-remote-user", federationHandler.UpdateRemoteUser, middleware.RequireAuth(), middleware.RequireScope("read:account"))
 	// Mastodon 互換のピア一覧 (#2245)。upstream は endpoints/ 配下ではなく
 	// ApiServerService.ts で fastify に直接登録しているので、mk-go でも
 	// endpoint 群とは別に /api/v1/... として生やす。
@@ -2543,6 +2635,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	channelsHandler.SetNoteFieldResolver(noteFieldResolver)
 	channelsHandler.SetUserRepo(userRepo)
 	channelsHandler.SetPinnedNoteRepo(noteRepo) // #1540: channels/show (detailed) の pinnedNotes 展開
+	// pinnedNotes の可視性判定に使う利用者間フォロー。**上の
+	// `SetFollowingRepo` (チャンネルのフォロー) とは別物。** 未配線だと
+	// `CanSeeNote` が fail-closed に倒れ、followers 限定ノートが投稿者本人に
+	// しか出なくなる (漏れる側ではないが、正当なピン留めも消える)。
+	channelsHandler.SetUserFollowingRepo(followingRepo)
+	channelsHandler.SetMetaRepo(metaRepo) // channels/timeline の blocked-host filter
 
 	// Antennas endpoints (Phase 4.3)
 	antennasHandler := antennas.NewHandler(antennaService, noteRepo, idGen)
@@ -2631,8 +2729,30 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// CachedMetaRepository.Update が invalidate してから notifyUpdate する
 	// 実装がその順序を保証しており、subscriber 側はここの並び順で保証する。
 	internalPubSub := event.NewPubSubService(s.redis.Pubsub, "internal:")
+	// captcha の provider 集合は起動時の meta スナップショットから組まれるので、
+	// **ここで繋がないと管理画面で有効にしても再起動まで一切検証されない**。
+	// `/api/meta` は DB を読むのでフロントは captcha を描画し、運営者からは
+	// ON に見える。provider が 1 つも無いときの `Verify` は成功を返すため、
+	// 有効化したつもりのまま `/api/signup` と `/api/signin` が素通りしていた。
+	//
+	// **自 worker の更新と他 worker からの受信の両方を通す。** 前者は hook、
+	// 後者は subscriber で、どちらも同じ channel を経由する。
+	reloadCaptcha := func() {
+		if captchaSvc == nil {
+			return
+		}
+		m, err := cachedMeta.Fetch()
+		if err != nil || m == nil {
+			// **読めなければ据え置く。** DB の瞬断で運営者の設定が消える側に
+			// 倒さない。
+			slog.Warn("captcha: reload skipped (meta unavailable)", "err", err)
+			return
+		}
+		captchaSvc.Reload(m)
+	}
 	cachedMeta.SetInvalidationHook(func() {
 		metaHandler.InvalidateResponseCache()
+		reloadCaptcha()
 		if err := internalPubSub.Publish(context.Background(), "metaUpdated", struct{}{}); err != nil {
 			slog.Warn("meta: publish metaUpdated failed", "err", err)
 		}
@@ -2640,6 +2760,41 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	internalPubSub.Subscribe(context.Background(), "metaUpdated", func([]byte) {
 		cachedMeta.Invalidate()
 		metaHandler.InvalidateResponseCache()
+		reloadCaptcha()
+	})
+
+	// #3037: ロール / ポリシーの cross-worker cache invalidation。更新した
+	// worker は internal:rolesUpdated を publish し、各 worker は受信して自
+	// プロセスのキャッシュを落とす。upstream の
+	// `RoleService` が `internal` チャンネルの `roleUpdated` /
+	// `userRoleAssigned` 等を購読しているのに相当する。
+	//
+	// **繋がないと剥奪が届かない。** `roleCacheTTL` は 5 分で、複数プロセス
+	// 構成 (`MK_ONLY_SERVER` / `MK_ONLY_QUEUE`) は明示的にサポートされている。
+	// 侵害された管理者のロールを剥奪しても、**剥奪操作を受け付けなかった側の
+	// ノードでは最大 5 分間、管理 API が通り続ける**。
+	//
+	// **受信側は `InvalidateAllCachesLocally`。** 通常の invalidate を呼ぶと
+	// そこから再び publish され、ワーカー同士が通知を投げ合って止まらなくなる。
+	//
+	// **自分の publish は受け流す (#3037)。** Redis の pub/sub は publish した
+	// プロセス自身にも配る。自 worker は既に**精密な** invalidate を済ませて
+	// いる (その user / その role だけ) のに、自分の通知で全消しに格上げされる
+	// と、`admin/roles/assign` 1 回で `userRoleCache` も `rolesListCache` も
+	// 全プラグインの policy cache も落ちる。`move_service` はアカウント移行
+	// 1 回でロール数ぶん連射するので、そこが効く。
+	rolesUpdatedSender := idGen.Generate(time.Now())
+	roleService.SetInvalidationHook(func() {
+		if err := internalPubSub.Publish(context.Background(), "rolesUpdated", rolesUpdatedSender); err != nil {
+			slog.Warn("role: publish rolesUpdated failed", "err", err)
+		}
+	})
+	internalPubSub.Subscribe(context.Background(), "rolesUpdated", func(payload []byte) {
+		var from string
+		if err := json.Unmarshal(payload, &from); err == nil && from == rolesUpdatedSender {
+			return
+		}
+		roleService.InvalidateAllCachesLocally()
 	})
 
 	// #2752: antenna の cross-worker cache invalidation。書き込んだ worker が
@@ -2791,6 +2946,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// followers note を本人以外に embed しない (= fail-closed)。
 	notificationPublisher.SetFollowingChecker(followingRepo)
 	notificationPublisher.SetRoleLookup(roleNotifLookup)
+	notificationPublisher.SetAbuseReportLookup(abuseNotifLookup)
+	notificationPublisher.SetEmojiApplicationLookup(emojiApplicationNotifLookup)
+	notificationPublisher.SetSignupApplicationLookup(signupApplicationNotifLookup)
 	// streaming の通知 payload にも note の files / channel を載せる (#2735)。
 	notificationPublisher.SetFieldResolver(noteFieldResolver)
 	drivePublisher := stream.NewDrivePublisher(streamPubSub)
@@ -2801,6 +2959,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// #1549: report-abuse が各 moderator の adminStream:<id> へ newAbuseUserReport
 	// を配信できるよう admin publisher + moderator lister を usersHandler に配線。
 	usersHandler.SetAbuseReportFanout(roleService, stream.NewAdminStreamPublisher(streamPubSub))
+	// 通報を通知欄にも残す (#2868)。**admin stream だけでは足りない** — あちらは
+	// その瞬間に管理画面を開いている人にしか届かず、後から見返せない。
+	usersHandler.SetAbuseReportInAppNotifier(notificationService)
 
 	// server / queue stats publishers (#344)。起動時から tick を回して
 	// `serverStats` / `queueStats` トピックへ定期 publish する。
@@ -2841,7 +3002,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	antennaService.SetStreamingPublisher(notePublisher)
 	notificationService.SetStreamingPublisher(notificationPublisher)
 	notificationService.SetMainStreamPublisher(mainStreamPublisher)
+	// readAllNotifications は upstream postReadAllNotifications と同じく
+	// main stream と Web Push の両方へ送る。これが無いと SW 側の
+	// readAllNotifications 分岐 (表示中の OS 通知を閉じる) が発火しない。
+	notificationService.SetReadAllPusher(webPushService)
 	notificationService.SetPacker(notificationPublisher)
+	// ロール単位の通知 opt-out (#2898)。**配線しないと optOutNotificationTypes
+	// を設定しても効かない** — Service は resolver 未設定なら全ての通知を通す。
+	notificationService.SetPolicyResolver(roleService)
 	driveService.SetStreamingPublisher(drivePublisher)
 	// folder の folderCreated/folderUpdated/folderDeleted も同じ drive channel
 	// publisher で配信する (#1564)。
@@ -2872,6 +3040,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	chatService := corechat.NewService(chatRepo, idGen)
 	chatService.SetStreamingPublisher(chatPublisher)
 	chatService.SetMainStreamPublisher(mainStreamPublisher)
+	// newChatMessage は upstream ChatService.ts と同じく main stream への publish と
+	// Web Push を対で送る。これが無いと、タブを閉じている利用者に届かない (#2840)。
+	chatService.SetChatPusher(webPushService)
+	// push の body に fromUser を載せるため sender を引く (#2840)。
+	chatService.SetUserRepo(userRepo)
 	// CherryPick 互換 AP 連合: 1-on-1 DM を Create+Note(_misskey_talk:true) で配送 (#692)。
 	chatService.SetAPDelivery(userRepo, apRenderer, apURLs, deliverService)
 	// chatScope=followers/following/mutual 判定用に following repo を渡す (#692)。
@@ -2897,6 +3070,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	federationProcessor.SetReversi(reversiService, reversiRepo, idGen, reversiFedCache)
 	federationProcessor.SetBlockingService(blockingService)
 	federationProcessor.SetAbuseReportRepo(repository.NewAbuseReportRepository(s.db), idGen)
+	// リモートからの通報 (AP Flag) もモデレーターの通知欄に出す (#2868)。
+	// **配線しないと通報の出どころで通知の有無が変わる。**
+	federationProcessor.SetAbuseReportNotification(roleService, notificationService)
 	federationProcessor.SetPinningRepo(piningRepo, idGen)
 	federationProcessor.SetRelayMarker(relaySvc)
 	federationProcessor.SetRelayActorChecker(relaySvc)
@@ -2948,6 +3124,9 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// GET が `api.Any("/*")` の catchall (= 200 + 空オブジェクト) に落ちて、
 	// 受信側で `chart.pubActive[0]` 等が `undefined` 例外を起こす (#421)。
 	chartsHandler := apicharts.NewHandler(chartCharts)
+	// /retention は chart engine ではなく集計済みテーブルを読む (#2791 で
+	// router.go の inline closure から移設)。
+	chartsHandler.SetRetentionRepo(retentionRepo)
 	chartMethods := []string{http.MethodGet, http.MethodPost}
 	api.Match(chartMethods, "/charts/notes", chartsHandler.Notes)
 	api.Match(chartMethods, "/charts/users", chartsHandler.Users)
@@ -2995,6 +3174,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	rolesHandler := apiroles.NewHandler(roleService, idGen)
 	rolesHandler.SetNotesQuery(repository.NewRoleNotesQuery(s.db))
 	rolesHandler.SetNoteRepo(noteRepo) // #1630: notes の renote 入れ子 mute/block 検査
+	rolesHandler.SetMetaRepo(metaRepo) // roles/notes の blocked-host filter
 	rolesHandler.SetInstanceRepo(instanceRepo)
 	rolesHandler.SetEmojiRepo(emojiRepo)
 	rolesHandler.SetReactionReader(reactionCountWriter)
@@ -3048,7 +3228,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		coreannouncement.NewCreator(announcementRepo, idGen, mainStreamPublisher, broadcastPublisher),
 		webhookService,
 		idGen,
-		miscsmtp.SubjectBodySenderFromMeta(metaRepo, s.config.ProxySmtp),
+		miscsmtp.SubjectBodySenderFromMeta(metaRepo, s.config.ProxySMTP),
 	)
 	s.queueServer.Handle(queue.TaskTypeCheckModeratorsActivity,
 		processors.NewCheckModeratorsActivityProcessor(modActivitySvc).Handle)
@@ -3074,9 +3254,12 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// recipientRepo がここで揃うため本箇所で配線する。
 	usersHandler.SetAbuseReportWebhook(webhookService, recipientRepo)
 	adminHandler := apiadmin.NewHandler(signupService, roleService, metaRepo, userRepo, idGen)
+	// モデレーターの suspend / unsuspend を local 由来として刻む (#2973)。
+	adminHandler.SetSuspensionOriginRepo(suspensionOriginRepo)
 	// catalog 更新を entity 側 packer に即時反映する (#2258)。TTL 任せだと
 	// 作成直後に装着された decoration が lookup miss で silent drop される。
 	adminHandler.SetAvatarDecorationInvalidator(avatarDecorationResolver)
+	adminHandler.SetEmojiDecorationInvalidator(emojiDecorationResolver)
 	// admin/ad/* の変更を /api/meta の response cache に反映する (#2649)。
 	adminHandler.SetMetaResponseInvalidator(metaHandler)
 	// admin/suspend-user / admin/unsuspend-user / admin/accounts/delete が
@@ -3090,7 +3273,77 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	adminHandler.SetInstanceRepo(instanceRepo)
 	adminHandler.SetDeliveryHealthProvider(deliveryHealth)
 	adminHandler.SetInboxHealthProvider(inboxHealth)
+	// IP からアカウントを引く口 (#3104)。**この行を落とすと admin/ip/accounts が
+	// 500 を返す** — 空の結果は「その IP を使ったアカウントは無い」という誤った
+	// 事実になり、調査の結論を反転させる。
+	adminHandler.SetIPSearchRepo(repository.NewUserIPSearchRepository(s.db))
+	// IP 照会の監査 (#3106)。**未配線だと照会が記録されないまま通る** — 照会は
+	// 成立するので誰も気付けない。critical wiring 検査で落とす。
+	ipLookupLogRepo := repository.NewIPLookupLogRepository(s.db)
+	adminHandler.SetIPLookupAudit(iplookuplog.NewService(ipLookupLogRepo, idGen))
+	adminHandler.SetIPLookupLogRepo(ipLookupLogRepo)
+	// ドライブ使用量の集計 (#3053)。**この行を落とすと admin/drive/usage が
+	// 500 を返す** — 0 バイトを返して「使っていない」と誤認させるよりよい。
+	adminHandler.SetDriveUsageProvider(driveusage.NewService(
+		repository.NewDriveUsageRepository(s.db), driveusage.DefaultTTL, driveusage.DefaultTopN))
 	adminHandler.SetSignupApplicationReviewer(signupApplicationService)
+	// カスタム絵文字の登録申請 (#2934)。承認までは emoji 行を作らず、
+	// 専用テーブルに閉じ込める (signup_application と同じ形)。
+	//
+	// **承認時の emoji 生成は adminHandler が行う。** service に持たせると
+	// admin/emoji/add と別経路になり、MIME の allowlist などの検証が申請
+	// だけ抜ける。ここでは依存を逆向きに渡すだけ。
+	// 通知の lookup が先に作った実体を使い回す (2 つ作らない)。
+	emojiApplicationRepo := emojiApplicationRepoForNotif
+	emojiApplicationService := emojiapplication.NewService(
+		emojiApplicationRepo,
+		emojiRepo,
+		driveFileRepo,
+		idGen,
+		adminHandler,
+		emojiapplication.NewResultNotifier(notificationService),
+	)
+	// 期間上限をロールから引く (#2958)。未配線だと上限が丸ごと効かなくなる
+	// ので criticalWiring に載せてある。
+	emojiApplicationService.SetPolicyProvider(roleService)
+	// 申請が出されたことを**審査できる人**へ知らせる (#2987)。モデレーターでは
+	// なく `canManageCustomEmojis` を持つ人 — 審査 endpoint の gate と揃える。
+	emojiApplicationService.SetReceivedNotifier(
+		emojiapplication.NewReceivedNotifier(notificationService, roleService))
+	// 申請枠の手動リセット (#2962)。**未配線ならリセットは 500 で失敗する**
+	// (`ErrQuotaResetUnavailable`) ので、戻したつもりで戻っていない状態にはならない。
+	// ただし既存のリセットも読めなくなる = 過去に戻した枠が再び満杯に見えるので、
+	// 配線の有無は静的ゲート (`emoji_application_gate_test.go`) と**起動時の
+	// 自己診断 (`criticalWiring`) の両方**で見る。**片方では足りない** — 静的
+	// ゲートは `nil` リテラルしか見ないので変数経由で渡す形を素通りし、自己診断は
+	// 呼び出しを消した構成を起動するまで気付けない。
+	emojiApplicationService.SetQuotaResetRepo(
+		repository.NewEmojiApplicationQuotaResetRepository(s.db))
+	emojiApplicationHandler := apiemojiapplications.NewHandler(
+		emojiApplicationService, emojiApplicationRepo, driveFileRepo)
+	// 「自分の申請」の画像プレビュー (#2989)。承認済みは `emojiId`、未承認の
+	// リモート申請は `remoteHost + remoteName` で引く。**未配線だと preview が
+	// `unknown` になる** — 「消えた」と断定しないので害は「理由が出ない」だけ。
+	emojiApplicationHandler.SetEmojiLookup(emojiRepo)
+	// **申請できる人をロールで絞る (#2934)。** canManageCustomEmojis を持つ人は
+	// 申請ではなく直接登録できるので、この policy は「登録はできないが頼める人」。
+	//
+	// **第三者アプリのトークンは入れない (#3037)。** この 3 つは mk-go 独自
+	// なので upstream の `kind` にあたる宣言が無く、`RequireScope` を配線
+	// できない。upstream は「`kind` が無く、かつ資格情報を要する endpoint」に
+	// 対し app token を一律で拒否する (`ApiCallService.ts:412-413`) ので、
+	// 同じ側に倒す。本体の他の kind 無し endpoint は `RequireSecure` で
+	// もっと強く塞がれており、抜けていたのはここだけ。
+	api.POST("/emoji-application/create", emojiApplicationHandler.Create,
+		middleware.RequireAuth(),
+		middleware.RejectAppToken(),
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanRequestCustomEmojis))
+	// **一覧と取り下げは policy で塞がない。** 後から policy を外された人が
+	// 自分の申請を確認することも取り下げることもできなくなる。
+	api.POST("/emoji-application/list-mine", emojiApplicationHandler.ListMine, middleware.RequireAuth(), middleware.RejectAppToken())
+	api.POST("/emoji-application/cancel", emojiApplicationHandler.Cancel, middleware.RequireAuth(), middleware.RejectAppToken())
+	adminHandler.SetEmojiApplicationReviewer(emojiApplicationService)
+	adminHandler.SetEmojiApplicationRepo(emojiApplicationRepo)
 	// 連合セルフ診断 (#2463)。migration 本数は起動時に数えず 0 を渡す
 	// (server 側は既に migrate 済みで動いている前提。適用漏れの検出は
 	// `misskey -doctor` の担当で、あちらは同梱ファイルを数えられる)。
@@ -3112,7 +3365,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	adminHandler.SetDeleteAccountEnqueuer(s.queueClient)
 	adminHandler.SetServerURL(s.config.URL)
 	adminHandler.SetConfigSetupPassword(s.config.SetupPassword)
-	adminHandler.SetSMTPProxyURL(s.config.ProxySmtp)
+	adminHandler.SetSMTPProxyURL(s.config.ProxySMTP)
 	modLogService := coremodlog.New(modLogRepo, idGen)
 	adminHandler.SetModLogService(modLogService)
 	// #1765: moderator が他人の note を削除したとき deleteNote moderation log を残す。
@@ -3144,6 +3397,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// を wire する (#670)。outboundClient 経由なので SSRF / proxy / outgoing
 	// address が他の outbound 経路と同じ設定で適用される。
 	adminHandler.SetEmojiImageFetcher(apiadmin.NewEmojiImageFetcher(s.outboundClient(10*time.Second), driveService, s.config.UserAgent))
+	// admin/emoji/fetch-remote-meta が使うメタデータ取得 (#2698)。**取得先の host は
+	// 絵文字の host = 相手が決める値**なので、SSRF ガード付きの transport を組む。
+	// **outbound の共通設定を渡す (#3037)。** 渡し忘れるとこの経路だけが
+	// `config.proxy` を通らず、サーバーの素の IP でリモートへ出る (#638)。
+	adminHandler.SetRemoteEmojiMetaFetcher(emojimeta.NewFetcher(s.config.AllowedPrivateNetworks, s.config.UserAgent, s.outboundOpts()...))
 	adminHandler.SetRelayService(relaySvc)
 	adminHandler.SetSystemWebhookRepo(systemWebhookRepo)
 	// admin/system-webhook/test は webhookService.DispatchSystemTest で real
@@ -3236,6 +3494,31 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.POST("/admin/accounts/delete", adminHandler.AccountsDelete, middleware.RequireAdmin(roleService), middleware.RequireScope("write:admin:account"))
 	api.POST("/admin/accounts/find-by-email", adminHandler.AccountsFindByEmail, middleware.RequireAdmin(roleService), middleware.RequireScope("read:admin:account"))
 	api.POST("/admin/get-user-ips", adminHandler.GetUserIPs, middleware.RequireAdmin(roleService), middleware.RequireScope("read:admin:user-ips"))
+	// mk-go 独自 (#3104、親 #3066)。IP からローカルアカウントを引く。
+	//
+	// **`RequireModerator` と policy を併用する。** upstream の `admin/get-user-ips`
+	// (上の行) は `requireAdmin` なので、同じ「利用者 ↔ IP の対応」に対して
+	// モデレーターだけで開くと既存より緩い経路を新設することになる。policy の
+	// 既定は false で、admin は policy を bypass するため、**既定の挙動は
+	// upstream と同じ「管理者のみ」**になる。モデレーターへ開きたい運営者が
+	// ロールで有効にする。scope は upstream の口と同じものを再利用する
+	// (`internal/misc/permissions` は misskey-js と完全一致させる契約)。
+	api.POST("/admin/ip/accounts", adminHandler.IPAccounts,
+		middleware.RequireModerator(roleService),
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanSearchIPHistory),
+		middleware.RequireScope("read:admin:user-ips"))
+	// 関連アカウント候補 (#3105)。**同じ policy と scope を再利用する** —
+	// 扱うのは同じ「利用者 ↔ IP の対応」で、別 policy にすると片方だけ開けてしまう。
+	api.POST("/admin/ip/related-accounts", adminHandler.IPRelatedAccounts,
+		middleware.RequireModerator(roleService),
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanSearchIPHistory),
+		middleware.RequireScope("read:admin:user-ips"))
+	// 照会の監査記録 (#3106)。**この応答自体が機密** — 照会に使った IP がそのまま
+	// 入るので、照会と同じ 3 段で守る。
+	api.POST("/admin/ip/lookup-log", adminHandler.IPLookupLog,
+		middleware.RequireModerator(roleService),
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanSearchIPHistory),
+		middleware.RequireScope("read:admin:user-ips"))
 	api.POST("/admin/get-index-stats", adminHandler.GetIndexStats, middleware.RequireAdmin(roleService), middleware.RequireScope("read:admin:index-stats"))
 	api.POST("/admin/get-table-stats", adminHandler.GetTableStats, middleware.RequireAdmin(roleService), middleware.RequireScope("read:admin:table-stats"))
 	api.POST("/admin/server-info", adminHandler.ServerInfo, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:server-info"))
@@ -3256,11 +3539,50 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.POST("/admin/drive/cleanup", adminHandler.DriveCleanup, middleware.RequireModerator(roleService), middleware.RequireScope("write:admin:drive"))
 	api.POST("/admin/drive/files", adminHandler.DriveFiles, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:drive"))
 	api.POST("/admin/drive/show-file", adminHandler.DriveShowFile, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:drive"))
+	// mk-go 独自 (#3053)。インスタンス全体のドライブ使用量と内訳。upstream は
+	// per-user の `driveCapacityMb` しか持たず、合計を出す口が無い。
+	api.POST("/admin/drive/usage", adminHandler.DriveUsage, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:drive"))
 	api.POST("/admin/emoji/add-aliases-bulk", adminHandler.EmojiAddAliasesBulk, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("write:admin:emoji"))
 	api.POST("/admin/emoji/copy", adminHandler.EmojiCopy, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("write:admin:emoji"))
+	// mk-go 独自 (#2698)。リモート絵文字のインポート時に、AP では運ばれない
+	// カテゴリ・エイリアス・センシティブを相手の REST API から取ってくる。
+	// **作成はしない**ので read 系の scope で足りるが、絵文字管理権限に揃える
+	// (取得先を相手に決められる = 外向き通信を起こす操作なので、誰でも叩けると
+	// 探索に使える)。
+	api.POST("/admin/emoji/fetch-remote-meta", adminHandler.EmojiFetchRemoteMeta, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("read:admin:emoji"))
 	api.POST("/admin/emoji/delete-bulk", adminHandler.EmojiDeleteBulk, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("write:admin:emoji"))
-	api.POST("/admin/emoji/import-zip", adminHandler.EmojiImportZip, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireSecure())
+	// upstream 2026.9.0 は emoji import zip の堅牢化 (GHSA 経由) と同時に
+	// requiredRolePolicy:'canManageCustomEmojis' から requireAdmin へ変えた。
+	// fork frontend も iAmAdmin でインポート UI を出し分けるので backend も揃える。
+	api.POST("/admin/emoji/import-zip", adminHandler.EmojiImportZip, middleware.RequireAdmin(roleService), middleware.RequireSecure())
 	api.POST("/admin/emoji/list-remote", adminHandler.EmojiListRemote, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("read:admin:emoji"))
+	// 絵文字の登録申請の審査 (#2934)。canManageCustomEmojis で gate する —
+	// 承認は実質 admin/emoji/add と同じ操作なので、同じ権限を要求する。
+	api.POST("/admin/emoji-application/list", adminHandler.EmojiApplicationList,
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis),
+		middleware.RequireScope("read:admin:emoji"))
+	api.POST("/admin/emoji-application/approve", adminHandler.EmojiApplicationApprove,
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis),
+		middleware.RequireScope("write:admin:emoji"))
+	api.POST("/admin/emoji-application/reject", adminHandler.EmojiApplicationReject,
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis),
+		middleware.RequireScope("write:admin:emoji"))
+	// 関連する過去の申請 (#2960)。**読むだけなので read scope**。
+	api.POST("/admin/emoji-application/related", adminHandler.EmojiApplicationRelated,
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis),
+		middleware.RequireScope("read:admin:emoji"))
+	// ユーザーモデレーション画面の申請履歴と集計 (#2961)。**却下理由と
+	// モデレーターへの補足が載るので、一般ユーザー向けには公開しない。**
+	api.POST("/admin/emoji-application/list-by-user", adminHandler.EmojiApplicationListByUser,
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis),
+		middleware.RequireScope("read:admin:emoji"))
+	api.POST("/admin/emoji-application/user-summary", adminHandler.EmojiApplicationUserSummary,
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis),
+		middleware.RequireScope("read:admin:emoji"))
+	// 申請枠の手動リセット (#2962)。**書き込みなので write scope**。
+	api.POST("/admin/emoji-application/reset-user-quota", adminHandler.EmojiApplicationResetUserQuota,
+		middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis),
+		middleware.RequireScope("write:admin:emoji"))
 	api.POST("/admin/emoji/remove-aliases-bulk", adminHandler.EmojiRemoveAliasesBulk, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("write:admin:emoji"))
 	api.POST("/admin/emoji/set-aliases-bulk", adminHandler.EmojiSetAliasesBulk, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("write:admin:emoji"))
 	api.POST("/admin/emoji/set-category-bulk", adminHandler.EmojiSetCategoryBulk, middleware.RequireRolePolicy(roleService, corerole.PolicyCanManageCustomEmojis), middleware.RequireScope("write:admin:emoji"))
@@ -3283,7 +3605,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.POST("/admin/invite/create", adminHandler.InviteCreate, middleware.RequireModerator(roleService), middleware.RequireScope("write:admin:invite-codes"))
 	api.POST("/admin/invite/list", adminHandler.InviteList, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:invite-codes"))
 	// 承認制の登録の審査 (#2555)。mk-go 独自。scope は invite-codes を再利用する
-	// — 承認は最終的に registration_ticket の発行につながるので管轄が同じで、
+	// — 承認はメール確認の経路で registration_ticket の発行につながるので管轄が同じで、
 	// internal/misc/permissions は upstream misskey-js と完全一致させる契約が
 	// あり mk-go 固有 scope を足せない。
 	api.POST("/admin/signup-application/list", adminHandler.SignupApplicationList, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:invite-codes"))
@@ -3317,7 +3639,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	api.POST("/admin/queue/retry-job", adminHandler.QueueRetryJob, middleware.RequireModerator(roleService), middleware.RequireScope("write:admin:queue"))
 	api.POST("/admin/queue/show-job", adminHandler.QueueShowJob, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:queue"))
 	api.POST("/admin/queue/show-job-logs", adminHandler.QueueShowJobLogs, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:queue"))
-	api.POST("/admin/queue/stats", adminHandler.QueueStats, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:emoji"))
+	api.POST("/admin/queue/stats", adminHandler.QueueStats, middleware.RequireModerator(roleService), middleware.RequireScope("read:admin:queue"))
 
 	// --- Phase 7.6b: chat/*, auth/*, ap/*, sw/*, reversi/*, bubble-game/*, misc ---
 
@@ -3478,31 +3800,20 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// `misskeyApiGet` で GET 呼び出ししても catchall に落ちないよう
 	// 両メソッドを受ける (#421)。POST のみだと `count` が undefined になり
 	// admin overview の「NaN 人」表示の原因になっていた。
-	onlineUsersHandler := func(c echo.Context) error {
-		count, _ := userRepo.CountOnlineUsers()
-		return c.JSON(http.StatusOK, map[string]any{"count": count})
-	}
-	api.GET("/get-online-users-count", onlineUsersHandler)
-	api.POST("/get-online-users-count", onlineUsersHandler)
+	api.GET("/get-online-users-count", usersHandler.OnlineCount)
+	api.POST("/get-online-users-count", usersHandler.OnlineCount)
 
 	// server-info (公開版) — サーバー情報
 	// frontend の server-metric widget は `misskeyApiGet` で GET 呼び出し、
 	// それ以外の MkVisitorDashboard 等は POST で呼ぶため両メソッドを登録。
-	serverInfoHandler := func(c echo.Context) error {
-		// 公開エンドポイントは machine/cpu/mem/fs のみを返す (upstream public
-		// server-info.ts)。os/node/psql/redis/net は admin 専用で未認証には出さない。
-		if m, err := metaRepo.Fetch(); err == nil && m.EnableServerMachineStats {
-			return c.JSON(http.StatusOK, serverstats.CollectPublic())
-		}
-		return c.JSON(http.StatusOK, serverstats.EmptyPublic())
-	}
-	api.POST("/server-info", serverInfoHandler)
-	api.GET("/server-info", serverInfoHandler)
+	api.POST("/server-info", metaHandler.ServerInfo)
+	api.GET("/server-info", metaHandler.ServerInfo)
 
 	// endpoints — 登録済みAPIエンドポイント一覧
-	api.POST("/endpoints", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, apiEndpointNames(s.echo))
-	})
+	// **Lister は closure で遅延評価する。** ここでの登録時点ではまだ全ルートが
+	// 生えていないので、呼ばれたときに数える必要がある。
+	endpointsHandler := endpoints.NewHandler(func() []string { return apiEndpointNames(s.echo) })
+	api.POST("/endpoints", endpointsHandler.Endpoints)
 
 	// endpoint — 指定 endpoint の情報を返す (#1695)。upstream endpoint.ts は
 	// 未知 endpoint で null、既知なら { params: [{name,type}, ...] } を返す。
@@ -3512,68 +3823,14 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// と未知 endpoint の null だけ upstream に揃える。params 内容の導出は
 	// endpoint registry の新設が必要で本 endpoint の用途 (API introspection) に
 	// 対して費用対効果が低いため非対応 (#1695 に明記)。
-	api.POST("/endpoint", func(c echo.Context) error {
-		var req struct {
-			Endpoint string `json:"endpoint"`
-		}
-		if err := c.Bind(&req); err != nil || req.Endpoint == "" {
-			return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-		}
-		// 未知 endpoint は null (upstream: ep == null → return null)。
-		if !isRegisteredAPIEndpoint(s.echo, req.Endpoint) {
-			return c.JSON(http.StatusOK, nil)
-		}
-		return c.JSON(http.StatusOK, map[string]any{"params": []any{}})
-	})
+	api.POST("/endpoint", endpointsHandler.Endpoint)
 
 	// retention — リテンション統計
-	api.POST("/retention", func(c echo.Context) error {
-		records, err := retentionRepo.ListRecent(30)
-		if err != nil {
-			return c.JSON(http.StatusOK, []any{})
-		}
-		out := make([]map[string]any, 0, len(records))
-		for _, r := range records {
-			out = append(out, map[string]any{
-				"createdAt": r.CreatedAt,
-				"users":     r.UsersCount,
-				"data":      r.Data,
-			})
-		}
-		return c.JSON(http.StatusOK, out)
-	})
+	api.POST("/retention", chartsHandler.Retention)
 
 	// get-avatar-decorations — アバターデコレーション全件取得
-	api.POST("/get-avatar-decorations", func(c echo.Context) error {
-		var decorations []model.AvatarDecoration
-		if err := s.db.Find(&decorations).Error; err != nil {
-			return c.JSON(http.StatusOK, []any{})
-		}
-		// upstream get-avatar-decorations.ts は roleIdsThatCanBeUsedThisDecoration を
-		// 現存ロールのみに filter して削除済ロール ID を除去する (#1543)。meta は
-		// 1 度だけ引いて使い回す。取得失敗時は空集合 (= 全 roleId を除去) ではなく
-		// nil 扱いで filter すると全件落ちるため、エラー時は filter を skip して
-		// 旧挙動 (verbatim) にフォールバックする。
-		existingRoles, roleErr := roleService.ExistingRoleIDSet()
-		out := make([]map[string]any, 0, len(decorations))
-		for _, d := range decorations {
-			roleIDs := []string(d.RoleIDs)
-			if roleErr == nil {
-				roleIDs = corerole.FilterExistingRoleIDs(roleIDs, existingRoles)
-			}
-			out = append(out, map[string]any{
-				"id":                                 d.ID,
-				"name":                               d.Name,
-				"description":                        d.Description,
-				"url":                                d.URL,
-				"roleIdsThatCanBeUsedThisDecoration": roleIDs,
-				// upstream Misskey #17034 (= 2026.5.0) で追加された category field
-				// もここで返す。nullable なので null のままも許容。
-				"category": d.Category,
-			})
-		}
-		return c.JSON(http.StatusOK, out)
-	})
+	avatarDecorationsHandler := avatardecorations.NewHandler(s.db, roleService.ExistingRoleIDSet)
+	api.POST("/get-avatar-decorations", avatarDecorationsHandler.Get)
 
 	// email-address/available — メールアドレスの利用可否チェック (public)
 	//
@@ -3583,68 +3840,13 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// で返す (#1551)。mk-go は外部依存の active validation (mx/smtp/disposable) は
 	// 行わず、format → used (emailVerified=true 一致) → banned の順で判定する
 	// (upstream の enableActiveEmailValidation=false 相当)。
-	api.POST("/email-address/available", func(c echo.Context) error {
-		var req struct {
-			EmailAddress string `json:"emailAddress"`
-		}
-		if err := c.Bind(&req); err != nil {
-			return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-		}
-		// upstream paramDef は emailAddress に minLength を持たないため、空文字は
-		// 400 ではなく format 不正として available:false / reason:"format" を返す。
-		available := true
-		var reason *string
-		setReason := func(r string) {
-			available = false
-			reason = &r
-		}
-		switch {
-		case !coreemail.ValidateFormat(req.EmailAddress):
-			setReason("format")
-		default:
-			// emailVerified=true の profile とだけ照合する (upstream は
-			// countBy({emailVerified:true, email}))。未認証 email は重複扱いしない。
-			var count int64
-			s.db.Model(&model.UserProfile{}).
-				Where(`"email" = ? AND "emailVerified" = ?`, req.EmailAddress, true).
-				Count(&count)
-			if count > 0 {
-				setReason("used")
-			} else {
-				domain := ""
-				if at := strings.IndexByte(req.EmailAddress, '@'); at >= 0 {
-					domain = strings.ToLower(req.EmailAddress[at+1:])
-				}
-				if m, err := metaRepo.Fetch(); err == nil && m != nil && coreemail.IsBannedDomain(domain, m.BannedEmailDomains) {
-					setReason("banned")
-				}
-			}
-		}
-		return c.JSON(http.StatusOK, map[string]any{
-			"available": available,
-			"reason":    reason,
-		})
-	})
+	signupHandler.SetEmailAvailabilityDB(s.db)
+	api.POST("/email-address/available", signupHandler.EmailAvailable)
 
 	// promo/read — プロモノートの既読マーク (認証必須)
-	api.POST("/promo/read", func(c echo.Context) error {
-		user := middleware.GetUser(c)
-		var req struct {
-			NoteID string `json:"noteId"`
-		}
-		if err := c.Bind(&req); err != nil || req.NoteID == "" {
-			return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-		}
-		if _, err := noteRepo.FindByID(req.NoteID); err != nil {
-			return apierr.JSONNoSuchNote(c)
-		}
-		_ = promoReadRepo.MarkRead(&model.PromoRead{
-			ID:     idGen.Generate(time.Now()),
-			UserID: user.ID,
-			NoteID: req.NoteID,
-		})
-		return c.NoContent(http.StatusNoContent)
-	}, middleware.RequireAuth(), middleware.RequireScope("write:account"))
+	promoHandler := promo.NewHandler(noteRepo, promoReadRepo, idGen)
+	api.POST("/promo/read", promoHandler.Read,
+		middleware.RequireAuth(), middleware.RequireScope("write:account"))
 
 	// invite/* — 招待コード user-scope 4 endpoint。canInvite role policy gate
 	// (#1020) + inviteLimit / inviteLimitCycle / inviteExpirationTime (#1029
@@ -3654,6 +3856,11 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	inviteHandler.SetRolePolicyProvider(roleService)
 	// invite/list が createdBy / usedBy を UserLite で解決するため (#1776)。
 	inviteHandler.SetUserRepo(userRepo)
+	// モデレーターが他人の / createdById が NULL の招待を消せるようにする (#2812)。
+	// 未配線なら bypass が効かないだけなので `recordCriticalWiring` には載せない
+	// (緩む側ではなく厳しい側に倒れる)。この行が消えていないことは
+	// `TestInviteModeratorCheckerIsWired` が見る。
+	inviteHandler.SetModeratorChecker(roleService)
 	api.POST("/invite/create", inviteHandler.Create,
 		middleware.RequireAuth(),
 		middleware.RequireRolePolicy(roleService, corerole.PolicyCanInvite), middleware.RequireScope("write:invite-codes"))
@@ -3677,19 +3884,8 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// export-custom-emojis — 全 local custom emoji を zip (画像 + meta.json) に
 	// export する非同期ジョブを enqueue する (#1217)。upstream 同様 endpoint は
 	// 即 204 を返し、生成完了後に exportCompleted 通知 + drive file で受け取る。
-	api.POST("/export-custom-emojis", func(c echo.Context) error {
-		user := middleware.GetUser(c)
-		if user == nil {
-			return c.NoContent(http.StatusNoContent)
-		}
-		if err := s.queueClient.EnqueueExport(queue.ExportPayload{
-			UserID: user.ID,
-			Type:   coretransfer.ExportCustomEmojis,
-		}); err != nil {
-			slog.Warn("export-custom-emojis: enqueue failed", "user", user.ID, "err", err)
-		}
-		return c.NoContent(http.StatusNoContent)
-	}, middleware.RequireAuth(), middleware.RequireSecure())
+	api.POST("/export-custom-emojis", emojisHandler.ExportCustomEmojis,
+		middleware.RequireAuth(), middleware.RequireSecure())
 
 	// fetch-external-resources — external JSON resource を hash 検証付きで取得
 	// (#1222)。外部 theme/plugin 等を integrity-check して返す。SSRF-safe client
@@ -3718,52 +3914,22 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	//   - `id` は format:'misskey:id' なので空文字は 400
 	//   - default 付きの param はキー省略時のみ既定値。`nullableDefault: null`
 	//     は明示 null として通す (default で潰さない)
-	api.POST("/test", func(c echo.Context) error {
-		var req struct {
-			Required        *bool           `json:"required"`
-			String          *string         `json:"string"`
-			Default         *string         `json:"default"`
-			NullableDefault json.RawMessage `json:"nullableDefault"`
-			ID              *string         `json:"id"`
-		}
-		if err := c.Bind(&req); err != nil || req.Required == nil {
-			return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-		}
-		// format:'misskey:id' は空文字を許さない。
-		if req.ID != nil && *req.ID == "" {
-			return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-		}
-		out := map[string]any{"required": *req.Required}
-		if req.String != nil {
-			out["string"] = *req.String
-		}
-		out["default"] = "hello"
-		if req.Default != nil {
-			out["default"] = *req.Default
-		}
-		// キー省略なら default、`null` ならそのまま null。
-		out["nullableDefault"] = "hello"
-		if len(req.NullableDefault) > 0 {
-			if string(req.NullableDefault) == "null" {
-				out["nullableDefault"] = nil
-			} else {
-				var v string
-				if err := json.Unmarshal(req.NullableDefault, &v); err != nil {
-					return c.JSON(http.StatusBadRequest, apierr.InvalidParam())
-				}
-				out["nullableDefault"] = v
-			}
-		}
-		if req.ID != nil {
-			out["id"] = *req.ID
-		}
-		return c.JSON(http.StatusOK, out)
-	})
+	echoTestHandler := apitest.NewEchoHandler()
+	api.POST("/test", echoTestHandler.Test)
 
 	// プラグインのルート (#2478)。catchall より前に登録する。
 	// Echo の radix tree は静的パスを wildcard より優先するので順序に依存
 	// しないが、「catchall の後ろに実ルートがある」形は読み手を惑わせる。
 	registeredPlugins := plugins
+	// nodeinfo に載せるのは **宣言したものだけ**。
+	var peered []string
+	for _, def := range registeredPlugins {
+		if def.Peered && pluginEnabled(s.config.Plugins[def.Name]) {
+			peered = append(peered, def.Name)
+		}
+	}
+	nodeinfoHandler.SetPeeredPlugins(peered)
+
 	// プラグイン同士の通信 (#2537)。**署名・解決・ブロック判定は本体のものを
 	// そのまま使う** — inbox と同じ厳しさにするため、専用の実装を作らない。
 	s.peerDeps = &pluginPeerDeps{
@@ -3773,17 +3939,15 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		keyCache: activitypub.NewPublicKeyCache(256),
 		blocker:  instanceService,
 		signer:   newInstanceActorSigner(sysAcctSvc, keypairRepo, apURLs),
-		remote:   newNodeInfoPeerLister(s.outboundClient(peerLookupTimeout)),
-		idGen:    idGen,
+		// **こちらが持っているものだけ覚える。** 相手の nodeinfo は相手が
+		// 書いた値なので、そのまま持つと外から中身を膨らませられる。
+		remote:  newNodeInfoPeerLister(s.outboundClient(peerLookupTimeout), peered),
+		idGen:   idGen,
+		limiter: newPeerRateLimiter(),
+		// 送信はキューに積む (#2819)。**プロセス内の time.Sleep だと再起動を
+		// またげず、デプロイのたびに送信中のものが消える。**
+		enqueuer: s.queueClient,
 	}
-	// nodeinfo に載せるのは **宣言したものだけ**。
-	var peered []string
-	for _, def := range registeredPlugins {
-		if def.Peered && pluginEnabled(s.config.Plugins[def.Name]) {
-			peered = append(peered, def.Name)
-		}
-	}
-	nodeinfoHandler.SetPeeredPlugins(peered)
 
 	if err := s.setupPlugins(api, registeredPlugins, openPluginStorage); err != nil {
 		s.pluginSetupErr = err
@@ -3805,17 +3969,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	// GET 以外は意図的に 200 + 空オブジェクトのまま。未登録エンドポイントへの
 	// 404 は Misskey 公式フロントの一部ページで例外を投げてしまうため、
 	// 実装が出揃うまで pass-through にしている。実装漏れは warn ログで検知する。
-	api.Any("/*", func(c echo.Context) error {
-		slog.Warn("unimplemented API endpoint", "method", c.Request().Method, "path", c.Request().URL.Path)
-		if c.Request().Method == http.MethodGet {
-			return c.JSON(http.StatusNotFound, apierr.Error(
-				"UNKNOWN_API_ENDPOINT",
-				"Unknown API endpoint.",
-				"2ca3b769-540a-4f08-9dd5-b5a825b6d0f1",
-			))
-		}
-		return c.JSON(http.StatusOK, map[string]any{})
-	})
+	api.Any("/*", apiCatchall)
 
 	// フロントエンドアセット配信
 	// ビルド済みアセットがあれば静的配信、なければVite dev serverプロキシ
@@ -3969,19 +4123,48 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 	//   - pluginPeerDeps.selfHost: struct literal 経由の 2 つ目の消費者。
 	//     config.resolve が空 host を弾くので実際には空にならない
 	//     (#2682 review L-5)
+	//   - #2791 で router.go から移設した endpoint の setter 6 本
+	//     (SetUsernameLookups / SetEmailAvailabilityDB / SetMetaRepo /
+	//     SetLocalHost / SetRetentionRepo / SetExportEnqueuer): 移設前は
+	//     closure の字句捕捉だったので落とすとコンパイルエラーだったが、今は
+	//     消してもビルドが通る。**ここに載せないのは、いずれも「認証や一回性の
+	//     保証」ではないため** — 未配線で起きるのは空配列 / 0 / 「使えない」で、
+	//     いちばん重いのが SetEmailAvailabilityDB の「登録済みアドレスを
+	//     available:true と答える」。ただし `user_profile.email` に unique
+	//     制約は無く、重複チェックはこの endpoint だけが持つので、劣化しても
+	//     防げるのは事前の案内だけという点で他の項目と tier が違う。
+	//     移設で新しく生まれた面なので、棚卸し (#2674) の対象には入れる
 	s.recordCriticalWiring([]criticalWiring{
+		{"users.remoteStatsFederationGate", remoteStatsFetcher.HasHostAllowedChecker(),
+			"連合を切った相手へもプロフィール表示のたびに統計を取りに行き、誰をいつ見たかが漏れる"},
+		{"peer.blocker", s.peerDeps.HasBlocker(),
+			"プラグイン間通信でブロックリストと連合ポリシーが効かなくなる"},
 		{"inbox.signatureVerifier", inboxProcessor.HasSignatureVerifier(),
 			"HTTP 署名検証・連合ブロック・actor 一致・replay 判定が同時に飛ぶ"},
 		{"signup.ticketConsumption", signupService.HasTicketConsumption(),
 			"招待 ticket の行ロックが飛び、1 枚から複数アカウントを作る窓が開く"},
 		{"signin.totpReplayGuard", signinHandler.HasTOTPReplayGuard(),
 			"有効な TOTP コードを window 内で再利用できる"},
+		{"signin.metaRepo", signinHandler.HasMetaRepo(),
+			"new-login メールの instance lang fallback が空のまま進み、profile.lang 未設定時に併記ではなく英語だけになる"},
+		{"resetpassword.metaRepo", resetHandler.HasMetaRepo(),
+			"パスワードリセットメールの instance lang fallback が空のまま進む"},
+		{"instance.hostBoundNodeinfoFetcher", metadataFetcher.HasHostBoundFetcher(),
+			"nodeinfo の取得が redirect の飛び先に縛られなくなり、任意の host が返した JSON を instance 行へ書き戻せる"},
+		{"federation.prohibitedWords", federationResolver.HasProhibitedWordsSource(),
+			"リモートから届くノートに禁止語のフィルタが掛からなくなる (ローカル投稿にだけ効く状態)"},
+		{"federation.noteDeleteHook.userRepo", noteDeleteHook.HasUserRepo(),
+			"DM / フォロワー限定ノートの Delete が宛先に届かず、相手サーバーに残り続ける"},
+		{"federation.noteDeleteHook.noteRepo", noteDeleteHook.HasNoteRepo(),
+			"フォローしていないリモート user が renote / reply したノートを消しても、相手サーバーに Delete が届かない"},
+		{"federation.localBaseURL", federationProcessor.HasLocalBaseURL(),
+			"relay の Accept / Reject が全て落ち、ローカル URI の判定も外れて自ホスト宛の object がリモート扱いになる"},
 		{"inbox.expectedHost", inboxHandler.HasExpectedHost(),
 			"署名対象の host ヘッダ検査と自ホスト一致検査が飛ぶ"},
 		{"inbox.enqueuer", inboxHandler.HasEnqueuer(),
 			"同期 fallback へ落ち、actor 一致検査・LD-Signature 検証・replay guard を通らない"},
 		{"i.totpReplayGuard", iHandler.HasTOTPReplayGuard(),
-			"verify2FAToken 経由の 8 endpoint と i/2fa/done で有効な TOTP コードを再利用できる"},
+			"2FA gate を持つ 8 endpoint と i/2fa/done で有効な TOTP コードを再利用でき、バックアップコードの単回予約も効かなくなる"},
 		{"i.authInvalidator", iHandler.HasAuthInvalidator(),
 			"revoke-token / regenerate-token / delete-account / update の後も古い token が auth cache の TTL のあいだ通る"},
 		{"admin.userTokenInvalidator", adminHandler.HasUserTokenInvalidator(),
@@ -3992,10 +4175,18 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"authorization code 再利用を検出して失効させた token が TTL のあいだ通る"},
 		{"signup.applicationSettlement", signupService.HasApplicationSettlement(),
 			"承認済み申請の行ロックが飛び、1 承認から複数アカウントを作る窓が開く"},
+		{"signup.formTokens", signupHandler.HasFormTokens(),
+			"captcha を 1 つも設定していないインスタンスで、申請 endpoint の唯一の簡易チェックが素通しになる"},
 		{"inbox.replayGuard", inboxProcessor.HasInboxReplayGuard(),
 			"処理済み activity の再投函を検出できない (isReplay が常に false)"},
 		{"postScheduledNote.lock", postScheduledNoteProcessor.HasLock(),
 			"job が二度 fire したとき予約投稿が 2 回 publish される"},
+		{"emojiApplication.policyProvider", emojiApplicationService.HasPolicyProvider(),
+			"カスタム絵文字申請の日次・週次・月次の上限が丸ごと効かなくなる"},
+		{"emojiApplication.quotaResetRepo", emojiApplicationService.HasQuotaResetRepo(),
+			"申請枠の手動リセットが常に失敗し、過去に戻した枠も再び満杯に見える"},
+		{"admin.emojiImageFetcher", adminHandler.HasEmojiImageFetcher(),
+			"承認した絵文字と admin/emoji/add で登録した絵文字 / admin/emoji/update で差し替えた絵文字が申請者 / 操作者 / 相手サーバーのファイルを参照し続け、消された時点で壊れる"},
 
 		// ここから可視性・権限・上限 (#2683)。認証ほど鋭くはないが、いずれも
 		// 利用者から見えない形で制限が外れる。
@@ -4058,18 +4249,38 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 			"federation: none でも Person を AP serve し、ap/show の FEDERATION_NOT_ALLOWED gate も skip される"},
 		{"deliverProcessor.deliveryGate", deliverProcessor.HasDeliveryGate(),
 			"block / federation mode は enqueue 時チェックの第 2 の関門が外れ (積み残しと retry 中が漏れる)、suspend は enqueue 側に検査が無いので新規ジョブごと配送し続ける"},
+		{"admin.suspensionOriginRepo", adminHandler.HasSuspensionOriginRepo(),
+			"モデレーターの suspend / unsuspend が由来を刻まないので、解除が次の actor refresh で無言で戻る (#2973)"},
+		{"resolver.suspensionOriginRepo", federationResolver.HasSuspensionOriginRepo(),
+			"リモート actor の凍結を読まなくなる (#2951 が効かない)。読んだとしても由来を刻めないので、モデレーターが解除しても次の refresh で無言で戻る"},
+		{"deliverProcessor.signingKeySource", deliverProcessor.HasSigningKeySource(),
+			"署名鍵は payload に載せず配送時に引くので、未配線だと全ての AP 配送が POST されないまま失敗する (連合が止まる)"},
 		{"notes.metaRepo", notesHandler.HasMetaRepo(),
 			"blocked-host の note が post-fetch 経路で漏れる"},
 		{"antennas.metaRepo", antennasHandler.HasMetaRepo(),
 			"blocked-host の note が antenna で漏れる"},
 		{"clips.metaRepo", clipsHandler.HasMetaRepo(),
 			"blocked-host の note が clip で漏れる"},
+		{"users.metaRepo", usersHandler.HasMetaRepo(),
+			"blocked-host の note が users/notes・users/reactions・users/featured-notes で漏れる"},
+		{"roles.metaRepo", rolesHandler.HasMetaRepo(),
+			"blocked-host の note が roles/notes で漏れる"},
+		{"channels.metaRepo", channelsHandler.HasMetaRepo(),
+			"blocked-host の note が channels/timeline で漏れる"},
 		{"reaction.mediaSilenceChecker", reactionService.HasMediaSilenceChecker(),
 			"media-silenced な host からのカスタム絵文字リアクションがそのまま出る"},
+		{"inbox.blockingService", federationProcessor.HasBlockingService(),
+			"受信した Block / Undo(Block) が無視され、reversi の Invite からブロック判定が飛ぶ"},
+		{"following.silencedHostChecker", followingService.HasSilencedHostChecker(),
+			"サイレンスしたホストからのフォローが承認なしで通り、followers 限定ノートが配送される"},
 		{"resolver.silencedHostChecker", federationResolver.HasSilencedHostChecker(),
 			"silenced instance の remote public note が home へ降格されず public timeline に出る"},
 		{"following.blockingChecker", followingService.HasBlockingChecker(),
 			"ブロック関係を無視してフォローが成立する (自分がブロックした相手・自分をブロックしている相手の両方。後者は inbox の Follow も通す)"},
+		{"admin.ipLookupAudit", adminHandler.HasIPLookupAudit(),
+			"IP 照会が監査に残らない (照会そのものは成立するので誰も気付けない)"},
+		{"blocking.followRequestCanceller", blockingService.HasFollowRequestCanceller(),
+			"block しても保留中の follow request が双方向に残り、block 中に承認されるとフォロー関係が成立する"},
 		{"reaction.blockingChecker", reactionService.HasBlockingChecker(),
 			"自分をブロックしている相手の投稿にリアクションできる (IsBlocked(target.UserID, user.ID))"},
 		{"poll.blockingChecker", pollService.HasBlockingChecker(),
@@ -4085,7 +4296,7 @@ func (s *Server) setupRoutes(plugins []plugin.Definition, openPluginStorage plug
 		{"notes.userFollowingRepo", notesHandler.HasUserFollowingRepo(),
 			"followers 限定投稿への返信が非フォロワーの HTL / STL に出る"},
 		{"i.roleProvider", iHandler.HasRoleProvider(),
-			"alwaysMarkNsfw の自己解除防止・wordMuteLimit・canUpdateBioMedia・i/import-antennas の antennaLimit が同時に外れ、avatarDecorationLimit は policy を無視して 1 固定になる"},
+			"alwaysMarkNsfw の自己解除防止・wordMuteLimit・canUpdateBioMedia・i/import-antennas の antennaLimit が同時に外れ、avatarDecorationLimit は policy を無視して 1 固定になり、canUseEmojiAsAvatarDecoration も既定の true 固定になる (ロールで絵文字デコレーションを止められなくなる)"},
 		{"notes.ugcVisibility", notesHandler.HasUGCVisibility(),
 			"匿名 visitor への note 露出を ugcVisibilityForVisitor で gate できない"},
 		{"users.ugcVisibility", usersHandler.HasUGCVisibility(),
@@ -4130,7 +4341,9 @@ type notifReaderAdapter struct {
 }
 
 func (a *notifReaderAdapter) ReadAll(userID string) error {
-	return a.svc.MarkAllAsRead(context.Background(), userID)
+	// WebSocket の readNotification は upstream Connection.onReadNotification と
+	// 同じく暗黙既読なので force を立てない (#2831)。
+	return a.svc.MarkAllAsRead(context.Background(), userID, false)
 }
 
 // hardMuteLookupAdapter bridges UserRepository to stream.HardMuteRulesLookup

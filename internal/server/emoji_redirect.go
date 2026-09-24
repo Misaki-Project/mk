@@ -74,7 +74,7 @@ func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
 		var hostPtr *string
 		if len(chunks) == 2 {
 			h := chunks[1]
-			// `@.` は ReactionService.normalizeReaction が永続化する
+			// `@.` は ReactionService.resolveReaction が永続化する
 			// canonical local-suffix。host_NULL と等価に扱う。
 			if h != "" && h != "." {
 				hostPtr = &h
@@ -82,6 +82,17 @@ func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
 		}
 
 		emoji, err := repo.FindByNameAndHost(name, hostPtr)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。このファイルは
+			// apierr を使わないので echo の HTTPError で返す。
+			//
+			// **キャッシュを打ち消す。** 上で `public, max-age=86400` を張って
+			// いるので、そのままだとブラウザや共有キャッシュが 500 を最大 1 日
+			// 保持しうる (RFC 9111 は明示的な max-age があれば 5xx も保存できる)。
+			// DB が復旧してもその絵文字だけ壊れて見える。
+			c.Response().Header().Set(echo.HeaderCacheControl, "no-store")
+			return echo.NewHTTPError(http.StatusInternalServerError)
+		}
 		if err != nil || emoji == nil {
 			if _, hasFallback := c.QueryParams()["fallback"]; hasFallback {
 				return c.Redirect(http.StatusFound, emojiRedirectFallback)
@@ -97,6 +108,47 @@ func emojiRedirectHandler(repo emojiLookup) echo.HandlerFunc {
 		}
 		if target == "" {
 			return c.NoContent(http.StatusNotFound)
+		}
+		// **`?badge=1` は badge モードへ回す (#2909)。** Service Worker の
+		// `create-notification.ts` がリアクションのプッシュ通知で
+		// `/emoji/<name>.webp?badge=1` を組み立てる。分岐が無いと badge が無視されて
+		// 通常の枝に落ち、96x96 の silhouette PNG ではなく**カラーの絵文字画像**が
+		// 返る (リモート絵文字なら `ProxyEmojiURLString` で高さ 128 にリサイズされた
+		// もの、ローカル絵文字は同一オリジンなので wrap されず原寸の元ファイル)。
+		// **どちらも 200 が返るので SW のエラー処理を素通りし、静かに違うものが出る**。
+		//
+		// **static より先に見る。** upstream (`ServerService.ts`) の if/else が badge を
+		// 先に取り、badge の枝では `static` を一切見ない。badge は 96x96 の silhouette
+		// PNG 固定なので、アニメーションの有無を渡しても結果が変わらないため。
+		if _, wantsBadge := c.QueryParams()["badge"]; wantsBadge {
+			// static と同じく entity 側で組む。`/proxy` を手で組むと sig が付かず、
+			// Authorize が HMAC ではなく DB allowlist に落ちる (#2905)。
+			if proxied := entity.BadgeEmojiProxyURL(target); proxied != "" {
+				c.Response().Header().Set("Content-Security-Policy", assetCSP)
+				return c.Redirect(http.StatusFound, proxied)
+			}
+			// context 未配線 (テスト等) なら従来どおり raw へ 302 する。
+		}
+		// **`?static=1` は media proxy へ回す (#2905)。** 利用者の
+		// 「アニメーション画像を再生しない」設定 (disableShowingAnimatedImages) が
+		// frontend からこの形で届く (`getStaticImageUrl` は `/emoji/` を見つけると
+		// searchParams を足すだけ)。raw へ 302 するとクエリが落ちて設定が無視される。
+		// upstream (`ServerService.ts`) も同じく media proxy へ飛ばしている。
+		//
+		// **allowlist は通る** — proxy は DB に実在する URL だけを許可し、
+		// `emoji.publicUrl` / `originalUrl` はその対象。
+		if _, wantsStatic := c.QueryParams()["static"]; wantsStatic {
+			// **entity 側で組む。** `/proxy` を手で組むと sig が付かず、
+			// Authorize が HMAC ではなく DB allowlist に落ちる。`/emoji/:path`
+			// はリアクションアイコンのホットパスなので、毎リクエスト DB を
+			// 引くことになる (#3036 で DB 障害は 403 + 1 日ではなく
+			// 503 + `no-store` になったが、引く回数そのものは減らない)。
+			// media proxy の設定 (external / proxyRemoteFiles) にも従う。
+			if proxied := entity.StaticEmojiProxyURL(target); proxied != "" {
+				c.Response().Header().Set("Content-Security-Policy", assetCSP)
+				return c.Redirect(http.StatusFound, proxied)
+			}
+			// context 未配線 (テスト等) なら従来どおり raw へ 302 する。
 		}
 		// upstream (`ServerService.ts` の `/emoji/:path`) はここで
 		// `default-src 'none'; style-src 'unsafe-inline'` を付けるので header を

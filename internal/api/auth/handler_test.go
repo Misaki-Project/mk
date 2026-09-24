@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/shiroha-a/mk/internal/misc"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"github.com/shiroha-a/mk/internal/testutil"
 	"github.com/stretchr/testify/assert"
@@ -178,7 +180,14 @@ func (m *mockAuthSessionRepo) findAppByID(appID string) *model.App {
 	return nil
 }
 
-var errNotFound = assert.AnError
+// **not-found を模す。** 汎用 error だと #2792 の「DB 障害は 500」に引っかかる。
+// repository は GORM の error をそのまま返すので、テストもそれに揃える。
+var errNotFound = repository.ErrNotFound
+
+// errBoom is a generic failure for write paths. **not-found とは分けること** —
+// 同じ値を使い回すと、将来 write path に `IsNotFound` の分岐が入ったときに
+// これらのテストが黙って別の枝を通る (#2792)。
+var errBoom = errors.New("db down")
 
 func newTestHandler() (*Handler, *mockAuthSessionRepo) {
 	repo := newMockRepo()
@@ -231,7 +240,7 @@ func TestSessionGenerate_InvalidParam(t *testing.T) {
 func TestSessionGenerate_CreateError(t *testing.T) {
 	h, repo := newTestHandler()
 	repo.apps["s1"] = &model.App{ID: "a1", Secret: "s1"}
-	repo.createErr = errNotFound
+	repo.createErr = errBoom
 	rec := post(h.SessionGenerate, `{"appSecret":"s1"}`, nil)
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -308,7 +317,7 @@ type failUpdateRepo struct {
 	*mockAuthSessionRepo
 }
 
-func (f *failUpdateRepo) UpdateSessionUserID(_, _ string) error { return errNotFound }
+func (f *failUpdateRepo) UpdateSessionUserID(_, _ string) error { return errBoom }
 
 func TestAccept_UpdateSessionError(t *testing.T) {
 	base := newMockRepo()
@@ -329,7 +338,7 @@ func TestAccept_CreateTokenError(t *testing.T) {
 	h, repo := newTestHandler()
 	repo.apps["s1"] = &model.App{ID: "a1", Secret: "s1", Permission: model.StringArray{}}
 	repo.sessions["tok1"] = &model.AuthSession{ID: "sess1", Token: "tok1", AppID: "a1"}
-	repo.createErr = errNotFound
+	repo.createErr = errBoom
 
 	rec := post(h.Accept, `{"token":"tok1"}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -560,7 +569,7 @@ func TestGenToken_MissingPermission(t *testing.T) {
 
 func TestGenToken_CreateError(t *testing.T) {
 	h, repo := newTestHandler()
-	repo.createErr = errNotFound
+	repo.createErr = errBoom
 	user := &model.User{ID: "u1", Username: "testuser"}
 
 	rec := post(h.GenToken, `{"permission":["read:account"]}`, user)
@@ -651,7 +660,8 @@ func TestMiAuthCheck_LosesFetchRace(t *testing.T) {
 	rec := postMiAuthCheck(h, sess, nil)
 	var out map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
-	// 遷移に負けた (または DB エラー) リクエストは token を払い出さない。
+	// 遷移に負けたリクエストは token を払い出さない。**DB エラー側は見ていない** —
+	// この stub は not-found を返す (#2792 で sentinel を分けた)。
 	assert.Equal(t, false, out["ok"])
 	_, hasToken := out["token"]
 	assert.False(t, hasToken)

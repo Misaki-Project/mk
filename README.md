@@ -2,16 +2,16 @@
 
 Misskey互換のGoバックエンド実装。TypeScript/NestJS製の[Misskey](https://github.com/misskey-dev/misskey)と同一のDB・Redis・フロントエンドを共有し、バックエンドを差し替えられる。
 
-互換バージョン: **Misskey 2026.7.0** (mk-go `1.2.1`)
+互換バージョン: **Misskey 2026.9.1** (mk-go `1.4.0`)
 
 ## 特徴
 
-- Go 1.26 / Echo v4 / GORM + pgx / go-redis v9
+- Go 1.27 / Echo v4 / GORM + pgx / go-redis v9
 - Misskeyフロントエンド(SPA)をそのまま配信
 - TypeScript版と同じPostgreSQL/Redisを共有、無停止で移行可能
 - ActivityPub連合対応（HTTP Signatures、リモートオブジェクト解決、配信キュー）
-- ジョブキューは `mkq` (BullMQ wire-compat、デフォルト) または `asynq`
-- Playwright e2e (290 spec ファイル) を PR ごとに実行。upstream 追従時は Misskey TS backend に対しても回して drop-in 互換を検証
+- ジョブキューは `mkq` (BullMQ wire-compat)
+- Playwright e2e (298 spec ファイル) を PR ごとに実行。upstream 追従時は Misskey TS backend に対しても回して drop-in 互換を検証
 - `RemoteStatsFetcher` でリモートユーザーの notesCount / followersCount / followingCount を origin から取得 (mk-go 独自拡張)
 
 ## クイックスタート
@@ -98,28 +98,23 @@ DB マイグレーションは one-shot の `migrate` サービスが自動適�
 ## アップデート
 
 ```bash
-# 1. submodule ごと更新する (--recurse-submodules を忘れない)
-git pull --recurse-submodules
-
-# 2. third_party/misskey が動いていたらフロントエンドを再ビルドする
-make e2e-frontend-build
-
-# 3. 再ビルドして起動しなおす (マイグレーションは自動適用される)
-docker compose build
-docker compose up -d
+# pull → ビルド → 再起動 → 配信アセットの検証まで通す
+make docker-update   # Docker Compose 構成
+make uds-update      # UDS 構成
 ```
 
 注意点:
 
-- **`git pull` だけでは submodule が更新されない**。親リポのポインタが動くだけで `third_party/misskey/` の中身は古いまま。`git config submodule.recurse true` を一度実行しておくと以後は自動で追従する
-- **フロントエンドを再ビルドしたら必ず mk-go を再起動する**。エントリポイントを起動時に 1 回だけ解決してキャッシュするため、再起動しないと消えた古いファイルを参照し続けて 404 になる
+- **`git pull` だけでは submodule が更新されない**。親リポのポインタが動くだけで `third_party/misskey/` の中身は古いまま。`make pull` (または `git pull --recurse-submodules`) を使う
+- **フロントエンドを再ビルドしたら必ず mk-go を再起動する**。エントリポイントを起動時に 1 回だけ解決してキャッシュするため、再起動しないと消えた古いファイルを参照し続けて 404 になる。**`docker compose up -d` では再起動されない** — イメージと設定が変わらなければコンテナは作り直されず、フロントエンドは bind-mount なので何も変わらないため。`make *-update` / `make *-restart` は `restart` を明示したうえで、配信中のアセットが実在するかまで検証する (#2885)
+- **ビルド中はフロントエンドが 404 になる**。配信中のディレクトリを作り直すため。ビルドが失敗した場合は 404 のまま残るので、成功するまで直すこと
 - ブラウザ側に Service Worker が残っている場合はハードリロードする
 
 バイナリ直接実行や UDS 構成でのアップデート手順は[デプロイ](docs/deployment.md#アップデート)を参照。
 
 ## ローカルビルド
 
-前提: Go 1.26+、PostgreSQL 18推奨 (16以降で動作、CI検証は18)、Redis 7+、Docker (テスト用)
+前提: Go 1.27+、PostgreSQL 18推奨 (16以降で動作、CI検証は18)、Redis 7+、Docker (テスト用)
 
 ```bash
 git clone --recursive https://github.com/shiroha-a/mk.git
@@ -150,7 +145,7 @@ make test
 go test ./internal/api/notes/...
 
 # レース検出 + カバレッジ (CIと同条件)
-go test -race -count=1 -timeout 10m \
+go test -race -count=1 -shuffle=3 -timeout 10m \
   -coverprofile=coverage.out -covermode=atomic ./...
 ```
 
@@ -177,13 +172,14 @@ go test -race -count=1 -timeout 10m \
 | [シェイプドリフト検出](docs/shape-drift.md) | レスポンス形状・エラーID・権限のドリフトを検出する静的ゲート |
 | [本家 backend e2e](docs/upstream-backend-e2e.md) | Misskey 本家の `test/e2e/**` を無改変で mk-go に向けて実行する |
 | [プラグイン](docs/plugins/) | ビルド時組み込みプラグインの書き方・運用 |
+| [プラグイン peer プロトコル](docs/plugin-peer-protocol.md) | mk-go 同士でだけ通じる署名付き HTTP チャネルの wire 仕様 |
 | [UDSデプロイ](docs/docker-uds.md) | UNIXドメインソケット構成 |
-| [queue-bench](docs/queue-bench.md) | BullMQ / asynq / mkq の 3-way 比較 (#563) |
+| [queue-bench](docs/queue-bench.md) | BullMQ / mkq の 2-way 比較 (#563) |
 | [ベンチプロファイリング](docs/bench-pprof.md) | k6負荷時のpprof取得と解析 |
 | [メディアプロキシの govips 評価](docs/mediaproxy-govips-evaluation.md) | 画像変換ライブラリの比較検討 |
 | [upstream追従手順](docs/upstream-catch-up.md) | Misskey TSの新リリース取り込みとsubmodule bump |
 | [設計メモ](docs/design/) | オートスケール、inbox verify、mkq等の設計判断 |
-| [upstream 差分](docs/update/) | Misskey TS 2026.3.2 → 2026.7.0 の backend 差分 (`<yyyymm><nn>diff.md`) と triage note |
+| [upstream 差分](docs/update/) | Misskey TS 2026.3.2 → 2026.9.1 の backend 差分 (`<yyyymm><nn>diff.md`) と triage note |
 
 ## ライセンス
 

@@ -18,6 +18,7 @@ import (
 	"github.com/shiroha-a/mk/internal/api/notehide"
 	"github.com/shiroha-a/mk/internal/api/pagination"
 	"github.com/shiroha-a/mk/internal/core/notesfilter"
+	"github.com/shiroha-a/mk/internal/core/notification"
 	"github.com/shiroha-a/mk/internal/core/reaction"
 	corewebhook "github.com/shiroha-a/mk/internal/core/webhook"
 	"github.com/shiroha-a/mk/internal/entity"
@@ -181,6 +182,10 @@ func (h *Handler) ReportAbuse(c echo.Context) error {
 	var target *model.User
 	if h.userRepo != nil {
 		t, err := h.userRepo.FindByID(req.UserID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+		}
 		if err != nil || t == nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "1acefcb5-0959-43fd-9685-b48305736cb5"))
 		}
@@ -292,11 +297,16 @@ func (h *Handler) inactiveAbuseWebhookIDs() []string {
 	return excludes
 }
 
-// notifyModeratorsOfAbuseReport publishes a newAbuseUserReport admin stream
-// event to every moderator/administrator (#1549)。lister / notifier 未配線時は
+// notifyModeratorsOfAbuseReport notifies every moderator/administrator of a new
+// report through two channels (#1549 / #2868)。lister / notifier 未配線時は
 // no-op。失敗は best-effort で握り潰す (report 自体は永続化済)。
+//
+//   - admin stream の newAbuseUserReport (#1549)。その瞬間に管理画面を開いて
+//     いる人に即座に届く。後から見返せない。
+//   - 通知欄に残る in-app notification (#2868)。**upstream には無い** —
+//     あちらは email / system webhook / admin stream しか持たない。
 func (h *Handler) notifyModeratorsOfAbuseReport(report *model.AbuseUserReport) {
-	if h.moderatorLister == nil || h.abuseNotifier == nil {
+	if h.moderatorLister == nil || (h.abuseNotifier == nil && h.abuseInAppNotifier == nil) {
 		return
 	}
 	mods, err := h.moderatorLister.GetModerators()
@@ -314,7 +324,33 @@ func (h *Handler) notifyModeratorsOfAbuseReport(report *model.AbuseUserReport) {
 		"comment":      report.Comment,
 	}
 	for _, m := range mods {
-		h.abuseNotifier.PublishAdminEvent(m.ID, "newAbuseUserReport", body)
+		if h.abuseNotifier != nil {
+			h.abuseNotifier.PublishAdminEvent(m.ID, "newAbuseUserReport", body)
+		}
+		if h.abuseInAppNotifier == nil {
+			continue
+		}
+		// **リクエストの ctx を使わない。** 通報は永続化済みで、通知はそれに
+		// 付随する副作用。クライアント切断で欠けるべきではない。
+		//
+		// 通報者自身がモデレーターなら notifier == notifiee になり
+		// ErrSelfNotification で弾かれる。自分の通報が自分の通知欄に出ないのは
+		// 正しいので、警告として出さない。
+		_, nerr := h.abuseInAppNotifier.Create(context.Background(), notification.CreateInput{
+			NotifieeID: m.ID,
+			NotifierID: report.ReporterID,
+			Type:       notification.TypeAbuseReport,
+			// **comment は入れない (#2868)。** 通報コメントは定型フォームの全文が
+			// 入るので通知欄に出しても読めず、出さない以上 Redis に通報本文の
+			// 複製を残す理由が無い (権限を失った元モデレーターに読まれる面も減る)。
+			Extra: map[string]any{
+				"reportId":     report.ID,
+				"targetUserId": report.TargetUserID,
+			},
+		})
+		if nerr != nil && !errors.Is(nerr, notification.ErrSelfNotification) {
+			slog.Warn("report-abuse: in-app notification failed", "moderator", m.ID, "err", nerr)
+		}
 	}
 }
 
@@ -346,7 +382,11 @@ func (h *Handler) Reactions(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "userId is required.", "3d81ceae-475f-4600-b2a8-2bc116157532"))
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	req.SinceID, req.UntilID = id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	cursorSince, cursorUntil, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
+	req.SinceID, req.UntilID = cursorSince, cursorUntil
 	limit, limitOK := pagination.ResolveLimit(req.Limit, 10, 100)
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
@@ -364,6 +404,10 @@ func (h *Handler) Reactions(c echo.Context) error {
 	// fall-through する (= test compat、production 影響なし)。
 	if !iAmModerator && h.userRepo != nil {
 		target, err := h.userRepo.FindByID(req.UserID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+		}
 		if err != nil || target == nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_USER", "No such user.", "27e494ba-2ac2-48e8-893b-10d4d8c2387b"))
 		}
@@ -377,7 +421,12 @@ func (h *Handler) Reactions(c echo.Context) error {
 		// profile 行が無い (= nil) 場合は DB 列 default の `true` 扱いで
 		// fall-through する (upstream TS の getUserPolicies と同 semantics)。
 		if viewer == nil || viewer.ID != req.UserID {
-			profile := h.userService.GetProfile(req.UserID)
+			// **DB 障害を「公開」に倒さない。** nil で fall-through すると
+			// 接続断のあいだ非公開リアクションが読めてしまう (#2799)。
+			profile, perr := h.userService.GetProfileErr(req.UserID)
+			if perr != nil && !repository.IsNotFound(perr) {
+				return apierr.JSONInternalError(c)
+			}
 			if profile != nil && !profile.PublicReactions {
 				return c.JSON(http.StatusBadRequest, apierr.Error("REACTIONS_NOT_PUBLIC", "Reactions of the user is not public.", "673a7dd2-6924-1093-e0c0-e68456ceae5c"))
 			}
@@ -419,7 +468,14 @@ func (h *Handler) Reactions(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
-	if len(sets.MutedUserIDs) > 0 || len(sets.BlockerIDs) > 0 || len(sets.MutedInstances) > 0 {
+	// **ブロック済みインスタンスのノートも落とす** (upstream
+	// generateBlockedHostQueryForNote)。`ListByUserID` が push down するのは
+	// visibility だけなので、ブロック後も既存のリアクションが出続けていた。
+	blockedHosts, berr := notesfilter.LoadBlockedHosts(h.metaRepo)
+	if berr != nil {
+		return apierr.JSONInternalError(c)
+	}
+	if len(sets.MutedUserIDs) > 0 || len(sets.BlockerIDs) > 0 || len(sets.MutedInstances) > 0 || len(blockedHosts) > 0 {
 		rowNotes := make([]*model.Note, 0, len(rows))
 		for _, r := range rows {
 			if r.Note != nil {
@@ -430,6 +486,7 @@ func (h *Handler) Reactions(c echo.Context) error {
 		if ferr != nil {
 			return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 		}
+		filteredNotes = notesfilter.ApplyBlockedHosts(filteredNotes, blockedHosts)
 		survived := make(map[string]struct{}, len(filteredNotes))
 		for _, n := range filteredNotes {
 			survived[n.ID] = struct{}{}
@@ -516,6 +573,11 @@ func (h *Handler) FeaturedNotes(c echo.Context) error {
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
+	// 他のページングと同じく `id.NormalizeCursor` を通す (#3025)。
+	_, untilID, cursorOK := id.NormalizeCursor("", req.UntilID, nil, nil)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	viewer := middleware.GetUser(c)
 	var viewerID string
 	if viewer != nil {
@@ -525,7 +587,7 @@ func (h *Handler) FeaturedNotes(c echo.Context) error {
 	if h.isBlockedByTarget(viewer, req.UserID) {
 		return c.JSON(http.StatusOK, []entity.NoteEntity{})
 	}
-	notes, err := h.featuredNotesByUser(c.Request().Context(), req.UserID, viewerID, req.UntilID, limit)
+	notes, err := h.featuredNotesByUser(c.Request().Context(), req.UserID, viewerID, untilID, limit)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
@@ -540,6 +602,14 @@ func (h *Handler) FeaturedNotes(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
+	// **ブロック済みインスタンスのノートを落とす** (upstream
+	// generateBlockedHostQueryForNote)。ランキング / SQL のどちらの経路にも
+	// 入っていないので post-fetch で落とす。
+	blockedHosts, err := notesfilter.LoadBlockedHosts(h.metaRepo)
+	if err != nil {
+		return apierr.JSONInternalError(c)
+	}
+	notes = notesfilter.ApplyBlockedHosts(notes, blockedHosts)
 	result := entity.PackNotes(c.Request().Context(), notes, h.idGen, h.instanceLookup(), h.emojiLookup(), h.reactionReader())
 	h.fieldRes.Apply(result, viewer)
 	notehide.HideEmbeds(viewer, result)

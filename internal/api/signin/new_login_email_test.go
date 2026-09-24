@@ -70,6 +70,36 @@ func strptr(s string) *string { return &s }
 
 // #2454: upstream SigninService はメール確認済みの user にログイン通知を送る。
 // `login` 通知はアプリ内にしか出ないので、乗っ取りに気付ける唯一の外向き経路。
+func TestNewLoginEmail_SentInJapaneseWhenProfileLangIsJa(t *testing.T) {
+	h, repo := newTestHandler(t)
+	sender := newChanEmailSender()
+	h.SetEmailSender("https://example.test", sender.send)
+	setProfileEmail(repo, "u1", strptr("user@example.test"), true)
+	repo.Profiles["u1"].Lang = strptr("ja-JP")
+
+	h.RecordSuccessfulSignin("u1", "1.2.3.4", http.Header{})
+
+	m := sender.waitMail(t)
+	assert.Equal(t, "ログインがありました", m.msg.Subject)
+	assert.Contains(t, m.msg.Text, "新しいログインがありました")
+}
+
+func TestNewLoginEmail_SentInJapaneseFromMetaLangsWhenProfileLangUnset(t *testing.T) {
+	h, repo := newTestHandler(t)
+	sender := newChanEmailSender()
+	h.SetEmailSender("https://example.test", sender.send)
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x", Langs: []string{"ja-JP"}}
+	h.SetMetaRepo(metaRepo)
+	setProfileEmail(repo, "u1", strptr("user@example.test"), true)
+
+	h.RecordSuccessfulSignin("u1", "1.2.3.4", http.Header{})
+
+	m := sender.waitMail(t)
+	assert.Equal(t, "ログインがありました", m.msg.Subject)
+	assert.Contains(t, m.msg.Text, "新しいログインがありました")
+}
+
 func TestNewLoginEmail_SentWhenVerified(t *testing.T) {
 	h, repo := newTestHandler(t)
 	sender := newChanEmailSender()
@@ -80,11 +110,9 @@ func TestNewLoginEmail_SentWhenVerified(t *testing.T) {
 
 	m := sender.waitMail(t)
 	assert.Equal(t, "user@example.test", m.to)
-	// 件名・本文は upstream の文面のまま。TS から切り替えた instance の利用者が
-	// 別の文面を受け取ると「別のサービスから届いた」と読めてしまう。
 	assert.Equal(t, "New login / ログインがありました", m.msg.Subject)
 	assert.Contains(t, m.msg.Text, "There is a new login.")
-	assert.Contains(t, m.msg.Text, "新しいログインがありました。")
+	assert.Contains(t, m.msg.Text, "新しいログインがありました")
 	// HTML 版は wrapper に載り、認証済 user 向けの email 設定 link を持つ。
 	assert.Contains(t, m.msg.HTML, "https://example.test/settings/email")
 }

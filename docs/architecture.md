@@ -29,7 +29,7 @@ mk-go は Misskey (TypeScript/NestJS) のバックエンドを Go で書き換�
 補助レイヤ:
   entity       … model → JSON レスポンス変換       ← core/entities/*EntityService
   activitypub  … AP の型/署名/レンダラ/解決         ← core/activitypub/*
-  queue        … 非同期ジョブ (mkq / asynq)         ← queue/processors/*
+  queue        … 非同期ジョブ (mkq)                 ← queue/processors/*
   stream       … WebSocket チャンネル               ← server/api/stream/channels/*
 ```
 
@@ -43,7 +43,7 @@ mk-go は Misskey (TypeScript/NestJS) のバックエンドを Go で書き換�
 | データアクセス | サービスが TypeORM repository を直接注入 | **明示的な `repository` interface 層** | mock 注入による単体テスト容易性 |
 | pack | `*EntityService.pack()` は DI されたサービス | **`entity.PackX()` は純関数** | 変換とドメインロジックの分離 |
 | クロスカット | `GlobalEventService` (event emitter) + 直接注入 | **明示的 hook interface** (`SetFanoutHook` 等) | import cycle 回避（§6） |
-| ジョブキュー | BullMQ | **mkq** (BullMQ wire 互換, 既定) / asynq (legacy) | Redis ストリーム互換 + Go ネイティブ |
+| ジョブキュー | BullMQ | **mkq** (BullMQ wire 互換) | Redis ストリーム互換 + Go ネイティブ |
 | HTTP 署名 | `@misskey-dev/node-http-message-signatures` | **自前実装** (`internal/activitypub/signature.go`) | 依存削減・RSA/Ed25519 両対応 |
 
 ---
@@ -234,7 +234,7 @@ upstream `core/activitypub/*` に対応。型/署名/レンダラは `activitypu
 
 ### 3.7 `internal/queue/` — ジョブキュー
 
-driver は `mkq`（BullMQ wire 互換, 既定）/ `asynq`（legacy）。`jobQueueDriver` で切替。`processors/` 配下:
+driver は `mkq`（BullMQ wire 互換）のみ。legacy の `asynq` は #2985 で削除し、`jobQueueDriver: asynq` は起動エラーになる。`processors/` 配下:
 
 | mk-go processor | Misskey-TS processor | 内容 |
 |---|---|---|
@@ -334,7 +334,7 @@ wire 互換を機械的に守る多層防御。upstream は **official `misskey/
 | drift detector | CanSeeNote ↔ SQL push-down 等のロジック整合検出 | shape-drift.md |
 | 値レベル diff harness | TS インスタンス ↔ mk-go の応答を値単位で diff（`make diff-test`） | diff-e2e.md |
 | drop-in e2e | 実 Misskey TS ↔ mk-go 切替の連合/フロント互換（PR ごと。frontend e2e のみ nightly） | dropin-e2e.md / dropin-frontend-e2e.md |
-| playwright | 290 spec を mk-go backend で（PR ごと、4 シャード）。TS backend は手動 | — |
+| playwright | 298 spec を mk-go backend で（PR ごと、4 シャード）。TS backend は手動 | — |
 | inbound/outbound 連合 | Fedibird-like mock との Ed25519 双方向 verify | federation.md |
 
 CI（`ci.yml`）は build / 4-shard test（パッケージ毎 90% カバレッジ強制）/ lint を必須化。
@@ -346,6 +346,7 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 | 機能 | 系統 | 備考 |
 |---|---|---|
+| password hash の Argon2id 受理 | cherrypick | signin 成功後に bcrypt へ段階移行。divergence.md |
 | federated chat | vanilla chat shape + yojo-art/cherrypick 連合 | 1-on-1 DM を `Create+Note(_misskey_talk:true)` で AP 配送 |
 | federated reversi | vanilla reversi + cherrypick 連合対戦 | crc32 等は packed schema 外（連合 verify 用） |
 | Ed25519 / Multikey (FEP-521a) | 連合拡張 | RSA に加え Ed25519 署名 |
@@ -363,17 +364,17 @@ upstream に無い、または cherrypick 由来の加算機能（wire 互換を
 
 `MK_` プレフィックスの環境変数でオーバーライド可（例 `MK_DB_HOST`）。詳細は [configuration.md](configuration.md)。
 
-マイグレーション（`migration/`、golang-migrate、現在 81 本）:
+マイグレーション（`migration/`、golang-migrate、現在 97 本）:
 
-- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 9 件あり、うち 8 件は mk-go が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
+- TS Misskey の既存テーブルへは原則**追加のみ**。例外が 15 件あり、うち 11 件は mk-go が自分で作ったものの除去・初期化か upstream 追随 ([TS版からの移行](migration-from-ts.md#破壊的なマイグレーション))。Go 固有の追加列・テーブルは `IF NOT EXISTS`。
 - drop-in テストで発見した補完列は専用マイグレーションで追加。
-- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただしこれは今後の規約で、既存の down は守れていない** — 宣言があるのは 8 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down が 51 本ある（[migration-from-ts.md](migration-from-ts.md#mk-go-内での切り戻し)）。
+- down スクリプトは必須（data loss する場合は `-- data loss:` で明記する）。**ただしこれは今後の規約で、既存の down は守れていない** — 宣言があるのは 16 本だけで、宣言が無いまま `DROP TABLE` / `DROP COLUMN` する down が 51 本ある（[migration-from-ts.md](migration-from-ts.md#mk-go-内での切り戻し)）。
 
 ```bash
 make migrate-up      # 最新まで
 make migrate-down    # 1 段ロールバック
 make migrate-create  # 新規作成
 
-# 全段ロールバック (破壊的。schema が消える)
+# 全段ロールバック (破壊的。全テーブルが消える)
 go run ./cmd/migrate -direction down
 ```

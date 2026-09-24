@@ -89,7 +89,7 @@ func TestCreateMessageViaAP(t *testing.T) {
 	svc := corechat.NewService(chatRepo, idGen)
 	sender := &model.User{ID: "remote1", Username: "remote1"}
 
-	msg, err := svc.CreateMessageViaAP(context.Background(), "https://remote.example/chat-messages/1", sender, "local1", "hello from remote")
+	msg, err := svc.CreateMessageViaAP(context.Background(), "https://remote.example/chat-messages/1", sender, "local1", "hello from remote", "")
 	require.NoError(t, err)
 	require.NotNil(t, msg)
 	assert.Equal(t, "remote1", msg.FromUserID)
@@ -104,10 +104,10 @@ func TestCreateMessageViaAP_InvalidTarget(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := corechat.NewService(chatRepo, idGen)
 
-	_, err := svc.CreateMessageViaAP(context.Background(), "", nil, "local1", "hi")
+	_, err := svc.CreateMessageViaAP(context.Background(), "", nil, "local1", "hi", "")
 	assert.Error(t, err)
 
-	_, err = svc.CreateMessageViaAP(context.Background(), "", &model.User{ID: "x"}, "", "hi")
+	_, err = svc.CreateMessageViaAP(context.Background(), "", &model.User{ID: "x"}, "", "hi", "")
 	assert.Error(t, err)
 }
 
@@ -237,7 +237,7 @@ func TestCreateMessageViaAP_ScopeEnforced(t *testing.T) {
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", ChatScope: "none"}
 	sender := &model.User{ID: "remote-alice", Username: "alice"}
 
-	_, err := svc.CreateMessageViaAP(context.Background(), "https://remote.example/cm/1", sender, "bob", "x")
+	_, err := svc.CreateMessageViaAP(context.Background(), "https://remote.example/cm/1", sender, "bob", "x", "")
 	require.ErrorIs(t, err, corechat.ErrChatScopeViolation)
 }
 
@@ -302,7 +302,7 @@ func TestFederateInvitation_DeliversInviteToRemoteInvitee(t *testing.T) {
 	remoteURI := "https://remote.example/users/bob"
 	userRepo.Users["owner1"] = &model.User{ID: "owner1", Username: "owner1"}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &remoteURI}
-	require.NoError(t, chatRepo.CreateRoom(&model.ChatRoom{ID: "room1", Name: "General", OwnerID: "owner1"}))
+	require.NoError(t, chatRepo.CreateRoom(remoteRoomRow("room1", "General", "owner1")))
 
 	svc.FederateInvitation("room1", "bob")
 	assert.Equal(t, 1, deliverer.called)
@@ -317,7 +317,7 @@ func TestFederateInvitation_SkipsLocalInvitee(t *testing.T) {
 	svc, chatRepo, userRepo, deliverer := newInvitationService(t)
 	userRepo.Users["owner1"] = &model.User{ID: "owner1", Username: "owner1"}
 	userRepo.Users["carol"] = &model.User{ID: "carol", Username: "carol"}
-	require.NoError(t, chatRepo.CreateRoom(&model.ChatRoom{ID: "room1", Name: "General", OwnerID: "owner1"}))
+	require.NoError(t, chatRepo.CreateRoom(remoteRoomRow("room1", "General", "owner1")))
 
 	svc.FederateInvitation("room1", "carol")
 	assert.Equal(t, 0, deliverer.called)
@@ -331,7 +331,7 @@ func TestFederateInvitation_SkipsRemoteOwnedRoom(t *testing.T) {
 	// owner が remote の room は本インスタンスから署名配送できないため no-op。
 	userRepo.Users["remoteOwner"] = &model.User{ID: "remoteOwner", Username: "owner", Host: &remoteHost, URI: &ownerURI}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &inviteeURI}
-	require.NoError(t, chatRepo.CreateRoom(&model.ChatRoom{ID: "room1", Name: "General", OwnerID: "remoteOwner"}))
+	require.NoError(t, chatRepo.CreateRoom(remoteRoomRow("room1", "General", "remoteOwner")))
 
 	svc.FederateInvitation("room1", "bob")
 	assert.Equal(t, 0, deliverer.called)
@@ -355,7 +355,7 @@ func TestFederateInvitation_DeliveryFailureIsSwallowed(t *testing.T) {
 	remoteURI := "https://remote.example/users/bob"
 	userRepo.Users["owner1"] = &model.User{ID: "owner1", Username: "owner1"}
 	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob", Host: &remoteHost, URI: &remoteURI}
-	require.NoError(t, chatRepo.CreateRoom(&model.ChatRoom{ID: "room1", Name: "General", OwnerID: "owner1"}))
+	require.NoError(t, chatRepo.CreateRoom(remoteRoomRow("room1", "General", "owner1")))
 
 	// 配送失敗は panic/propagate せず swallow される。
 	svc.FederateInvitation("room1", "bob")

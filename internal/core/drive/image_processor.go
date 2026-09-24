@@ -2,6 +2,7 @@ package drive
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/draw"
@@ -12,6 +13,8 @@ import (
 	_ "github.com/gen2brain/avif" // AVIF input decode (mediaproxy と同じ wazero ベース)
 	"github.com/gen2brain/webp"
 	"github.com/kovidgoyal/imaging"
+
+	"github.com/shiroha-a/mk/internal/misc/imagedecode"
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
@@ -46,7 +49,10 @@ type VideoProcessor interface {
 	// GenerateThumbnail extracts a frame from the video and returns a
 	// WebP thumbnail. Returns nil, nil if extraction fails or FFmpeg is
 	// unavailable.
-	GenerateThumbnail(body []byte, mimeType string) (*ProcessedImage, error)
+	//
+	// ctx は ffmpeg の実行に渡る (#3037)。利用者が接続を切ったら外部
+	// プロセスも止める。
+	GenerateThumbnail(ctx context.Context, body []byte, mimeType string) (*ProcessedImage, error)
 }
 
 // Thumbnail / webpublic 生成パラメータ (Misskey TS 準拠)
@@ -117,9 +123,22 @@ func NewDefaultImageProcessor() *DefaultImageProcessor {
 // images using EXIF orientation data. golang.org/x/image の webp/bmp/tiff
 // デコーダは import _ で init 登録済み。
 func decodeImage(body []byte, mimeType string) (image.Image, error) {
-	// imaging.Decode は EXIF orientation を自動補正し、
-	// import _ で登録済みの webp/bmp/tiff も処理できる。
-	img, err := imaging.Decode(bytes.NewReader(body), imaging.AutoOrientation(true))
+	// 規則は `internal/misc/imagedecode` に 1 つだけ置いてある (#2925)。
+	// EXIF orientation の自動補正と、インターレース truecolor PNG の
+	// decoder バグ回避を含む。**ここを直接 imaging.Decode に戻さないこと** —
+	// media proxy 側と食い違い、ローカルにアップロードされた画像だけが
+	// 真っ黒なサムネイルを storage に焼く形になる。
+	// **cap は upstream の sharp に揃える。** media proxy の 64MP をそのまま
+	// 当てると、develop では通っていた 64MP 超の実写真 (102MP の中判、パノラマ
+	// 合成、高解像度スキャン) がサムネイル・blurhash・寸法・**webpublic** を
+	// 全部失う。webpublic が作られないと `GetPublicURL` が原本を指すので、
+	// EXIF の GPS が公開側へ出る側に倒れる — 同じ PR の別コミットが塞いだ
+	// ばかりの穴を、この cap で開け直すことになる。
+	//
+	// upstream は `limitInputPixels` を上書きしないので、アップロードで通る
+	// 上限は sharp の既定 (0x3FFF^2) になる。ここを揃えても宣言寸法での爆弾
+	// (46341^2 = 21 億画素) は引き続き弾ける。
+	img, err := imagedecode.DecodeWithPixelCap(body, imagedecode.UpstreamMaxPixels)
 	if err != nil {
 		return nil, fmt.Errorf("unsupported image format: %s: %w", mimeType, err)
 	}
@@ -192,6 +211,32 @@ func (p *DefaultImageProcessor) GenerateWebpublic(body []byte, mimeType string) 
 	if !isMimeImage(mimeType) {
 		return nil, nil
 	}
+	// **アニメーションを静止画に潰してまで縮めない。** `encodeWebP` は 1 枚しか
+	// 受けないので、ここで作ると 1 コマだけの webpublic になり、`GetPublicURL` を
+	// 通す経路 (他人に見せる側) が静止画に化ける。upstream も `isAnimated` なら
+	// webpublic を作らない (`DriveService.ts` の `!isAnimated`)。
+	//
+	// **ただしメタデータがあるときは作る** (upstream より厳しい側)。アニメーションを
+	// 保つために撮影情報を残すのは割に合わない。**実際に効くのは APNG と
+	// アニメーション WebP だけ** — `hasStrippableMetadata` は GIF を見ない
+	// (`imagemeta.go` は JPEG / PNG / WebP / TIFF のみ) ので、GIF に対しては
+	// この条件が常に真になる。
+	//
+	// **WebP は MIME では判定できない (#3128)。** アニメーションも静止画も
+	// `image/webp` なので、`isAnimatedMime` では拾えずに 1 コマへ潰れていた。
+	// コンテナを歩く判定を足す。
+	//
+	// **animated AVIF はまだ拾えない。** ISOBMFF を歩いて複数フレームを見る必要が
+	// あり、WebP の RIFF 走査とは別物。しかも下の枝が `mimeType != "image/avif"` を
+	// 条件にしているため、AVIF は寸法にもメタデータにも関係なく必ず作られる。
+	//
+	// **デコードより前に置く。** 判定はバイト列だけで決まるので、作らないと
+	// 決まっている入力をデコードする必要が無い。
+	if (isAnimatedMime(mimeType) || imagedecode.IsAnimatedWebP(body)) &&
+		!hasStrippableMetadata(body, mimeType) {
+		return nil, nil
+	}
+
 	img, err := decodeImage(body, mimeType)
 	if err != nil {
 		return nil, nil
@@ -199,7 +244,7 @@ func (p *DefaultImageProcessor) GenerateWebpublic(body []byte, mimeType string) 
 
 	bounds := img.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
-	hasExif := hasExifMarker(body)
+	hasExif := hasStrippableMetadata(body, mimeType)
 
 	// AVIF は Mastodon / MS Edge が表示できないため、寸法やメタデータに
 	// 関わらず必ず WebP の webpublic を作る (upstream DriveService の
@@ -259,20 +304,4 @@ func (p *DefaultImageProcessor) CalculateBlurhash(body []byte, mimeType string) 
 	// blurhash.Encode は xComp/yComp が 1-9 の範囲内であれば常に成功する
 	hash, _ := blurhash.Encode(blurhashXComp, blurhashYComp, nrgba)
 	return hash, nil
-}
-
-// hasExifMarker checks if the image bytes contain an EXIF marker.
-// JPEG の APP1 (0xFF 0xE1) + "Exif\0\0" パターンを検索する。
-func hasExifMarker(body []byte) bool {
-	if len(body) < 12 {
-		return false
-	}
-	// JPEG 先頭の SOI マーカー確認
-	if body[0] != 0xFF || body[1] != 0xD8 {
-		return false // JPEG でなければ EXIF なしとみなす
-	}
-	// APP1 マーカー + Exif ヘッダを探す (先頭 64KB 以内)
-	limit := min(len(body), 65536)
-	exifSig := []byte{0x45, 0x78, 0x69, 0x66, 0x00, 0x00} // "Exif\0\0"
-	return bytes.Contains(body[:limit], exifSig)
 }

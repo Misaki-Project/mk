@@ -2,15 +2,19 @@ package notes
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/api/apierr"
 	"github.com/shiroha-a/mk/internal/api/pagination"
 	coreachievement "github.com/shiroha-a/mk/internal/core/achievement"
+	corenote "github.com/shiroha-a/mk/internal/core/note"
+	"github.com/shiroha-a/mk/internal/core/notesfilter"
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -96,6 +100,10 @@ func (h *Handler) FavoritesDelete(c echo.Context) error {
 	// 操作するので visibility gate は不要 (可視性を絞られた後でも un-favorite
 	// できるべき)、存在確認のみ行う。
 	if _, err := h.noteRepo.FindByID(req.NoteID); err != nil {
+		if !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "80848a2c-398f-4343-baa9-df1d57696c56"))
 	}
 	if exists, _ := h.favoriteRepo.Exists(user.ID, req.NoteID); !exists {
@@ -129,7 +137,10 @@ func (h *Handler) Featured(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// untilDate を aidx prefix に正規化 (#1166)。
-	_, untilID := id.NormalizeCursor("", req.UntilID, nil, req.UntilDate)
+	_, untilID, cursorOK := id.NormalizeCursor("", req.UntilID, nil, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	notes, err := h.featuredNotes(c.Request().Context(), req.ChannelID, untilID, limit, req.Offset)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
@@ -228,6 +239,10 @@ func (h *Handler) Unrenote(c echo.Context) error {
 	}
 	// renoteId が指定ノートの自分のノートを探して削除
 	renote, err := h.noteRepo.FindRenoteByUser(user.ID, req.NoteID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "efd4a259-2442-496b-8dd7-b255aa1a160f"))
 	}
@@ -257,7 +272,10 @@ func (h *Handler) Mentions(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	// visibility kind の絞り込みは ListMentions の SQL push-down に委譲する
 	// (#1451)。upstream TS notes/mentions と同じく、visibility 指定時のみ
 	// note.visibility = <値> で exact-match し、未指定は全種別を返す。旧実装は
@@ -308,6 +326,10 @@ func (h *Handler) UserListTimeline(c echo.Context) error {
 	// リスト所有権チェック (TS互換: 自分のリストのみ閲覧可)
 	if h.userListRepo != nil {
 		list, err := h.userListRepo.FindByID(req.ListID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_LIST", "No such list.", "8fb1fbd5-e476-4c37-9fb0-43d55b63a2ff"))
 		}
@@ -316,7 +338,10 @@ func (h *Handler) UserListTimeline(c echo.Context) error {
 		}
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	// list owner gate だけでは note の visibility を守れない。list メンバーは
 	// 自由に編集できるため、未フォローのアカウントを list に詰めれば followers
 	// visibility note を読めてしまう (#1442)。#1452 で visibility を
@@ -349,6 +374,15 @@ func (h *Handler) UserListTimeline(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
+	// **ブロック済みインスタンスのノートを落とす** (upstream
+	// generateBlockedHostQueryForNote)。list のメンバーは自由に編集できるので、
+	// ブロック後もリストに残っている相手のノートがここから出続けていた。
+	// SQL push-down 側には入っていないので post-fetch で落とす。
+	blocked, err := notesfilter.LoadBlockedHosts(h.metaRepo)
+	if err != nil {
+		return apierr.JSONInternalError(c)
+	}
+	notes = notesfilter.ApplyBlockedHosts(notes, blocked)
 	return c.JSON(http.StatusOK, h.packMany(c.Request().Context(), notes, me))
 }
 
@@ -399,7 +433,10 @@ func (h *Handler) SearchByTag(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1166)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	// tagsカラムにtagを含むノートを検索。visibility は repository 側で
 	// push-down する (#1439)。discovery 系の tag 検索は notes/show の
 	// 「ID 既知公開」doctrine 対象外なので、匿名/非follower には followers/
@@ -456,6 +493,10 @@ func (h *Handler) Clips(c echo.Context) error {
 	}
 	// note 存在確認 (upstream getterService.getNote)。可視性は問わず存在のみ。
 	if _, err := h.noteRepo.FindByID(req.NoteID); err != nil {
+		if !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return apierr.JSONInternalError(c)
+		}
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "47db1a1c-b0af-458d-8fb4-986e4efafe1e"))
 	}
 	clipIDs, err := h.clipNoteRepo.ListClipIDsByNote(req.NoteID)
@@ -527,6 +568,10 @@ func (h *Handler) Translate(c echo.Context) error {
 	// note/text check より前に置くと、null-text note が upstream の 204 ではなく
 	// UNAVAILABLE を返してしまうため後ろに移動する。
 	n, err := h.noteRepo.FindByID(req.NoteID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return apierr.JSONInternalError(c)
+	}
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "bea9b03f-36e0-49c5-a4db-627a029f8971"))
 	}
@@ -542,10 +587,23 @@ func (h *Handler) Translate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("CANNOT_TRANSLATE_INVISIBLE_NOTE", "Cannot translate invisible note.", "ea29f2ca-c368-43b3-aaf1-5ac3e74bbe5d"))
 	}
 
-	// upstream translate.ts:86-88: note.text == null は return; (res optional → 204
-	// No Content)。空文字は upstream が DeepL へ POST するので素通しする。mk-go の
-	// 旧 CANNOT_TRANSLATE は upstream に無い独自 error だったので廃止 (#1948-17)。
-	if n.Text == nil {
+	// upstream translate.ts: CW があれば `<cw>\n-----\n<text>` を翻訳対象にする
+	// (upstream ab26d2b7b2)。text が無くても CW だけあれば翻訳する。
+	text := ""
+	if n.Text != nil {
+		text = *n.Text
+	}
+	if n.CW != nil {
+		text = *n.CW + "\n-----\n" + text
+	}
+
+	// upstream は 2026.9.0 で判定を `note.text == null` から `text.trim() === ''`
+	// に変えた。空白のみ / 空文字は DeepL へ投げずに 204 (res optional → No Content)。
+	// **空白の集合は完全一致ではない** — JS の trim は U+FEFF を落とすが Go の
+	// unicode.IsSpace は落とさず、逆に Go は U+0085 を落とすが JS は落とさない。
+	// それだけで構成された本文でのみ分岐する。
+	// mk-go の旧 CANNOT_TRANSLATE は upstream に無い独自 error なので廃止済み (#1948-17)。
+	if strings.TrimSpace(text) == "" {
 		return c.NoContent(http.StatusNoContent)
 	}
 
@@ -554,7 +612,7 @@ func (h *Handler) Translate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("UNAVAILABLE", "Translate of notes unavailable.", "50a70314-2d8a-431b-b433-efa5cc56444c"))
 	}
 
-	result, err := h.translator.Translate(c.Request().Context(), *n.Text, req.TargetLang)
+	result, err := h.translator.Translate(c.Request().Context(), text, req.TargetLang)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Translation failed.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
@@ -622,6 +680,13 @@ func (h *Handler) SetNoteMaterializer(m NoteMaterializer) {
 // failed. 通常のノートでは Redis を一切引かない。
 func (h *Handler) materializeIfMissing(noteID string, lookupErr error) bool {
 	if lookupErr == nil || h.materializer == nil {
+		return false
+	}
+	// **DB 障害では materialize しない** (#2799)。`RequireVisible` は not-found と
+	// 非可視を `ErrNoteNotFound` に集約し、接続断だけ raw error を返す。種別を
+	// 見ずに走らせると、DB 断のあいだ 1 リクエストごとに outbound の
+	// remote-note fetch が 1 発出る。
+	if !errors.Is(lookupErr, corenote.ErrNoteNotFound) {
 		return false
 	}
 	_, err := h.materializer.EnsureNote(context.Background(), noteID)

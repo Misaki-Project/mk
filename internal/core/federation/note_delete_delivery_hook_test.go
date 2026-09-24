@@ -19,16 +19,33 @@ func newDeleteHook(t *testing.T) (
 	*testutil.MockFollowingRepository,
 	*testutil.MockUserKeypairRepository,
 ) {
+	hook, enq, userRepo, followingRepo, keypairRepo, _ := newDeleteHookWithNotes(t)
+	return hook, enq, userRepo, followingRepo, keypairRepo
+}
+
+// newDeleteHookWithNotes also wires a note repository as the renderer's
+// NoteResolver so tests can control the URI of a boosted note (pure renote の
+// Undo(Announce) はブースト元の URI を object に置く)。
+func newDeleteHookWithNotes(t *testing.T) (
+	*federation.NoteDeleteDeliveryHook,
+	*stubEnqueuer,
+	*testutil.MockUserRepository,
+	*testutil.MockFollowingRepository,
+	*testutil.MockUserKeypairRepository,
+	*testutil.MockNoteRepository,
+) {
 	t.Helper()
 	enq := &stubEnqueuer{}
 	userRepo := testutil.NewMockUserRepository()
 	followingRepo := testutil.NewMockFollowingRepository()
 	keypairRepo := testutil.NewMockUserKeypairRepository()
+	noteRepo := testutil.NewMockNoteRepository()
 	urls := activitypub.NewURLBuilder("https://example.com")
 	deliver := federation.NewDeliverService(enq, userRepo, followingRepo, keypairRepo, urls)
 	renderer := activitypub.NewRenderer(urls)
+	renderer.SetNoteResolver(noteRepo)
 	hook := federation.NewNoteDeleteDeliveryHook(deliver, renderer, urls)
-	return hook, enq, userRepo, followingRepo, keypairRepo
+	return hook, enq, userRepo, followingRepo, keypairRepo, noteRepo
 }
 
 func TestNoteDeleteHook_LocalAuthor(t *testing.T) {
@@ -299,4 +316,348 @@ func TestNoteDeleteHook_EmptyBroadcastListStillDeliversToFollowers(t *testing.T)
 
 	require.Len(t, enq.calls, 1)
 	assert.Equal(t, "https://remote.example/inbox", enq.calls[0].Inbox)
+}
+
+// seedDeleteSigner registers a local author with a keypair so DeliverService can
+// sign, plus a remote follower inbox.
+func seedDeleteSigner(t *testing.T, userRepo *testutil.MockUserRepository, keypairRepo *testutil.MockUserKeypairRepository) *model.User {
+	t.Helper()
+	author := &model.User{ID: "alice", Username: "alice"}
+	userRepo.Users["alice"] = author
+	keypairRepo.Keypairs["alice"] = &model.UserKeypair{UserID: "alice", PrivateKey: "PEM"}
+	return author
+}
+
+func seedRemoteRecipient(userRepo *testutil.MockUserRepository, id, host, inbox string) {
+	h := host
+	in := inbox
+	userRepo.Users[id] = &model.User{ID: id, Username: id, Host: &h, Inbox: &in}
+}
+
+// 純粋リノート (ブースト) の取り消しは Delete(Tombstone) では連合しない。受信側は
+// Announce を `uri = <noteURI>/activity` で保存するのに対し Tombstone の id は
+// `/activity` の付かない note URI なので一致しない。upstream と同じく
+// Undo(Announce) を出す。
+func TestNoteDeleteHook_PureRenoteSendsUndoAnnounce(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes["alice"] = []string{"https://r.example/inbox"}
+	targetURI := "https://remote.example/notes/orig"
+	noteRepo.Notes["orig"] = &model.Note{ID: "orig", UserID: "bob", URI: &targetURI}
+
+	renoteID := "orig"
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice", RenoteID: &renoteID,
+		Visibility: model.NoteVisibilityPublic,
+	})
+
+	require.Len(t, enq.calls, 1)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(enq.calls[0].Body, &got))
+	assert.Equal(t, "Undo", got["type"], "pure renote の削除は Undo(Announce)")
+	inner, ok := got["object"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "Announce", inner["type"])
+	assert.Equal(t, "https://example.com/notes/n1/activity", inner["id"],
+		"Announce id は受信側が renote の uri として保存した値と一致させる")
+	assert.Equal(t, targetURI, inner["object"], "object はブースト元の URI")
+}
+
+// text 付き renote (引用) は pure renote ではないので従来どおり Delete。
+func TestNoteDeleteHook_QuoteRenoteStillSendsDelete(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes["alice"] = []string{"https://r.example/inbox"}
+	targetURI := "https://remote.example/notes/orig"
+	noteRepo.Notes["orig"] = &model.Note{ID: "orig", UserID: "bob", URI: &targetURI}
+
+	renoteID := "orig"
+	text := "quoting"
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice", RenoteID: &renoteID, Text: &text,
+		Visibility: model.NoteVisibilityPublic,
+	})
+
+	require.Len(t, enq.calls, 1)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(enq.calls[0].Body, &got))
+	assert.Equal(t, "Delete", got["type"])
+}
+
+// specified な pure renote は Announce 自体を連合していない (#1886) ので、
+// 取り消す対象も無い。
+func TestNoteDeleteHook_PureRenoteSpecifiedNotDelivered(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	// **userRepo を配線してから見る。** 配線しないと directInboxes が常に空を
+	// 返すので、skip を外しても配送が起きず検査が空振りする。
+	hook.SetUserRepo(userRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes["alice"] = []string{"https://r.example/inbox"}
+	noteRepo.Notes["orig"] = &model.Note{ID: "orig", UserID: "bob"}
+	seedRemoteRecipient(userRepo, "dmpeer", "dmpeer.example", "https://dmpeer.example/inbox")
+
+	renoteID := "orig"
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice", RenoteID: &renoteID,
+		Visibility:     model.NoteVisibilitySpecified,
+		VisibleUserIDs: model.StringArray{"dmpeer"},
+	})
+	assert.Empty(t, enq.calls)
+}
+
+// DM の Delete は宛先へ届かなければ意味が無い。宛先はフォロワーとは限らない。
+func TestNoteDeleteHook_SpecifiedReachesRecipientsNotFollowers(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo := newDeleteHook(t)
+	hook.SetUserRepo(userRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followerInbox := "https://follower.example/inbox"
+	followingRepo.RemoteInboxes["alice"] = []string{followerInbox}
+	dmInbox := "https://dmpeer.example/users/bob/inbox"
+	seedRemoteRecipient(userRepo, "dmpeer", "dmpeer.example", dmInbox)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility:     model.NoteVisibilitySpecified,
+		VisibleUserIDs: model.StringArray{"dmpeer"},
+	})
+
+	require.Len(t, enq.calls, 1, "宛先のみ (フォロワーには送らない)")
+	assert.Equal(t, dmInbox, enq.calls[0].Inbox)
+}
+
+// followers 可視性でメンションされたリモート user は Create を直接受け取って
+// いる (note_delivery_hook の deliverToDirectRecipients) ので、Delete も直接
+// 届けないと相手側に残り続ける。
+func TestNoteDeleteHook_FollowersVisibilityReachesMentionedNonFollower(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo := newDeleteHook(t)
+	hook.SetUserRepo(userRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followerInbox := "https://follower.example/inbox"
+	followingRepo.RemoteInboxes["alice"] = []string{followerInbox}
+	mentionInbox := "https://mentioned.example/users/carol/inbox"
+	seedRemoteRecipient(userRepo, "carol", "mentioned.example", mentionInbox)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility: model.NoteVisibilityFollowers,
+		Mentions:   model.StringArray{"carol"},
+	})
+
+	inboxes := map[string]int{}
+	for _, c := range enq.calls {
+		inboxes[c.Inbox]++
+	}
+	assert.Equal(t, 1, inboxes[mentionInbox], "メンション先にも届く")
+	assert.Equal(t, 1, inboxes[followerInbox], "フォロワーにも届く")
+	assert.Len(t, enq.calls, 2)
+}
+
+// direct とフォロワーで同じ inbox を共有していても 2 回送らない。
+func TestNoteDeleteHook_DirectAndFollowerInboxNotDuplicated(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo := newDeleteHook(t)
+	hook.SetUserRepo(userRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	shared := "https://mentioned.example/inbox"
+	followingRepo.RemoteInboxes["alice"] = []string{shared}
+	seedRemoteRecipient(userRepo, "carol", "mentioned.example", shared)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility: model.NoteVisibilityFollowers,
+		Mentions:   model.StringArray{"carol"},
+	})
+	require.Len(t, enq.calls, 1)
+	assert.Equal(t, shared, enq.calls[0].Inbox)
+}
+
+// ローカルユーザー宛の DM は連合配送が要らない (宛先が全員ローカルなら 0 件)。
+func TestNoteDeleteHook_SpecifiedLocalRecipientsOnly(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo := newDeleteHook(t)
+	hook.SetUserRepo(userRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes["alice"] = []string{"https://follower.example/inbox"}
+	// inbox 列を持たせても送らない (local user は Host == nil で判定する)。
+	localInbox := "https://example.com/users/localpeer/inbox"
+	userRepo.Users["localpeer"] = &model.User{ID: "localpeer", Username: "localpeer", Inbox: &localInbox}
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility:     model.NoteVisibilitySpecified,
+		VisibleUserIDs: model.StringArray{"localpeer"},
+	})
+	assert.Empty(t, enq.calls)
+}
+
+// --- #2995: renote / reply したリモート user へも届ける ---
+
+// seedRenoterNote records a remote note that renotes or replies to targetID so
+// the hook's note repository lookup finds its author.
+func seedRenoterNote(noteRepo *testutil.MockNoteRepository, id, userID, host, targetID string, isReply bool) {
+	t := targetID
+	n := &model.Note{ID: id, UserID: userID, UserHost: &host}
+	if isReply {
+		n.ReplyID = &t
+	} else {
+		n.RenoteID = &t
+	}
+	noteRepo.Notes[id] = n
+}
+
+// **この issue (#2995) の中核。** フォローしていないリモート user が renote した
+// followers 限定ノートを消すと、フォロワー配送では相手に届かず、削除したはずの
+// ノートが相手のサーバーに残り続ける。
+func TestNoteDeleteHook_FollowersVisibilityReachesRenoterNonFollower(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	hook.SetUserRepo(userRepo)
+	hook.SetNoteRepo(noteRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followerInbox := "https://follower.example/inbox"
+	followingRepo.RemoteInboxes["alice"] = []string{followerInbox}
+	renoterInbox := "https://renoter.example/users/dave/inbox"
+	seedRemoteRecipient(userRepo, "dave", "renoter.example", renoterInbox)
+	seedRenoterNote(noteRepo, "rn1", "dave", "renoter.example", "n1", false)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility: model.NoteVisibilityFollowers,
+	})
+
+	inboxes := map[string]int{}
+	for _, c := range enq.calls {
+		inboxes[c.Inbox]++
+	}
+	assert.Equal(t, 1, inboxes[renoterInbox], "renote した非フォロワーに届かない")
+	assert.Equal(t, 1, inboxes[followerInbox], "フォロワーにも届く")
+	assert.Len(t, enq.calls, 2)
+}
+
+// **DM では renote / reply した相手を宛先にしない。** inbound の reply は
+// 可視性を見ずに `replyId` を結ぶので、敵対的な host が任意のローカル note id を
+// `replyId` に書いた note を投げておくだけで、「その DM が存在し、いつ誰に
+// 消されたか」を Delete の配送で確かめられてしまう。正当な返信者は元から
+// `visibleUserIDs` に居るので、届く相手は減らない。
+func TestNoteDeleteHook_SpecifiedDoesNotReachNonRecipientReplier(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	hook.SetUserRepo(userRepo)
+	hook.SetNoteRepo(noteRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes["alice"] = []string{"https://follower.example/inbox"}
+	// 宛先ではないのに reply 行だけを持っている相手。
+	seedRemoteRecipient(userRepo, "mallory", "evil.example", "https://evil.example/users/mallory/inbox")
+	seedRenoterNote(noteRepo, "rp1", "mallory", "evil.example", "n1", true)
+	// 宛先の相手にはもちろん届く。
+	recipientInbox := "https://recipient.example/users/erin/inbox"
+	seedRemoteRecipient(userRepo, "erin", "recipient.example", recipientInbox)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility:     model.NoteVisibilitySpecified,
+		VisibleUserIDs: model.StringArray{"erin"},
+	})
+
+	require.Len(t, enq.calls, 1, "宛先でない相手に DM の Delete を配っている")
+	assert.Equal(t, recipientInbox, enq.calls[0].Inbox)
+}
+
+// フォロワーかつ renote 者でも 1 回だけ。**renote だけの相手には別途届く**ので、
+// この 2 つを同じテストで見る (片方だけだと「機能を丸ごと消しても緑」になる)。
+func TestNoteDeleteHook_RenoterWhoIsAlsoFollowerNotDuplicated(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	hook.SetUserRepo(userRepo)
+	hook.SetNoteRepo(noteRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	shared := "https://renoter.example/inbox"
+	followingRepo.RemoteInboxes["alice"] = []string{shared}
+	// フォロワーでもある renote 者 (inbox はフォロワー配送と同じ)。
+	seedRemoteRecipient(userRepo, "dave", "renoter.example", shared)
+	seedRenoterNote(noteRepo, "rn1", "dave", "renoter.example", "n1", false)
+	// フォローしていない renote 者 (この分は renote 経路でしか届かない)。
+	onlyRenoter := "https://other.example/users/frank/inbox"
+	seedRemoteRecipient(userRepo, "frank", "other.example", onlyRenoter)
+	seedRenoterNote(noteRepo, "rn2", "frank", "other.example", "n1", false)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility: model.NoteVisibilityFollowers,
+	})
+
+	inboxes := map[string]int{}
+	for _, c := range enq.calls {
+		inboxes[c.Inbox]++
+	}
+	assert.Equal(t, 1, inboxes[shared], "フォロワーかつ renote 者へ 2 回送っている")
+	assert.Equal(t, 1, inboxes[onlyRenoter], "renote しかしていない相手に届かない")
+	assert.Len(t, enq.calls, 2)
+}
+
+// **引けなくても他の宛先は配る。** ここで諦めると、元から届いていたメンション先への
+// Delete まで道連れになる。
+func TestNoteDeleteHook_RenoteLookupFailureStillDeliversMentions(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	hook.SetUserRepo(userRepo)
+	hook.SetNoteRepo(noteRepo)
+	noteRepo.ListRenoteOrReplyErr = assert.AnError
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes["alice"] = []string{}
+	mentionInbox := "https://mentioned.example/users/carol/inbox"
+	seedRemoteRecipient(userRepo, "carol", "mentioned.example", mentionInbox)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility: model.NoteVisibilitySpecified,
+		Mentions:   model.StringArray{"carol"},
+	})
+	require.Len(t, enq.calls, 1)
+	assert.Equal(t, mentionInbox, enq.calls[0].Inbox)
+}
+
+// note repository 未配線では従来どおり (メンション先と DM 宛先だけ)。
+func TestNoteDeleteHook_WithoutNoteRepoSkipsRenoters(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo, noteRepo := newDeleteHookWithNotes(t)
+	hook.SetUserRepo(userRepo)
+	assert.False(t, hook.HasNoteRepo())
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+	followingRepo.RemoteInboxes["alice"] = []string{}
+	seedRemoteRecipient(userRepo, "dave", "renoter.example", "https://renoter.example/users/dave/inbox")
+	seedRenoterNote(noteRepo, "rn1", "dave", "renoter.example", "n1", false)
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility: model.NoteVisibilityFollowers,
+	})
+	assert.Empty(t, enq.calls)
+}
+
+// **sharedInbox を持つフォロワーでも 1 通であること (敵対的レビュー)。**
+//
+// `seedRemoteRecipient` は `SharedInbox` を設定しないので、既存の dedup テストは
+// 「direct と follower が同じ URL」という現実には起きにくい形しか見ていなかった。
+// **実際の `ListRemoteFollowerInboxes` は `COALESCE(NULLIF(sharedInbox,”), inbox)`
+// を返す**ので、direct 側が個別 inbox を使うと URL が食い違い、exclude が
+// 効かずに 2 通届く。
+func TestNoteDeleteHook_SharedInboxFollower_Deduped(t *testing.T) {
+	hook, enq, userRepo, followingRepo, keypairRepo := newDeleteHook(t)
+	hook.SetUserRepo(userRepo)
+	author := seedDeleteSigner(t, userRepo, keypairRepo)
+
+	const shared = "https://mentioned.example/inbox"
+	// carol はメンション先かつフォロワー。個別 inbox と sharedInbox の両方を持つ
+	// (リモートの通常の形)。
+	h := "mentioned.example"
+	in := "https://mentioned.example/users/carol/inbox"
+	s := shared
+	userRepo.Users["carol"] = &model.User{
+		ID: "carol", Username: "carol", Host: &h, Inbox: &in, SharedInbox: &s,
+	}
+	// フォロワー側は sharedInbox を返す (repository の COALESCE と同じ)。
+	followingRepo.RemoteInboxes["alice"] = []string{shared}
+
+	hook.OnNoteDeleted(author, &model.Note{
+		ID: "n1", UserID: "alice",
+		Visibility: model.NoteVisibilityFollowers,
+		Mentions:   model.StringArray{"carol"},
+	})
+	require.Len(t, enq.calls, 1,
+		"sharedInbox を持つフォロワー宛に同じ Delete が 2 通出ている (exclude が効いていない)")
+	assert.Equal(t, shared, enq.calls[0].Inbox)
 }

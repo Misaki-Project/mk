@@ -177,3 +177,64 @@ func TestApplicationRegister_PoliciesAreEffective(t *testing.T) {
 	assert.EqualValues(t, 99, policies["pinLimit"],
 		"register 経路が user ID を渡していない (条件ロールが効いていない)")
 }
+
+// 即時作成では `registration_ticket` を 1 行も作らない (#2813)。
+//
+// **発行しても誰も参照しない。** 一回性は settleApplicationTx の行ロックが担保して
+// おり (#2580)、ticket は `signup_application.ticketId` に記録されるだけだった。
+// 残すと承認のたびに 1 行増え、`createdById` を入れない (#2805) ので管理画面には
+// `system` として出る。
+//
+// **実 repo で確かめる。** 手書きの fake だと「行が増えない」ことしか見えず、
+// handler が repo を経由しなくなった場合との区別が付かない。
+func TestApplicationRegister_ImmediateCreatesNoTicket(t *testing.T) {
+	h, db, app := newApprovalHandlerWithDB(t)
+	h.SetTicketStore(repository.NewRegistrationTicketRepository(db))
+
+	const moderator = "itapi_mod1"
+	// 前回が異常終了して行が残っていても落ちないように、作る前にも消す。
+	db.Exec(`DELETE FROM "user" WHERE id = ?`, moderator)
+	require.NoError(t, db.Create(&model.User{
+		ID: moderator, Username: "itapimod1", UsernameLower: "itapimod1",
+		AvatarDecorations: []byte("[]"),
+	}).Error)
+	require.NoError(t, db.Model(&model.SignupApplication{}).
+		Where("id = ?", app.ID).Update("processedById", moderator).Error)
+
+	// 回帰したとき (と変異検証のとき) に孤児 ticket を残さない。**base の cleanup は
+	// user を消すだけ**で、`usedById` が NULL の行はどの CASCADE にも掛からず、
+	// 次の実行の基準値に混ざって居座る。
+	var preexisting []string
+	require.NoError(t, db.Model(&model.RegistrationTicket{}).Pluck("id", &preexisting).Error)
+	t.Cleanup(func() {
+		if len(preexisting) == 0 {
+			db.Exec(`DELETE FROM "registration_ticket"`)
+			return
+		}
+		db.Exec(`DELETE FROM "registration_ticket" WHERE id NOT IN ?`, preexisting)
+	})
+
+	before := int64(len(preexisting))
+
+	rec := doPost(h.ApplicationRegister,
+		`{"claimCode":"itapi-code","username":"itapiq1","password":"hunter22"}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var after int64
+	require.NoError(t, db.Model(&model.RegistrationTicket{}).Count(&after).Error)
+	assert.Equal(t, before, after, "即時作成では ticket を 1 行も作らない")
+
+	// **監査は申請だけで辿れる。** この表には FK が 1 つも無いので、user を消しても
+	// 審査した管理者と登録者は残る (ticket 行は CASCADE で消える、#2805)。
+	var stored model.SignupApplication
+	require.NoError(t, db.Where("id = ?", app.ID).First(&stored).Error)
+	assert.Equal(t, model.SignupApplicationCompleted, stored.Status)
+	require.NotNil(t, stored.ProcessedByID)
+	assert.Equal(t, moderator, *stored.ProcessedByID, "審査した管理者は申請から辿る")
+	require.NotNil(t, stored.UsedByID)
+	assert.Nil(t, stored.TicketID, "ticketId は記録しない")
+
+	var user model.User
+	require.NoError(t, db.Where(`"usernameLower" = ?`, "itapiq1").First(&user).Error)
+	assert.Equal(t, user.ID, *stored.UsedByID, "登録者は申請から辿る")
+}

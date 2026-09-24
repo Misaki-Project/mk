@@ -302,6 +302,10 @@ func (s *Service) StartChunkedUpload(_ context.Context, in StartChunkedUploadInp
 	if in.FolderID != nil {
 		folder, err := s.folderRepo.FindByID(*in.FolderID)
 		if err != nil {
+			// **DB 障害を not-found に丸めない** (#2799)。
+			if !repository.IsNotFound(err) {
+				return nil, err
+			}
 			return nil, ErrFolderNotFound
 		}
 		if folder.UserID == nil || *folder.UserID != in.User.ID {
@@ -353,6 +357,45 @@ type ChunkAppendResult struct {
 	ReceivedBytes int64 `json:"receivedBytes"`
 	TotalSize     int64 `json:"totalSize"`
 	Completed     bool  `json:"completed"`
+}
+
+// SessionChunkSize reports the chunk size a session accepts, so the handler can
+// stop copying past it.
+//
+// **`io.ReadAll` のコピーを 1 つ減らすためのもの (#3037)。** `AppendChunk` は
+// `size > sess.ChunkSize` を拒否するが、そこへ届く時点でチャンクは全部
+// 読み終わっている。`drive/files/create` を同じ理由で直したのに、こちらだけ
+// 残っていた。
+//
+// **「読み切る前に落とす」ではない (レビュー 2 周目の実測)。** handler は
+// これを呼ぶ前に `c.FormValue("uploadId")` を読み、echo の `FormValue` は
+// `http.Request.ParseMultipartForm(32MiB)` を通す。つまり**この関数へ来る
+// 時点で body はワイヤから全部読み出され、パーサのメモリに載っている**
+// (実測: 5,243,351 バイトの body に対し `FormValue` の直後で
+// 5,243,351 バイトが読み出し済み)。`ReadForm` の閾値は 32MiB + 10MiB で
+// この route の body limit は 33MiB なので、チャンクは常にメモリに残る。
+// 消せているのは `io.ReadAll` による**2 つ目のコピー**だけで、ピークは
+// 66MiB から 33MiB に半減するにとどまる。**本当に塞ぐには
+// `c.Request().MultipartReader()` でストリーム処理するか、body limit を
+// セッション単位にする必要がある。**
+//
+// (`drive/files/create` 側は 250MB のような大きい本体がパーサで**ディスクへ
+// spill** されるので、そちらの guard は最大 250MB のヒープ確保を実際に消す。)
+//
+// ok=false は「上限を決められない」(セッションが無い / 他人のもの / 期限切れ)。
+// **その場合は上限を掛けない** — 本物の判定は `AppendChunk` が行い、そちらが
+// 正しいエラーを返す。ここで独自に落とすと、応答の種類が経路で食い違う。
+// 存在しない `uploadId` を送ればこの枝に入れるが、body limit が 33MiB なので
+// 最悪値は変わらない (`AppendChunk` がその後 404 を返す)。
+func (s *Service) SessionChunkSize(user *model.User, sessionID string) (int64, bool) {
+	if s.chunkedRepo == nil {
+		return 0, false
+	}
+	sess, err := s.loadOwnedSession(user, sessionID, time.Now())
+	if err != nil || sess == nil || sess.ChunkSize <= 0 {
+		return 0, false
+	}
+	return sess.ChunkSize, true
 }
 
 // AppendChunk stores one chunk as a part of the session's multipart upload.
@@ -722,10 +765,11 @@ func (s *Service) loadOwnedSession(user *model.User, sessionID string, now time.
 	}
 	sess, err := s.chunkedRepo.FindByID(sessionID)
 	if err != nil {
-		if repository.IsChunkedUploadSessionNotFound(err) {
-			return nil, ErrUploadSessionNotFound
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
 		}
-		return nil, err
+		return nil, ErrUploadSessionNotFound
 	}
 	if sess.UserID != user.ID {
 		return nil, ErrUploadSessionNotFound

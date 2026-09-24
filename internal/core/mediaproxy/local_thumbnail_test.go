@@ -52,7 +52,7 @@ func TestResolveLocal_SwapsToThumbnail(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{primary: "primary-key", thumbKey: "thumb-key"})
 
-	res, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP)
+	res, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP, true)
 	require.NoError(t, err)
 	defer res.Body.Close()
 
@@ -71,7 +71,7 @@ func TestResolveLocal_FallsBackWhenLookupMisses(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{notFoundOn: "primary-key"})
 
-	res, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP)
+	res, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP, true)
 	require.NoError(t, err)
 	defer res.Body.Close()
 
@@ -90,7 +90,7 @@ func TestResolveLocal_StaticPrefersWebpublic(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{primary: "primary-key", thumbKey: "thumb-key", webpubKey: "webpub-key"})
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModeStatic, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModeStatic, FormatWebP, false)
 	require.NoError(t, err)
 	assert.Contains(t, store.reads, "webpub-key")
 }
@@ -108,7 +108,7 @@ func TestResolveLocal_StaticDoesNotSwapToThumbnail(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{primary: "primary-key", thumbKey: "thumb-key"})
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModeStatic, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModeStatic, FormatWebP, false)
 	require.NoError(t, err)
 	assert.Contains(t, store.reads, "primary-key", "Static must serve primary when only thumbnail variant exists")
 	assert.NotContains(t, store.reads, "thumb-key")
@@ -125,7 +125,7 @@ func TestResolveLocal_RequestingVariantKeyDirectly(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{primary: "primary-key", thumbKey: "thumb-key"})
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/thumb-key", ModePreview, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/thumb-key", ModePreview, FormatWebP, true)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"thumb-key"}, store.reads)
 }
@@ -141,7 +141,7 @@ func TestResolveLocal_PreviewWithOnlyWebpublic(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{primary: "primary-key", webpubKey: "webpub-key"})
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP, true)
 	require.NoError(t, err)
 	assert.Contains(t, store.reads, "webpub-key")
 }
@@ -157,7 +157,7 @@ func TestResolveLocal_DefaultModeNoSwap(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{primary: "primary-key", thumbKey: "thumb-key"})
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	assert.Contains(t, store.reads, "primary-key")
 	assert.NotContains(t, store.reads, "thumb-key")
@@ -176,7 +176,7 @@ func TestResolveLocal_VariantMissingFallsBackToPrimary(t *testing.T) {
 	s.SetDriveStorage(store)
 	s.SetDriveLookup(stubLookup{primary: "primary-key", thumbKey: "thumb-key"})
 
-	res, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP)
+	res, err := s.Fetch(context.Background(), "https://example.com/files/primary-key", ModePreview, FormatWebP, true)
 	require.NoError(t, err, "must not 404 when only the variant is missing")
 	defer res.Body.Close()
 	// thumb-key tried first, then primary-key as fallback.
@@ -187,6 +187,9 @@ func TestResolveLocal_VariantMissingFallsBackToPrimary(t *testing.T) {
 type stubDriveStorage struct {
 	objects map[string][]byte
 	reads   []string
+	// getErr replaces the not-found sentinel, standing in for a broken
+	// backend (expired credentials / provider 5xx / wrong endpoint).
+	getErr error
 }
 
 func newStubDriveStorage() *stubDriveStorage {
@@ -197,6 +200,9 @@ func (s *stubDriveStorage) put(key string, body []byte) { s.objects[key] = body 
 
 func (s *stubDriveStorage) Get(key string) (io.ReadCloser, error) {
 	s.reads = append(s.reads, key)
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
 	body, ok := s.objects[key]
 	if !ok {
 		// Match the production sentinel so resolveLocal's variant→primary
@@ -224,7 +230,7 @@ func TestResolveLocal_FallsBackToLocalStorage(t *testing.T) {
 	s.SetDriveStorage(primary)
 	s.SetLocalStorage(local)
 
-	res, err := s.Fetch(context.Background(), "https://example.com/files/legacy-key", ModeDefault, FormatWebP)
+	res, err := s.Fetch(context.Background(), "https://example.com/files/legacy-key", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer res.Body.Close()
 
@@ -242,7 +248,7 @@ func TestResolveLocal_NoFallbackWhenPrimaryHasIt(t *testing.T) {
 	s.SetDriveStorage(primary)
 	s.SetLocalStorage(local)
 
-	res, err := s.Fetch(context.Background(), "https://example.com/files/k", ModeDefault, FormatWebP)
+	res, err := s.Fetch(context.Background(), "https://example.com/files/k", ModeDefault, FormatWebP, true)
 	require.NoError(t, err)
 	defer res.Body.Close()
 	assert.Empty(t, local.reads)
@@ -258,7 +264,7 @@ func TestResolveLocal_NoFallbackWhenPrimaryIsLocal(t *testing.T) {
 	s.SetDriveStorage(primary)
 	s.SetLocalStorage(local)
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/missing", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/missing", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrNotFound)
 	assert.Empty(t, local.reads, "primary がローカルなら二度見しない")
 }
@@ -272,6 +278,44 @@ func TestResolveLocal_FallbackMissStillNotFound(t *testing.T) {
 	s.SetDriveStorage(primary)
 	s.SetLocalStorage(local)
 
-	_, err := s.Fetch(context.Background(), "https://example.com/files/nope", ModeDefault, FormatWebP)
+	_, err := s.Fetch(context.Background(), "https://example.com/files/nope", ModeDefault, FormatWebP, true)
 	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// **object storage が壊れているときこそローカルへ倒す (#2990)。** ここに来る行の
+// 実体は object storage に置かれていないので、あちらの失敗が not-found か障害かは
+// 判断の材料にならない。`S3Storage.Get` が全エラーを not-found に潰していた頃は
+// どちらでも倒れていたが、種別を分けた結果**鍵の期限切れや 503 でローカルを見に
+// 行かなくなり、移行前の画像が全部 500 になる**回帰が生まれた。
+func TestResolveLocal_FallsBackToLocalOnBackendFailure(t *testing.T) {
+	primary := newStubDriveStorage()
+	primary.getErr = errors.New("ExpiredToken: the security token expired")
+	local := newStubDriveStorage()
+	local.put("legacy-key", makePNG())
+
+	s := testService(map[string]bool{"https://example.com/files/legacy-key": true})
+	s.SetDriveStorage(primary)
+	s.SetLocalStorage(local)
+
+	res, err := s.Fetch(context.Background(), "https://example.com/files/legacy-key", ModeDefault, FormatWebP, true)
+	require.NoError(t, err, "object storage の障害でローカルの実体を見に行かなくなっている")
+	defer res.Body.Close()
+	assert.Contains(t, local.reads, "legacy-key")
+}
+
+// ローカルにも無ければ、not-found ではなく元の障害をそのまま伝える (#2792)。
+func TestResolveLocal_BackendFailureIsNotNotFound(t *testing.T) {
+	boom := errors.New("ExpiredToken: the security token expired")
+	primary := newStubDriveStorage()
+	primary.getErr = boom
+	local := newStubDriveStorage()
+
+	s := testService(map[string]bool{"https://example.com/files/gone": true})
+	s.SetDriveStorage(primary)
+	s.SetLocalStorage(local)
+
+	_, err := s.Fetch(context.Background(), "https://example.com/files/gone", ModeDefault, FormatWebP, true)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNotFound, "ストレージ障害を 404 に潰している")
+	assert.ErrorIs(t, err, boom)
 }

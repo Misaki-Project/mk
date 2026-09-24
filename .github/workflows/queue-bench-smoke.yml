@@ -1,6 +1,6 @@
 name: Queue-bench smoke (nightly)
 
-# Issue #1163 で queue-bench の orchestration 非決定性 (3 stack 並列起動で
+# Issue #1163 で queue-bench の orchestration 非決定性 (複数 stack の並列起動で
 # random に 1 stack が ok=0 になる) を `--force-recreate` で解消した。同種の
 # regression が再発した場合に nightly で検知するための smoke workflow。
 #
@@ -11,14 +11,14 @@ name: Queue-bench smoke (nightly)
 #   で観測された後者の manifestation もカバー)。実際の load 計測は
 #   手動 / 別タスクで継続。
 # - inbound 結果 (`tests/queue-bench/results/inbound.json`) を assert step
-#   でパースして「全 3 stack が ok==sent」を verify。partial ok=0 だと
+#   でパースして「全 stack が ok==sent」を verify。partial ok=0 だと
 #   driver_inbound 自体は exit 0 で抜けるので、assertion なしでは regression
 #   を検知できない。
 # - schedule: 毎日 1 回 (UTC 17:30 ≒ JST 02:30)。dropin-e2e (18:00) と
 #   playwright (17:00) の間にずらして runner 競合を避ける。
 # - workflow_dispatch: 任意の ref で手動発火可。
 # - PR の required check には**入れない**。8-10 min かかる上に
-#   docker-in-docker / 3 stack 並列という flaky 要素を含むため merge ブロッカー
+#   docker-in-docker / 複数 stack 並列という flaky 要素を含むため merge ブロッカー
 #   に向かない。failure は Actions 上で確認、別 PR で対処する運用
 #   (dropin-e2e / playwright と同じ方針)。
 
@@ -28,11 +28,13 @@ on:
     # 30 分ずらして runner queue 競合を避ける。
     - cron: "30 17 * * *"
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "Branch / tag / SHA to test"
-        required: false
-        default: "develop"
+    # **checkout する ref を input で受け取らない。** キャッシュの scope は
+    # `github.ref` (schedule なら develop) で決まるので、input で別 ref を
+    # checkout するとそのコードが develop のキャッシュを書き換えられる
+    # (CodeQL actions/cache-poisoning)。`misskey-workspace-*` のキーは
+    # playwright / dropin-e2e / diff-e2e と共有で、それらの PR run が develop の
+    # キャッシュを読む。別の ref で回すときは「Use workflow from」
+    # (`gh workflow run <file> -r <branch>`) で選ぶ。scope もそのブランチになる。
 
 permissions:
   contents: read
@@ -46,10 +48,8 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
-          # schedule 起動時 inputs は空 → develop fallback。
-          ref: ${{ inputs.ref || 'develop' }}
           # tests/federation/common/Dockerfile.mkgo が
           # third_party/misskey/built/ + node_modules/ を COPY するので
           # submodule を先に展開しないと docker build が "failed to compute
@@ -59,28 +59,52 @@ jobs:
       # Misskey TS の pnpm install + frontend build を node_modules / built/
       # ごと cache する。dropin-e2e.yml / playwright.yml と同 strategy で
       # cache hit すれば 5-10 min → 数秒に短縮できる。
+      # **cache key は submodule の commit SHA で取る。** `pnpm-lock.yaml` の
+      # hash だと、submodule のソースを変えても lock が動かない限り cache hit に
+      # なり、**古い `built/` が使われる** (#2786 で実際に踏んだ。fork の
+      # `boot.js` を直したのに CI では反映されず spec が落ちた)。
+      - name: Resolve misskey submodule SHA
+        id: misskey-sha
+        run: echo "sha=$(git rev-parse HEAD:third_party/misskey)" >> "$GITHUB_OUTPUT"
+
       - name: Cache misskey workspace (built + node_modules)
         id: cache-misskey
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             third_party/misskey/node_modules
             third_party/misskey/packages/*/node_modules
             third_party/misskey/built
-          key: misskey-workspace-${{ runner.os }}-${{ hashFiles('third_party/misskey/pnpm-lock.yaml') }}
+          key: misskey-workspace-${{ runner.os }}-${{ steps.misskey-sha.outputs.sha }}
+
+      - name: Set up pnpm
+        if: steps.cache-misskey.outputs.cache-hit != 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          # pnpm のバージョンは submodule 側 package.json の packageManager から
+          # 取る。mk リポジトリ直下には package.json が無い。
+          #
+          # **corepack を使わない (#2914)。** Node.js 26 の配布物に corepack は
+          # 含まれておらず、今動いているのは runner image にプリインストールされた
+          # Node の corepack が PATH に残るからでしかない。image の Node が 26 に
+          # なった時点で一斉に落ちる。
+          #
+          # **版は元から揃っていた。** corepack は packageManager の pin を尊重する
+          # ので、`prepare pnpm@latest` を挟んでも workspace 内で走るのは 11.25.0
+          # (実測)。ここで消えるのは corepack への依存と、使われない 12.x を毎回
+          # ダウンロードしていた無駄。
+          package_json_file: third_party/misskey/package.json
 
       - name: Set up Node.js
         if: steps.cache-misskey.outputs.cache-hit != 'true'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version-file: third_party/misskey/.node-version
 
       - name: Build third_party/misskey frontend bundle
         if: steps.cache-misskey.outputs.cache-hit != 'true'
         working-directory: third_party/misskey
         run: |
-          corepack enable
-          corepack prepare pnpm@latest --activate
           pnpm install --frozen-lockfile
           pnpm build
 
@@ -106,7 +130,7 @@ jobs:
 
       - name: queue-bench smoke (assert ok=sent)
         # driver_inbound.py は partial ok=0 でも exit 0 で抜けるので、
-        # ここで inbound.json をパースして「全 3 stack で ok == sent」を
+        # ここで inbound.json をパースして「全 stack で ok == sent」を
         # verify する。1 stack でも `ok < sent` なら CI fail にして
         # orchestration regression を early surface する。
         # quoted heredoc (`'PYEOF'`) で shell interpolation を止めつつ、
@@ -117,18 +141,39 @@ jobs:
           import json, sys
           with open("tests/queue-bench/results/inbound.json") as f:
               d = json.load(f)
+          stats = d["send"]["stats"]
+          # **1 件も測っていないなら落とす (#2917)。** 空の stats で
+          # 「PASS: all 0 stacks」を出すと、検査していないのに緑になる。
+          if not stats:
+              print("FAIL: inbound smoke produced no stats", file=sys.stderr)
+              sys.exit(1)
           bad = []
-          for s in d["send"]["stats"]:
+          for s in stats:
               if s["ok"] != s["sent"]:
                   bad.append(
                       f"{s['target']}: ok={s['ok']}/{s['sent']} failed={s['failed']}"
                   )
           if bad:
-              print("FAIL: inbound smoke detected partial failure:", file=sys.stderr)
+              # **全滅と部分失敗を区別する (#2917)。** 「partial failure」だけを
+              # 出していたので、ok=0/100 が全 stack で並ぶ状態 (= orchestration が
+              # 壊れていて 1 件も届いていない) を「一部が失敗した」と読んでしまう。
+              # 実際 #2917 は全滅だったのに 6 夜そう読まれ続けた。
+              total = len(stats)
+              # **`sent > 0` を要求する。** sent=0 の stack は「配れなかった」の
+              # ではなく「投げていない」ので、dead に数えると bad の列挙と
+              # 食い違う (数えた stack が列挙されない)。
+              dead = sum(1 for s in stats if s["ok"] == 0 and s["sent"] > 0)
+              if dead == total:
+                  head = f"FAIL: inbound smoke delivered nothing ({total} stacks all ok=0)"
+              elif dead:
+                  head = f"FAIL: inbound smoke: {dead}/{total} stacks delivered nothing"
+              else:
+                  head = "FAIL: inbound smoke detected partial failure:"
+              print(head, file=sys.stderr)
               for b in bad:
                   print(f"  {b}", file=sys.stderr)
               sys.exit(1)
-          print(f"PASS: all {len(d['send']['stats'])} stacks ok=sent")
+          print(f"PASS: all {len(stats)} stacks ok=sent")
           PYEOF
 
       - name: queue-bench smoke (down)
@@ -151,7 +196,7 @@ jobs:
 
       - name: Upload logs artifact on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: queue-bench-logs
           path: /tmp/queue-bench-logs/
@@ -164,3 +209,38 @@ jobs:
         if: always()
         run: |
           make queue-bench-down >/dev/null 2>&1 || true
+
+  # **失敗に気付ける手当て (#2917)。** schedule 専用の workflow は PR で発火
+  # しないので、赤くなっても誰も見ない。実際 9/4 から 6 夜連続で失敗していたのに
+  # 気付かれなかった。dropin-frontend-e2e.yml と同じ形で、open な同名 issue が
+  # 無いときだけ起票する。
+  notify-failure:
+    needs: [smoke]
+    if: ${{ always() && github.event_name == 'schedule' && needs.smoke.result == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open tracking issue when absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: "nightly queue-bench-smoke が失敗しています"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          existing=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "既に open な issue #$existing があるので起票しない"
+            exit 0
+          fi
+          {
+            # shellcheck disable=SC2016  # バッククォートは Markdown の記法で、展開させない
+            printf 'nightly workflow `%s` が失敗しました。\n\n' "queue-bench-smoke"
+            printf -- '- 失敗した run: %s\n' "$RUN_URL"
+            printf -- '- 対象 branch: develop\n\n'
+            printf 'この issue は nightly の schedule 実行が失敗したときに自動起票されます。\n'
+            printf '既に open な同名 issue がある間は重複起票しません。原因を解消したら\n'
+            printf 'この issue を close してください (次回失敗時に再度起票されます)。\n'
+          } > /tmp/nightly-issue.md
+          gh issue create --title "$TITLE" --body-file /tmp/nightly-issue.md

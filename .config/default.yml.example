@@ -16,10 +16,19 @@
 # to this license. Please see the upstream Misskey example.yml for
 # the full explanation of license compliance options.
 #
-# If you have made changes to the source code (forks included)
-# and publish a Git repository, set the repository URL via the
-# admin settings page. Otherwise, uncomment the following line so
-# the source tarball is published from /api/meta:
+# If you have made changes to the source code (forks included),
+# publish a Git repository and set its URL from the admin control
+# panel (/admin/settings -> General -> Info -> Repository URL).
+# Fresh installs start with the mk-go repository so the notice is
+# never empty.
+#
+# **mk-go does not serve /tarball/**, so the option below has no
+# effect: /api/meta always reports providesTarball=false and the
+# server logs a warning at startup when it is enabled. Upstream
+# Misskey serves built/tarball at /tarball/; mk-go has no such route,
+# and the SPA catchall would answer such a link with HTML at 200 --
+# i.e. a download named misskey-<version>.tar.gz that is not an
+# archive at all (#2700).
 #
 # publishTarballInsteadOfProvideRepositoryUrl: true
 
@@ -121,8 +130,33 @@ port: 3000
 # delay. Raise it if your instance has very wide fanout and CPU to spare.
 #noteHookConcurrency: 8
 
+# How many media proxy image pipelines (decode/resize/encode) may run at the
+# same time (default: GOMAXPROCS / 2, at least 1).
+#
+# This is a memory bound, not a latency knob. Concurrent decodes each hold their
+# own intermediate buffers, and the built-in proxy shares a process with the API
+# server, so the peak is the whole instance's RSS. Measured on 8 cores under a
+# sustained AVIF burst (c=8):
+#
+#   limit 1 -> 131MB   2 -> 409MB   4 -> 636MB   8 -> 995MB   unlimited -> 959MB
+#
+# and jpeg->avatar throughput at the same limits: 30.7 / 45.5 / 63.9 / 71.2 /
+# 71.6 rps. The default buys a 34% lower peak for 11% less throughput.
+#
+# Those numbers are from a closed-loop benchmark, so they bound the *decoding*
+# set only. Requests waiting for a slot still hold their downloaded input, and
+# the queue itself has no length limit -- it is bounded only by the internal
+# 5-second wait, which is not configurable. Past that the request is shed with
+# 503 (or the dummy image when `?fallback` is set).
+#
+# Lower it on memory-constrained hosts; raise it when the box has RAM to spare
+# and proxy throughput matters more. The commented value below is the default
+# for an 8-core host -- on a 2-core host the default is 1, so uncommenting this
+# line as-is would quadruple it.
+#mediaProxyConcurrency: 4
+
 # Floor for how long an idle queue worker waits on the marker key before
-# re-checking, in seconds (default: mkq's own). mkq driver only.
+# re-checking, in seconds (default: mkq's own).
 #
 # Since mkq v1.0.4 the wait doubles on every empty poll and is capped at 30s,
 # snapping back to this floor as soon as a job is processed. So this is the
@@ -139,7 +173,7 @@ port: 3000
 #queueIdlePollSeconds: 5
 
 # How long one job's handler may run before its worker stops counting towards
-# the queue's worker budget and gets replaced (mkq driver only).
+# the queue's worker budget and gets replaced.
 #
 # A worker is one dispatcher goroutine. If its handler never returns, the queue
 # silently loses that much capacity — this is what happened in #2657, where all
@@ -172,7 +206,7 @@ port: 3000
 #queueStuckWorkerSeconds: -1
 
 # How long the dispatcher waits for one job's handler before giving up on it
-# and moving on to the next job (mkq driver only).
+# and moving on to the next job.
 #
 # **This does not stop the handler.** Go cannot kill a goroutine; all that
 # stops is the waiting. The abandoned handler keeps running and keeps whatever
@@ -272,22 +306,22 @@ redis:
 
 # mk-go specific: select the job queue runtime.
 #
-#   - 'mkq' (default, recommended): shiroha-a/mkq based runtime.
-#                        BullMQ wire-compatible — admin queue dashboard
+#   - 'mkq' (the only driver): shiroha-a/mkq based runtime. BullMQ
+#                        wire-compatible — the admin queue dashboard
 #                        renders correctly under the upstream Misskey
 #                        TS frontend (which assumes BullMQ). Supports
 #                        per-queue concurrency / rate-limit knobs (see
 #                        `<queue>JobConcurrency` / `<queue>JobPerSec`).
-#   - 'asynq': legacy hibiken/asynq based runtime. Kept for migration
-#                        path. **Future-deprecation candidate** — once
-#                        mkq is fully battle-tested in production we
-#                        plan to remove asynq entirely. New deploys
-#                        should use 'mkq'. Note that `inboxJobConcurrency`
-#                        and per-queue rate-limit settings only partially
-#                        apply under asynq (see docs/configuration.md).
 #
-# Switching between drivers does not migrate in-flight jobs; flush
-# the queue or wait for completion before changing.
+# The legacy 'asynq' driver was removed in mk-go (#2985). If your config
+# still pins it, mk-go — and every CLI that loads this file, including
+# cmd/migrate — refuses to start: set 'mkq' or delete the line.
+#
+# Migrating is ONE-WAY. asynq's jobs live under `asynq:{<queue>}:*` in
+# Redis and mkq (`bull:*`) never sees them, so anything still queued is
+# silently dropped. The new build refuses to start, so the only way to
+# drain them is to run the PREVIOUS mk-go build until those keys are
+# empty, and only then upgrade.
 #
 #jobQueueDriver: mkq
 
@@ -352,26 +386,19 @@ id: 'aidx'
 # but only these three have a knob; every queue left unset uses a
 # hot-tuned default (see docs/configuration.md).
 #
-# The asynq driver has a single shared pool, so deliverJobConcurrency
-# acts as the global pool size there and the other two are no-ops.
-# The mkq driver runs one pool per queue and treats each key as that
-# queue's own worker count, defaulting to deliver=16, inbox=16,
-# relationship=4. asynq has no per-queue split -- its shared pool is
-# whatever deliverJobConcurrency says, defaulting to 16. NOTE: the values below
-# are upstream Misskey's, not mk-go's (see docs/configuration.md).
+# mk-go runs one pool per queue and treats each key as that queue's own
+# worker count, defaulting to deliver=16, inbox=16, relationship=4.
+# NOTE: the values below are upstream Misskey's, not mk-go's
+# (see docs/configuration.md).
 #deliverJobConcurrency: 128
 #inboxJobConcurrency: 16
 #relationshipJobConcurrency: 16
 
-# Job rate limiter. Honoured by both drivers, but differently.
-#
-# mkq (the default) limits PER QUEUE: the cap is one shared Redis key
+# Job rate limiter, applied PER QUEUE: the cap is one shared Redis key
 # (bull:<queue>:limiter), so "deliverJobPerSec: 128" is about 128
-# jobs/sec no matter how many workers that queue runs. Do not divide
-# by the worker count.
-#
-# asynq waits inside the handler instead, so a throttled queue can
-# starve the shared pool. See docs/configuration.md.
+# jobs/sec no matter how many workers that queue runs, and it holds
+# across processes. Do not divide by the worker count.
+# See docs/configuration.md.
 #deliverJobPerSec: 128
 #inboxJobPerSec: 32
 #relationshipJobPerSec: 64
@@ -383,8 +410,8 @@ id: 'aidx'
 
 # Auto-scale: when jobQueueAutoScale=true, an AIMD controller dynamically
 # resizes worker pools for queues without an explicit *JobConcurrency knob,
-# within [minWorkers, maxWorkers]. mkq driver only (asynq returns a startup
-# error). Full spec: docs/design/auto-scale-job-workers.md.
+# within [minWorkers, maxWorkers]. Full spec:
+# docs/design/auto-scale-job-workers.md.
 #jobQueueAutoScale: false
 #maxWorkers: 128                # per-queue upper bound (default: runtime.NumCPU() * 16)
 #minWorkers: 4                  # per-queue lower bound (kept warm even at idle)
@@ -550,8 +577,12 @@ proxyBypassHosts:
 # apply env vars to known keys, and plugin keys cannot be enumerated in
 # advance. A plugin that needs env-provided secrets should read them
 # itself.
+# Reserved keys: `enabled` (run the plugin) and `peerMaxBody` (bytes the
+# plugin's peer endpoint accepts; default 64KiB, max 1MiB). Everything else is
+# handed to the plugin as-is.
 #plugins:
 #  gameinfo:
 #    enabled: true
+#    peerMaxBody: 524288
 #    apiKey: "..."
 #    endpoint: https://api.example-game.com

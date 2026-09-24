@@ -145,6 +145,24 @@ func TestList_ReturnsAll(t *testing.T) {
 	assert.Len(t, list, 2)
 }
 
+// TestFindByID_ReturnsRow は inbox の Accept / Reject が所有権検証に使う lookup を
+// 固定する (federation.RelayStatusMarker.FindByID)。
+func TestFindByID_ReturnsRow(t *testing.T) {
+	svc, _, _, _ := newService(t)
+	rel, err := svc.Add(context.Background(), "https://r.example/inbox")
+	require.NoError(t, err)
+
+	got, err := svc.FindByID(context.Background(), rel.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, rel.ID, got.ID)
+	assert.Equal(t, "https://r.example/inbox", got.Inbox)
+
+	// 存在しない id は error (呼び出し側はこれを見て drop する)。
+	_, err = svc.FindByID(context.Background(), "no-such-relay")
+	assert.Error(t, err)
+}
+
 func TestMarkAccepted_UpdatesStatus(t *testing.T) {
 	svc, repo, _, _ := newService(t)
 	rel, err := svc.Add(context.Background(), "https://r.example/inbox")
@@ -318,7 +336,7 @@ func TestIsRelayActor(t *testing.T) {
 	svc, repo, _, _ := newService(t)
 	relayInbox := "https://relay.example/inbox"
 	// accepted な relay を登録 (= cache 経由で IsRelayActor の判定対象に入る)
-	repo.Create(&model.Relay{ID: "r1", Inbox: relayInbox, Status: relay.StatusAccepted})
+	require.NoError(t, repo.Create(&model.Relay{ID: "r1", Inbox: relayInbox, Status: relay.StatusAccepted}))
 
 	t.Run("nil_actor", func(t *testing.T) {
 		assert.False(t, svc.IsRelayActor(nil))

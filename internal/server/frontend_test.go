@@ -850,7 +850,11 @@ func TestFrontendHTML_SplashColor(t *testing.T) {
 
 		// `<meta name="theme-color">` 側には属性 escape された値がそのまま
 		// 出る (そちらは属性値なので正しい)。見るのは style ブロックだけ。
-		style := regexp.MustCompile(`<style>[^<]*</style>`).FindString(rec.Body.String())
+		// **最初の `<style>` を取らない。** loader の CSS を inline する
+		// テストが先に走ると、そちらを掴んで別物を比較する (#2795)。splash を
+		// 名指しで取れば、fixture が残っていても意味のある比較になる。
+		style := regexp.MustCompile(`<style>:root\{--splash-color:[^<]*</style>`).
+			FindString(rec.Body.String())
 		require.NotEmpty(t, style, "splash color style block not found")
 		assert.Equal(t, `<style>:root{--splash-color:#86b300}</style>`, style)
 	})
@@ -869,6 +873,7 @@ func TestFrontendHTML_InlinesLoaderAssets(t *testing.T) {
 		[]byte("window.__markerInlinedJs = 1;"), 0o644))
 	t.Setenv("MISSKEY_FRONTEND_DIR", dir)
 	frontendutil.ResetLoaderCacheForTest()
+	t.Cleanup(frontendutil.ResetLoaderCacheForTest)
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
 	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
@@ -891,6 +896,7 @@ func TestFrontendHTML_InlinesLoaderAssets(t *testing.T) {
 func TestFrontendHTML_FallsBackToLoaderReferences(t *testing.T) {
 	t.Setenv("MISSKEY_FRONTEND_DIR", t.TempDir())
 	frontendutil.ResetLoaderCacheForTest()
+	t.Cleanup(frontendutil.ResetLoaderCacheForTest)
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
 	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
@@ -914,6 +920,7 @@ func TestFrontendHTML_DevModeKeepsReferences(t *testing.T) {
 		[]byte("#splash{--marker:stale}"), 0o644))
 	t.Setenv("MISSKEY_FRONTEND_DIR", dir)
 	frontendutil.ResetLoaderCacheForTest()
+	t.Cleanup(frontendutil.ResetLoaderCacheForTest)
 
 	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test", Dev: true}
 	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
@@ -986,4 +993,111 @@ func extractEmbeddedMeta(t *testing.T, body string) map[string]any {
 	var parsed map[string]any
 	require.NoError(t, json.Unmarshal([]byte(body[start:start+end]), &parsed))
 	return parsed
+}
+
+// SSR 埋め込み meta にもビルドの revision を載せること (#2700)。/about-mkgo は
+// fetchInstance を待たずに描けるので、こちらに無いと初回描画でだけ版が欠ける。
+func TestFrontendHTML_EmbedsBuildRevision(t *testing.T) {
+	// ldflags で埋める package 変数。プロセス共有なので必ず戻す (#2795)。
+	prevCommit, prevFrontend := config.MkGoCommit, config.MkGoFrontendVersion
+	t.Cleanup(func() {
+		config.MkGoCommit, config.MkGoFrontendVersion = prevCommit, prevFrontend
+	})
+	config.MkGoCommit = "abc1234"
+	config.MkGoFrontendVersion = "2026.9.0-mk.3"
+
+	cfg := &config.Config{URL: "https://example.test", Version: "0.0.1-test"}
+	repo := testutil.NewMockMetaRepository()
+	repo.Meta = &model.Meta{ID: "x"}
+	handler := frontendHTML(cfg, repo, nil, nil)
+
+	e := echo.New()
+	rec := httptest.NewRecorder()
+	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
+	require.NoError(t, handler(c))
+
+	parsed := extractEmbeddedMeta(t, rec.Body.String())
+	assert.Equal(t, "abc1234", parsed["mkGoCommit"])
+	assert.Equal(t, "2026.9.0-mk.3", parsed["mkGoFrontendVersion"])
+}
+
+// SSR 埋め込み meta の providesTarball も /api/meta と同じく設定を無視して
+// false を返すこと (#2700)。
+//
+// **片側だけ戻る形を止めるためのテスト。** この埋め込み meta は frontend の
+// instance cache を上書きする経路なので、`/api/meta` だけ直っていても
+// ここが設定値を返すと、初回描画では tarball リンクが出るという食い違いになる。
+// 既存の `TestSSRMetaCoversAPIMeta` はキーの有無しか見ないので捕まらない。
+func TestFrontendHTML_ProvidesTarballIgnoresConfigFlag(t *testing.T) {
+	cfg := &config.Config{
+		URL:     "https://example.test",
+		Version: "0.0.1-test",
+		PublishTarballInsteadOfProvideRepositoryURL: true,
+	}
+
+	repo := testutil.NewMockMetaRepository()
+	repo.Meta = &model.Meta{ID: "x"}
+	handler := frontendHTML(cfg, repo, nil, nil)
+
+	e := echo.New()
+	rec := httptest.NewRecorder()
+	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
+	require.NoError(t, handler(c))
+
+	parsed := extractEmbeddedMeta(t, rec.Body.String())
+	assert.Equal(t, false, parsed["providesTarball"],
+		"設定が true でも mk-go に /tarball/ は無いので false を出すこと")
+}
+
+// `/about-misskey` のクレジット画像 62 枚が読める origin を img-src に足していること
+// (#2892)。#2700 で upstream の謝辞を残す判断をしたので、ここを許さないとその
+// ページには恒久的に壊れた画像が並ぶ。
+//
+// **media proxy 経由には落とせない** — mk-go の proxy は open proxy ではなく、
+// allowlist は DB に実在する URL だけを通すので静的な URL は 403 になる。
+func TestFrontendHTML_CreditImageOriginsInCSP(t *testing.T) {
+	cfg := &config.Config{
+		URL: "https://example.test", Version: "0.0.1-test",
+		FrontendContentSecurityPolicy: CSPModeEnforce,
+	}
+	handler := frontendHTML(cfg, testutil.NewMockMetaRepository(), nil, nil)
+	e := echo.New()
+	rec := httptest.NewRecorder()
+	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
+	require.NoError(t, handler(c))
+
+	csp := rec.Header().Get("Content-Security-Policy")
+	require.NotEmpty(t, csp)
+
+	directives := map[string]string{}
+	for _, d := range strings.Split(csp, "; ") {
+		name, rest, _ := strings.Cut(d, " ")
+		directives[name] = rest
+	}
+
+	// **host はリテラルで書く。** `creditImageOrigins` をループの反復元にすると
+	// 検証対象そのものを truth にすることになり、定数を空にしても片方を消しても
+	// 通ってしまう (= #2892 が直した状態に戻っても検出しない)。
+	imgSrc, ok := directives["img-src"]
+	require.True(t, ok, "img-src directive が無い")
+	assert.Contains(t, imgSrc, "https://avatars.githubusercontent.com",
+		"プロジェクトメンバーのアイコン 6 枚が読めない")
+	assert.Contains(t, imgSrc, "https://assets.misskey-hub.net",
+		"スポンサー 6 枚とパトロン 50 枚が読めない")
+
+	// **増やす方向も固定する。** ワイルドカード (`https://*.githubusercontent.com`)
+	// に広げると open image proxy の `camo.githubusercontent.com` まで開く。
+	assert.Len(t, creditImageOrigins, 2, "許可する origin を増減させるときはこのテストも見直すこと")
+	for _, origin := range creditImageOrigins {
+		assert.NotContains(t, origin, "*", "ワイルドカードは使わない")
+	}
+
+	// **img-src だけに足す。** これらの host からは画像しか読まないので、
+	// media-src / connect-src には要らない (`cspExtras.Media` と分けた理由)。
+	for _, name := range []string{"media-src", "connect-src", "script-src", "style-src"} {
+		for _, origin := range []string{"https://avatars.githubusercontent.com", "https://assets.misskey-hub.net"} {
+			assert.NotContains(t, directives[name], origin,
+				"%s に画像用の origin が漏れている", name)
+		}
+	}
 }

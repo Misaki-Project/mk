@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	corenote "github.com/shiroha-a/mk/internal/core/note"
@@ -1147,4 +1148,228 @@ func TestGroupNotifications_GroupCreatedAtSkipsDropped(t *testing.T) {
 	assert.Equal(t, "2026-01-02T03:04:06.000Z", out[0]["createdAt"],
 		"createdAt は先頭の生存メンバー (drop された n3 の時刻を出さない)")
 	assert.Equal(t, "n1", out[0]["id"], "id は最後の生存メンバー")
+}
+
+// 取得が 0 件の fetch では既読化しない (#2833)。upstream
+// i/notifications-grouped.ts の `notifications.length === 0` 早期 return と同じ。
+//
+// **既読位置が飛ぶのが問題。** MarkAllAsRead が進める先は fetch が返した行では
+// なく**ストリームの最新エントリ**なので、0 件の fetch で呼ぶと、ユーザーが一度も
+// 受け取っていない通知まで既読になる。
+//
+// こちらは `includeTypes:[]` = Grouped の emptyByTypeFilter が
+// collectNotificationsWithDropped を呼ぶ**前**に早期 return する経路。
+// **svc.List に到達する経路は別に要る** —
+// この 1 本だけだと「includeTypes が空かどうか」だけを見る実装で全テストが通り、
+// untilId 末尾ページングや excludeTypes 全指定の回帰を検出できない
+// (TestGrouped_EmptyPageDoesNotMarkAsRead)。
+func TestGrouped_IncludeTypesEmptyDoesNotMarkAsRead(t *testing.T) {
+	h, svc, _, _ := groupedHandler(t)
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	// includeTypes: [] は「何も含めない」なので取得は 0 件になる。ストリームには
+	// 通知が積まれたままなので、既読化すると位置が最新まで飛ぶ。
+	c, rec := newJSONRequest(t, "/api/i/notifications-grouped", `{"includeTypes":[]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Grouped(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Empty(t, decodeGrouped(t, rec.Body.Bytes()))
+
+	assert.NotContains(t, pub.types("alice"), "readAllNotifications",
+		"empty fetch must not publish readAllNotifications")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.Empty(t, readID, "empty fetch must not advance the read marker")
+}
+
+// 非空の fetch では従来どおり既読化する。上の早期 return が広すぎないことの
+// 裏返しで、これが無いと「常に既読化しない」変異が素通りする。
+func TestGrouped_NonEmptyResultMarksAsRead(t *testing.T) {
+	h, svc, userRepo, _ := groupedHandler(t)
+	// notifier を解決できないと collectNotificationsWithDropped の
+	// unresolved-notifier drop (#2106 N6) で行が落ち、結果が空になって
+	// 「非空の fetch」を試したことにならない。
+	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications-grouped", `{}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Grouped(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotEmpty(t, decodeGrouped(t, rec.Body.Bytes()))
+
+	assert.Contains(t, pub.types("alice"), "readAllNotifications",
+		"non-empty fetch keeps the implicit mark-as-read")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.NotEmpty(t, readID, "non-empty fetch advances the read marker")
+}
+
+// 判定は `all` (svc.List の生の結果) であって `grouped` ではない (#2833)。
+//
+// notifier を解決できない通知は collectNotificationsWithDropped の
+// unresolved-notifier drop (#2106 N6) で落ちるので、取得は 1 件でも応答は空になる
+// (落とすのは pack ではなくその前段)。upstream の早期 return は `getNotifications`
+// の直後にあり、この drop よりさらに前なので、**この場合は既読化する**。
+// `grouped` で判定すると upstream より後ろの位置になり、逆向きの乖離を作る。
+func TestGrouped_MarksAsReadWhenRowsDropButFetchWasNonEmpty(t *testing.T) {
+	h, svc, _, _ := groupedHandler(t)
+	ctx := context.Background()
+	// notifier "bob" を userRepo に入れない → unresolved-notifier drop で行が落ちる。
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications-grouped", `{}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Grouped(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Empty(t, decodeGrouped(t, rec.Body.Bytes()), "pack drops the unresolved notifier row")
+
+	assert.Contains(t, pub.types("alice"), "readAllNotifications",
+		"upstream marks as read here: the early return is before pack, not after")
+}
+
+// **svc.List に到達する 0 件 fetch** でも既読化しない (#2833)。
+//
+// これが本命のケースで、実運用で最も踏むのは末尾までページングした
+// `untilId` (cursor は exclusive なので最古通知の id を渡すと 0 行になる)。
+// ストリームには通知が残っているので、既読化すると位置が最新まで飛ぶ。
+//
+// **includeTypes:[] の 1 本だけでは守れない。** あちらは svc.List を呼ぶ前に
+// 早期 return する経路なので、guard を「includeTypes が空か」で書いた実装でも
+// 全テストが通ってしまう (実測)。
+func TestGrouped_EmptyPageDoesNotMarkAsRead(t *testing.T) {
+	h, svc, userRepo, _ := groupedHandler(t)
+	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
+	ctx := context.Background()
+	oldest, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	// untilId は exclusive。最古の通知自身を渡すと、それより古い行は無いので 0 件。
+	c, rec := newJSONRequest(t, "/api/i/notifications-grouped",
+		`{"untilId":"`+oldest.ID+`"}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Grouped(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Empty(t, decodeGrouped(t, rec.Body.Bytes()))
+
+	assert.NotContains(t, pub.types("alice"), "readAllNotifications",
+		"an empty page must not publish readAllNotifications")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.Empty(t, readID, "an empty page must not advance the read marker")
+}
+
+// excludeTypes が実在する type を全て覆っても同じ (#2833)。こちらも svc.List に
+// 到達する経路で、in-app の type filter で全行が落ちて 0 件になる形
+// (mk-go の svc.List に refetch loop は無く、MaxPerUser=300 を 1 回取って絞る)。
+func TestGrouped_ExcludeAllTypesDoesNotMarkAsRead(t *testing.T) {
+	h, svc, userRepo, _ := groupedHandler(t)
+	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications-grouped",
+		`{"excludeTypes":["follow"]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Grouped(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Empty(t, decodeGrouped(t, rec.Body.Bytes()))
+
+	assert.NotContains(t, pub.types("alice"), "readAllNotifications",
+		"excluding every present type must not publish readAllNotifications")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.Empty(t, readID, "excluding every present type must not advance the read marker")
+}
+
+// excludeTypes 全指定でも、**notificationTypeList に無い type の行は生き残る**
+// (#2835)。svc.List の exclude filter は `excludeSet[n.Type]` の一致しか見ない
+// ので、pollVote (notificationTypeList の外にある唯一の type。producer は #690 で
+// 無効化済みだが、それ以前の行は残りうる) が 1 件あるだけで `len(all) > 0` が
+// 成立し、#2833 の guard をすり抜けて既読化まで走る。upstream は早期 return
+// するので `[]` が正。
+//
+// **この 1 本が Grouped 側の早期 return を守る唯一のテスト。** これが無いと
+// 早期 return を丸ごと消す変異が全テストを素通りする (実測)。
+func TestGrouped_ExcludeAllTypesStopsNonEnumRows(t *testing.T) {
+	h, svc, userRepo, noteRepo := groupedHandler(t)
+	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
+	noteRepo.Notes["n1"] = &model.Note{ID: "n1", UserID: "alice", Visibility: "public",
+		User: &model.User{ID: "alice", Username: "alice"}}
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob",
+		Type: notification.TypePollVote, NoteID: "n1",
+	})
+	require.NoError(t, err)
+
+	pub := &stubMainPublisher{}
+	svc.SetMainStreamPublisher(pub)
+
+	body, err := json.Marshal(map[string]any{"excludeTypes": notificationTypeList})
+	require.NoError(t, err)
+	c, rec := newJSONRequest(t, "/api/i/notifications-grouped", string(body))
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Grouped(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	// wire 上 `[]` であること。null は misskey-js / misskey_dart が non-null で
+	// 受けるので通知ページごと落ちる。
+	assert.Equal(t, "[]", strings.TrimSpace(rec.Body.String()))
+
+	assert.NotContains(t, pub.types("alice"), "readAllNotifications")
+	readID, err := svc.LatestReadID(ctx, "alice")
+	require.NoError(t, err)
+	assert.Empty(t, readID, "non-enum rows must not sneak past the early return")
+}
+
+// Grouped も Show と同じく obsolete を除去する (#2837)。除去後に空になった
+// includeTypes は filter として効かないので全件が返る。
+func TestGrouped_IncludeTypesObsoleteOnlyReturnsAll(t *testing.T) {
+	h, svc, userRepo, _ := groupedHandler(t)
+	userRepo.Users["bob"] = &model.User{ID: "bob", Username: "bob"}
+	ctx := context.Background()
+	_, err := svc.Create(ctx, notification.CreateInput{
+		NotifieeID: "alice", NotifierID: "bob", Type: notification.TypeFollow,
+	})
+	require.NoError(t, err)
+
+	c, rec := newJSONRequest(t, "/api/i/notifications-grouped",
+		`{"includeTypes":["pollVote"]}`)
+	setAuth(c, &model.User{ID: "alice"})
+	require.NoError(t, h.Grouped(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	resp := decodeGrouped(t, rec.Body.Bytes())
+	require.Len(t, resp, 1, "obsolete-only includeTypes means no filter")
+	assert.Equal(t, "follow", resp[0]["type"])
 }

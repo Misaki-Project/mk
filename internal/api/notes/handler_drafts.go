@@ -2,6 +2,7 @@ package notes
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -48,7 +49,10 @@ func (h *Handler) DraftsList(c echo.Context) error {
 	if !limitOK {
 		return apierr.JSONInvalidParam(c)
 	}
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	drafts, err := h.draftRepo.ListByUser(user.ID, sinceID, untilID, req.Scheduled, limit)
 	if err != nil {
 		return c.JSON(http.StatusOK, []any{})
@@ -116,13 +120,6 @@ func (h *Handler) DraftsCreate(c echo.Context) error {
 		scheduledAt = &t
 	}
 	if req.IsActuallyScheduled {
-		// asynq driver は scheduled note 機能を確実に support できないため
-		// (= clearSchedule の task ID 仕様制約)、機能無効化する。upstream
-		// 互換の \`TOO_MANY_SCHEDULED_NOTES\` で reject し、frontend には
-		// 上限到達と同じ UX を返す (#1045 Phase 2-C)。
-		if h.scheduledNoteEnqueuer != nil && !h.scheduledNoteEnqueuer.SupportsScheduledNote() {
-			return c.JSON(http.StatusBadRequest, apierr.Error("TOO_MANY_SCHEDULED_NOTES", "You cannot create scheduled notes any more.", "22ae69eb-09e3-4541-a850-773cfa45e693"))
-		}
 		if scheduledAt == nil {
 			// Misskey は SCHEDULED_AT_* に create / update で別 id を割り当てるため endpoint 固有 id を inline で返す
 			return c.JSON(http.StatusBadRequest, apierr.Error("SCHEDULED_AT_REQUIRED", "scheduledAt is required when isActuallyScheduled is true.", "15e28a55-e74c-4d65-89b7-8880cdaaa87d"))
@@ -253,6 +250,10 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", err.Error(), apierr.UUIDInvalidParam))
 	}
 	draft, err := h.draftRepo.FindByIDAndUser(req.DraftID, user.ID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil {
 		return c.JSON(http.StatusNotFound, apierr.NoSuchNoteDraft())
 	}
@@ -328,10 +329,7 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 	}
 	if scheduleChanged && draft.IsActuallyScheduled {
 		// 新しく schedule する / 既に scheduled だった draft の scheduledAt が
-		// 変わった場合は validation + capability check が必要。
-		if h.scheduledNoteEnqueuer != nil && !h.scheduledNoteEnqueuer.SupportsScheduledNote() {
-			return c.JSON(http.StatusBadRequest, apierr.Error("TOO_MANY_SCHEDULED_NOTES", "You cannot create scheduled notes any more.", "02f5df79-08ae-4a33-8524-f1503c8f6212"))
-		}
+		// 変わった場合は validation が必要。
 		if draft.ScheduledAt == nil {
 			// notes/drafts/update は create とは別の SCHEDULED_AT_* id を持つ
 			return c.JSON(http.StatusBadRequest, apierr.Error("SCHEDULED_AT_REQUIRED", "scheduledAt is required when isActuallyScheduled is true.", "fe9737d5-cc41-498c-af9d-149207307530"))
@@ -346,7 +344,14 @@ func (h *Handler) DraftsUpdate(c echo.Context) error {
 	// しても draft 更新自体は成功で返す (= log のみ、frontend は draft
 	// 更新の永続化を確認できる)。
 	if scheduleChanged && h.scheduledNoteEnqueuer != nil {
-		_ = h.scheduledNoteEnqueuer.ClearScheduledNote(draft.ID)
+		// **捨てずに log へ残す。** 500 にはしない (draft の更新は成功して
+		// いるので、そこを失敗にすると「保存できたのに失敗と表示される」)。
+		// ただし黙って捨てると、古い job が残って**取り消したはずの時刻で
+		// 公開される**事故の手掛かりが 1 つも残らない。
+		if err := h.scheduledNoteEnqueuer.ClearScheduledNote(draft.ID); err != nil {
+			slog.Warn("notes/drafts/update: 旧 delayed task を消せなかった",
+				"draftId", draft.ID, "err", err)
+		}
 		if draft.IsActuallyScheduled && draft.ScheduledAt != nil {
 			delay := draft.ScheduledAt.Sub(now)
 			if err := h.scheduledNoteEnqueuer.EnqueuePostScheduledNote(
@@ -391,6 +396,11 @@ func (h *Handler) validateDraftReplyRenote(viewer *model.User, replyID, renoteID
 	}
 	if renoteID != nil {
 		t, err := h.noteRepo.FindByIDWithUser(*renoteID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。この関数は
+			// (status, body) を返すので 500 も同じ形で返す。
+			return http.StatusInternalServerError, apierr.InternalError()
+		}
 		if err != nil || t == nil {
 			return http.StatusBadRequest, errs.noSuchRenote
 		}
@@ -414,6 +424,11 @@ func (h *Handler) validateDraftReplyRenote(viewer *model.User, replyID, renoteID
 	}
 	if replyID != nil {
 		t, err := h.noteRepo.FindByIDWithUser(*replyID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。この関数は
+			// (status, body) を返すので 500 も同じ形で返す。
+			return http.StatusInternalServerError, apierr.InternalError()
+		}
 		if err != nil || t == nil {
 			return http.StatusBadRequest, errs.noSuchReply
 		}
@@ -439,6 +454,11 @@ func (h *Handler) validateDraftReplyRenote(viewer *model.User, replyID, renoteID
 	// draft 自身の channelId が指定されていれば存在 (非 archived) 確認 (#2039)。
 	if channelID != nil && *channelID != "" && h.channelRepo != nil {
 		ch, err := h.channelRepo.FindByID(*channelID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。この関数は
+			// (status, body) を返すので 500 も同じ形で返す。
+			return http.StatusInternalServerError, apierr.InternalError()
+		}
 		if err != nil || ch == nil || ch.IsArchived {
 			return http.StatusBadRequest, apierr.Error("NO_SUCH_CHANNEL", "No such channel.", "b1653923-5453-4edc-b786-7c4f39bb0bbb")
 		}
@@ -468,6 +488,11 @@ func (h *Handler) validateRenoteChannel(renoteChannelID, draftChannelID *string)
 		return 0, nil // 同一 channel への renote は対象外
 	}
 	ch, err := h.channelRepo.FindByID(*renoteChannelID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。この関数は
+		// (status, body) を返すので 500 も同じ形で返す。
+		return http.StatusInternalServerError, apierr.InternalError()
+	}
 	if err != nil || ch == nil {
 		return http.StatusBadRequest, apierr.Error("NO_SUCH_CHANNEL", "No such channel.", "b1653923-5453-4edc-b786-7c4f39bb0bbb")
 	}
@@ -557,10 +582,14 @@ func (h *Handler) DraftsDelete(c echo.Context) error {
 	}
 	// delete に成功したら旧 delayed task も best-effort で clear する
 	// (#1045 Phase 2-C)。upstream は `clearSchedule(draftId)` を fire
-	// and forget で呼ぶ。clear 失敗は 204 を阻害しない (= asynq retry
-	// で task が fire してもprocessor 側で draft 不在 silent skip で済む)。
+	// and forget で呼ぶ。clear 失敗は 204 を阻害しない (= 残った task が
+	// fire しても processor 側で draft 不在 silent skip で済む)。
 	if h.scheduledNoteEnqueuer != nil {
-		_ = h.scheduledNoteEnqueuer.ClearScheduledNote(req.DraftID)
+		// 上と同じ。消せなくても 204 は返すが、手掛かりは残す。
+		if err := h.scheduledNoteEnqueuer.ClearScheduledNote(req.DraftID); err != nil {
+			slog.Warn("notes/drafts/delete: 旧 delayed task を消せなかった",
+				"draftId", req.DraftID, "err", err)
+		}
 	}
 	return c.NoContent(http.StatusNoContent)
 }
@@ -612,19 +641,33 @@ func (h *Handler) ThreadMutingCreate(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
 	note, err := h.noteRepo.FindByID(req.NoteID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil || note == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "5ff67ada-ed3b-2e71-8e87-a1a421e177d2"))
 	}
 	threadID := threadIDForMute(note)
-	// 冪等: 既存行があれば UNIQUE 制約違反 (500) を避けて成功扱い。
-	if exists, _ := h.threadMutingRepo.Exists(user.ID, threadID); !exists {
-		if err := h.threadMutingRepo.Create(&model.NoteThreadMuting{
-			ID:       h.idGen.Generate(time.Now()),
-			UserID:   user.ID,
-			ThreadID: threadID,
-		}); err != nil {
-			return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
-		}
+	// upstream 1853898d71 で重複時の error が定義された。#1538 では UNIQUE 制約違反に
+	// よる 500 を避けるため既存行を成功扱い (204) にしていたが、upstream は 400
+	// ALREADY_MUTING を返すので wire 上のレスポンスが分岐していた。upstream に揃える。
+	exists, err := h.threadMutingRepo.Exists(user.ID, threadID)
+	if err != nil {
+		// **DB 障害を「既にミュート済み」に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
+	if exists {
+		return c.JSON(http.StatusBadRequest, apierr.Error("ALREADY_MUTING", "You are already muting that thread.", "c146e22d-1141-4b31-b28d-176371014d18"))
+	}
+	if err := h.threadMutingRepo.Create(&model.NoteThreadMuting{
+		ID:       h.idGen.Generate(time.Now()),
+		UserID:   user.ID,
+		ThreadID: threadID,
+	}); err != nil {
+		// Exists 側と同じ apierr.InternalError() に揃える。同じ endpoint の同じ
+		// code / id なのに kind が枝ごとに違うと、クライアントの分類が枝で変わる。
+		return apierr.JSONInternalError(c)
 	}
 	return c.NoContent(http.StatusNoContent)
 }
@@ -642,6 +685,10 @@ func (h *Handler) ThreadMutingDelete(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, apierr.Error("INTERNAL_ERROR", "Internal error.", "5d37dbcb-891e-41ca-a3d6-e690c97775ac"))
 	}
 	note, err := h.noteRepo.FindByID(req.NoteID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil || note == nil {
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_NOTE", "No such note.", "bddd57ac-ceb3-b29d-4334-86ea5fae481a"))
 	}

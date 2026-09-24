@@ -14,37 +14,64 @@ import (
 )
 
 // stubBus implements PubSubBus and records subscribe/unsubscribe calls.
+// stubBus records subscriptions per topic.
+//
+// **トピックごとに複数のハンドラを持つ。** 1 つしか持たない形は、本番から
+// 取り除いた「後から来た購読が前のを上書きする」挙動をスタブ側に残すことに
+// なり、複数の Dispatcher を同じトピックへ繋ぐテストで嘘をつく。
 type stubBus struct {
 	mu         sync.Mutex
-	subs       map[string]func([]byte)
+	subs       map[string][]func([]byte)
 	unsubs     []string
 	subscribed []string
 }
 
 func newStubBus() *stubBus {
-	return &stubBus{subs: map[string]func([]byte){}}
+	return &stubBus{subs: map[string][]func([]byte){}}
 }
 
-func (b *stubBus) Subscribe(topic string, handler func([]byte)) {
+func (b *stubBus) Subscribe(topic string, handler func([]byte)) func() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.subs[topic] = handler
+	b.subs[topic] = append(b.subs[topic], handler)
+	idx := len(b.subs[topic]) - 1
 	b.subscribed = append(b.subscribed, topic)
+	b.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			if hs := b.subs[topic]; idx < len(hs) {
+				hs[idx] = nil
+				// **全部外れたらキーごと消す。** 既存のテストが
+				// `_, ok := bus.subs[topic]` で購読状態を見ているので、
+				// 残すと「解除したのに購読中」に見える。
+				live := false
+				for _, h := range hs {
+					if h != nil {
+						live = true
+						break
+					}
+				}
+				if !live {
+					delete(b.subs, topic)
+				}
+			}
+			b.unsubs = append(b.unsubs, topic)
+		})
+	}
 }
 
-func (b *stubBus) Unsubscribe(topic string) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.subs, topic)
-	b.unsubs = append(b.unsubs, topic)
-}
-
+// deliver hands payload to every live handler for topic.
 func (b *stubBus) deliver(topic string, payload []byte) {
 	b.mu.Lock()
-	h := b.subs[topic]
+	hs := make([]func([]byte), len(b.subs[topic]))
+	copy(hs, b.subs[topic])
 	b.mu.Unlock()
-	if h != nil {
-		h(payload)
+	for _, h := range hs {
+		if h != nil {
+			h(payload)
+		}
 	}
 }
 
@@ -1223,4 +1250,50 @@ func TestDispatcher_SrDoesNotReadAllNotifications(t *testing.T) {
 	// 正規の readNotification は引き続き全通知既読を行う。
 	d.HandleClientMessage("readNotification", json.RawMessage(`{}`))
 	assert.Equal(t, 1, nr.called, "'readNotification' must mark all notifications read")
+}
+
+// **subNote は 1 接続あたり maxNoteSubsPerConnection 件まで。** 超えたら最も
+// 古く購読したものを外す (LRU)。購読 1 件ごとに Redis の接続を張るので、上限が
+// 無いと 1 本の接続から Redis の接続を無制限に増やせる。
+func TestDispatcher_SubNote_CapEvictsOldest(t *testing.T) {
+	conn := NewConnection("test", nil, newFakeConn())
+	bus := newStubBus()
+	d := NewDispatcher(conn, nil, bus)
+	d.SetNoteVisibilityChecker(&stubNoteVisibility{defaultAllow: true})
+
+	sub := func(id string) {
+		d.HandleClientMessage("subNote", json.RawMessage(`{"id":"`+id+`"}`))
+	}
+	subbed := func(id string) bool {
+		bus.mu.Lock()
+		defer bus.mu.Unlock()
+		_, ok := bus.subs["noteStream:"+id]
+		return ok
+	}
+
+	for i := range maxNoteSubsPerConnection {
+		sub(fmt.Sprintf("n%d", i))
+	}
+	// n0 を購読し直すと最も新しい扱いになり、次に外れるのは n1。
+	sub("n0")
+
+	sub("over")
+	d.noteSubMu.Lock()
+	held := len(d.noteSubs)
+	d.noteSubMu.Unlock()
+	assert.Equal(t, maxNoteSubsPerConnection, held, "上限を超えて保持しない")
+	assert.True(t, subbed("over"))
+	assert.True(t, subbed("n0"), "購読し直したものは残る")
+	assert.False(t, subbed("n1"), "最も古いものが bus から外れる")
+
+	// 外れたものへの unsubNote は何も起こさない。
+	d.HandleClientMessage("unsubNote", json.RawMessage(`{"id":"n1"}`))
+	assert.True(t, subbed("n2"))
+
+	// unsubNote で空いた枠は次の購読で使え、誰も押し出さない。
+	d.HandleClientMessage("unsubNote", json.RawMessage(`{"id":"n2"}`))
+	d.HandleClientMessage("unsubNote", json.RawMessage(`{"id":"n0"}`))
+	d.HandleClientMessage("unsubNote", json.RawMessage(`{"id":"n0"}`))
+	sub("new1")
+	assert.True(t, subbed("n3"), "空いた枠があれば押し出さない")
 }

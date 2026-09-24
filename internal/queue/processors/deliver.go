@@ -1,6 +1,6 @@
 // Package processors contains task handlers used by the queue worker.
 // Handlers are driver-neutral: they accept a driver.Task and return
-// driver.SkipRetry to suppress retries.
+// driver.ErrSkipRetry to suppress retries.
 package processors
 
 import (
@@ -12,13 +12,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/shiroha-a/mk/internal/activitypub"
 	"github.com/shiroha-a/mk/internal/core/deliveryhealth"
+	"github.com/shiroha-a/mk/internal/core/federation"
 	"github.com/shiroha-a/mk/internal/queue"
 	"github.com/shiroha-a/mk/internal/queue/driver"
 )
@@ -109,6 +109,8 @@ type DeliverProcessor struct {
 	// 毎 job で PEM->x509 を再パースしていた。worker 間共有の単一 processor
 	// にここを持たせて job 横断でメモ化する (#1425)。nil の場合は都度パース。
 	keyCache *lru.Cache[string, *activitypub.PrivateKey]
+	// keySource は payload に鍵が無いとき (= 新しい job) に引く先。
+	keySource SigningKeySource
 }
 
 // NewDeliverProcessor constructs a DeliverProcessor.
@@ -146,6 +148,109 @@ func (p *DeliverProcessor) signingKey(kind, keyID, pem string, parse func(string
 	}
 	p.keyCache.Add(ck, k)
 	return k, nil
+}
+
+// SigningKeySource resolves a local user's signing keys at delivery time.
+// **payload に鍵を載せないため**に要る (`admin/queue/jobs` が job を
+// moderator へ返すので、載せると鍵がそこから読める)。
+type SigningKeySource interface {
+	// SigningKeyPEM returns the PEM for the given kind. kind は
+	// `keyKindRSA` / `keyKindEd25519` のいずれかで、**値は "rsa" / "ed"**
+	// (定数を見ずに "ed25519" と比較すると RSA 鍵が返り、Ed25519 署名が
+	// 壊れたうえ 4xx → degrade に化けて気付きにくい)。
+	//
+	// 鍵が無いときは `ErrSigningKeyMissing` を返す。**DB 障害など一時的な
+	// 失敗はそのまま error として返すこと** — 呼び出し元は前者だけ
+	// `ErrSkipRetry` に包み、後者は retry させる。取り違えると、障害の瞬間に
+	// 配送中だった job が恒久的に消える。
+	SigningKeyPEM(userID, kind string) (string, error)
+}
+
+// SetSigningKeySource attaches the resolver used when a payload carries no key.
+func (p *DeliverProcessor) SetSigningKeySource(s SigningKeySource) {
+	p.keySource = s
+}
+
+// HasSigningKeySource reports whether the resolver is wired.
+// **未配線だと全ての AP 配送が失敗する**ので criticalWiring 表で見る。
+func (p *DeliverProcessor) HasSigningKeySource() bool { return p.keySource != nil }
+
+// resolveSigningKey returns the parsed key for kind, preferring the payload's
+// inline PEM when present.
+//
+// **payload の PEM を先に見るのは移行のため。** この変更より前に積まれた job は
+// 鍵を持っている。新しい job は `SignerUserID` だけを持つので `keySource` から
+// 引く。どちらも `keyCache` でメモ化する — ap:deliver は inbox ごとに 1 job
+// なので、同一署名者への fan-out で毎回 DB と x509 parse を通さない (#1425)。
+func (p *DeliverProcessor) resolveSigningKey(kind string, payload queue.DeliverPayload) (*activitypub.PrivateKey, error) {
+	keyID, inline, parse := payload.KeyID, payload.KeyPEM, activitypub.NewPrivateKey
+	if kind == keyKindEd25519 {
+		keyID, inline, parse = payload.Ed25519KeyID, payload.Ed25519PrivPEM, activitypub.NewEd25519PrivateKey
+	}
+	if inline != "" {
+		k, err := p.signingKey(kind, keyID, inline, parse)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errSigningKeyInvalid, err)
+		}
+		return k, nil
+	}
+	if p.keySource == nil {
+		// **恒久扱いにしない。** 配線漏れは再起動で直るので、job を捨てるより
+		// retry させて運用者が気付ける形にする (criticalWiring 表でも見る)。
+		return nil, fmt.Errorf("no signing key source configured for %s", kind)
+	}
+	// **fetch に使う値 (SignerUserID) でメモ化する。** keyID を使うと、
+	// keyID が空の payload が 2 人分来たときに 2 人目が 1 人目の鍵で署名する。
+	// 現在の producer は必ず keyID を詰めるので到達しないが、秘密鍵の
+	// キャッシュで「引く値と別の値をキーにする」形は残さない。
+	//
+	// **鍵は通常運用で変わらない**
+	// (UserKeypairRepository は Create と FindByUserID しか持たず、更新は
+	// `NormalizePrivateKeysToPKCS8` の一回限りのバッチだけ。あれは同じ鍵の
+	// フォーマット変換なので、古い PEM が残っていても署名は正しい)。
+	// keyID も含める。`PrivateKey` は keyID を保持するので、`config.url` を
+	// 変えた直後に古い keyID を持つキャッシュ済みの鍵で署名しないため。
+	ck := kind + "\x00uid\x00" + payload.SignerUserID + "\x00" + keyID
+	if p.keyCache != nil {
+		if k, ok := p.keyCache.Get(ck); ok {
+			return k, nil
+		}
+	}
+	pem, err := p.keySource.SigningKeyPEM(payload.SignerUserID, kind)
+	if err != nil {
+		return nil, fmt.Errorf("load %s signing key: %w", kind, err)
+	}
+	if pem == "" {
+		return nil, fmt.Errorf("%w: kind=%s user=%s", ErrSigningKeyMissing, kind, payload.SignerUserID)
+	}
+	k, err := parse(keyID, pem)
+	if err != nil {
+		// PEM が壊れている。retry しても直らない。
+		return nil, fmt.Errorf("%w: %w", errSigningKeyInvalid, err)
+	}
+	if p.keyCache != nil {
+		p.keyCache.Add(ck, k)
+	}
+	return k, nil
+}
+
+// errSigningKeyInvalid marks a key that will never parse (retry は無意味)。
+var errSigningKeyInvalid = errors.New("signing key is not parsable")
+
+// isPermanentSigningKeyError reports whether retrying the job cannot help.
+//
+// **既定は「一時的」に倒す。** 判定を誤ったときの損失が非対称で、一時的な
+// ものを恒久と誤ると配送が消える (取り返せない) 一方、恒久的なものを一時と
+// 誤っても retry が 12 回空振りして failed になるだけだから。
+//
+// **既知の副作用**: アカウント削除は最後に `user_keypair` を FK CASCADE で
+// 消すので、`Delete(actor)` の配送が backoff 中だとその後の retry で鍵を引け
+// ず捨てられる。鍵を payload に載せていた頃は行が消えた後も再送できていた
+// (= best-effort の失敗モードが「遅れる」から「消える」に変わった)。同一
+// worker が既に署名していればキャッシュが救うが、再起動後や配送ノードが
+// 複数ある構成では救われない。
+func isPermanentSigningKeyError(err error) bool {
+	return errors.Is(err, ErrSigningKeyMissing) || errors.Is(err, errSigningKeyInvalid)
 }
 
 // SetRedis attaches a Redis client used to persist per-host Ed25519 degrade
@@ -284,12 +389,16 @@ func (p *DeliverProcessor) SetDeliveryTelemetry(t DeliveryTelemetry) {
 
 // hostFromInbox returns the host portion of an inbox URL, or "" if the URL is
 // not parseable. ResponseHook 通知用に共通化する。
+//
+// **正規化は federation 側の規則をそのまま使う。** この値は
+// `ShouldSkipDelivery` (blockedHosts / federationHosts / suspensionState) と
+// `instance.host` の lookup に渡るので、取り込み側 (`federation.hostFromURI`)
+// と同じ形でないと gate が空振りする。生の `u.Host` を返していた頃は
+// `https://blocked.example:443/inbox` が `blocked.example:443` になり、
+// dispatch 時の block 判定を素通りしていた。**規則をここへ写さないこと** —
+// 写した瞬間に片側だけ既定ポートを剥がす状態へ戻る。
 func hostFromInbox(inbox string) string {
-	u, err := url.Parse(inbox)
-	if err != nil {
-		return ""
-	}
-	return u.Host
+	return federation.NormalizeGateHost(inbox)
 }
 
 // recordSuccess is a best-effort wrapper that fires both the response
@@ -347,7 +456,7 @@ func (p *DeliverProcessor) Handle(_ context.Context, t driver.Task) error {
 	payload, err := queue.DecodeDeliverPayload(t.Payload())
 	if err != nil {
 		// payload が壊れているジョブは何度リトライしても無意味なのでスキップ。
-		return fmt.Errorf("decode deliver payload: %w: %w", err, driver.SkipRetry)
+		return fmt.Errorf("decode deliver payload: %w: %w", err, driver.ErrSkipRetry)
 	}
 
 	// deliverSuspendedSoftware: 対象インスタンスの software がリストに該当すればスキップ
@@ -367,7 +476,11 @@ func (p *DeliverProcessor) Handle(_ context.Context, t driver.Task) error {
 	// Ed25519 sign 経路: payload に Ed25519 鍵情報があり (= DeliverService が
 	// recipient capable と判定) かつ host が degrade flag に立っていない
 	// (= 過去 5min 以内に Ed25519 4xx 失敗がない) ときに試す (#1067 / #1071)。
-	useEd25519 := payload.Ed25519PrivPEM != "" && !p.isEd25519Degraded(host)
+	// **判定は KeyID で行う。** 鍵 PEM は payload に載らなくなったので
+	// (admin/queue/jobs から読めてしまうため)、PrivPEM の有無では判定できない。
+	// KeyID は DeliverService が「相手が FEP-521a で Ed25519 を expose して
+	// いる」と判断したときだけ詰める、という契約は変わっていない。
+	useEd25519 := (payload.Ed25519KeyID != "" || payload.Ed25519PrivPEM != "") && !p.isEd25519Degraded(host)
 
 	// 配送レイテンシの起点 (#2461)。sendOnce の中で Ed25519->RSA の再送が起きた
 	// 場合も含めて「この job が相手にかけた時間」を測る。
@@ -441,12 +554,12 @@ func (p *DeliverProcessor) Handle(_ context.Context, t driver.Task) error {
 		if payload.IsSharedInbox && resp.StatusCode == http.StatusGone {
 			p.recordGoneSuspended(payload.Inbox)
 		}
-		return fmt.Errorf("target gone (%d): %w", resp.StatusCode, driver.SkipRetry)
+		return fmt.Errorf("target gone (%d): %w", resp.StatusCode, driver.ErrSkipRetry)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		// #2106 N30: 429 は 4xx だが upstream status-error.ts では retryable
 		// (isRetryable = !isClientError || statusCode === 429)。rate-limited な配送先には
 		// backoff 付きで再試行する。「応答した」事実があるので isNotResponding は解除する
-		// (instance は健在で rate-limit しているだけ)。SkipRetry を付けず queue に retry させる。
+		// (instance は健在で rate-limit しているだけ)。ErrSkipRetry を付けず queue に retry させる。
 		slog.Warn("ap deliver: rate limited (429), will retry",
 			"inbox", payload.Inbox)
 		p.recordSuccess(payload.Inbox)
@@ -459,7 +572,7 @@ func (p *DeliverProcessor) Handle(_ context.Context, t driver.Task) error {
 			"inbox", payload.Inbox, "status", resp.StatusCode)
 		p.recordSuccess(payload.Inbox)
 		p.recordTelemetry(host, deliveryhealth.ClassClientError, resp.StatusCode, started, resp.Status)
-		return fmt.Errorf("client error (%d): %w", resp.StatusCode, driver.SkipRetry)
+		return fmt.Errorf("client error (%d): %w", resp.StatusCode, driver.ErrSkipRetry)
 	default:
 		// 5xx は受信側の一時的な障害。リトライさせる + 不調状態としてマーク。
 		slog.Warn("ap deliver: server error",
@@ -473,7 +586,7 @@ func (p *DeliverProcessor) Handle(_ context.Context, t driver.Task) error {
 // sendOnce performs one signed POST attempt. useEd25519=true なら
 // payload.Ed25519KeyID + Ed25519PrivPEM で sign、それ以外は RSA。鍵 parse 失敗
 // 時は (useEd25519=true ならば) RSA に fallback する。RSA 鍵自体が壊れている
-// 場合は driver.SkipRetry で投函を中止。
+// 場合は driver.ErrSkipRetry で投函を中止。
 //
 // 2 つ目の戻り値は「実際に Ed25519 で署名したか」。呼び出し元の useEd25519 とは
 // 一致しないことがある (鍵 parse 失敗で RSA に落ちた場合)。相手が Ed25519 を
@@ -481,7 +594,7 @@ func (p *DeliverProcessor) Handle(_ context.Context, t driver.Task) error {
 // 戻り値を見ること (#2393)。
 func (p *DeliverProcessor) sendOnce(payload queue.DeliverPayload, useEd25519 bool) (*http.Response, bool, error) {
 	if useEd25519 {
-		key, err := p.signingKey(keyKindEd25519, payload.Ed25519KeyID, payload.Ed25519PrivPEM, activitypub.NewEd25519PrivateKey)
+		key, err := p.resolveSigningKey(keyKindEd25519, payload)
 		if err == nil {
 			resp, perr := p.signer.PostSigned(payload.Inbox, payload.Body, key)
 			if perr != nil {
@@ -495,9 +608,19 @@ func (p *DeliverProcessor) sendOnce(payload queue.DeliverPayload, useEd25519 boo
 			"inbox", payload.Inbox, "err", err)
 		// fallthrough: RSA で sign
 	}
-	key, err := p.signingKey(keyKindRSA, payload.KeyID, payload.KeyPEM, activitypub.NewPrivateKey)
+	key, err := p.resolveSigningKey(keyKindRSA, payload)
 	if err != nil {
-		return nil, false, fmt.Errorf("parse private key: %w: %w", err, driver.SkipRetry)
+		// **一時的な失敗は retry させる。** 鍵を payload から外したことで、
+		// この分岐には DB 接続断・failover・pool 枯渇も合流するようになった。
+		// それを ErrSkipRetry に包むと、**障害の瞬間に配送中だった job が恒久的に
+		// 消える** (deliver は既定 12 回・約 32 時間かけて再送する設計)。
+		// 消えたことは相手サーバー側でしか分からない。
+		//
+		// 恒久的な失敗 (鍵が無い / PEM が壊れている) だけを ErrSkipRetry にする。
+		if isPermanentSigningKeyError(err) {
+			return nil, false, fmt.Errorf("parse private key: %w: %w", err, driver.ErrSkipRetry)
+		}
+		return nil, false, fmt.Errorf("load private key: %w", err)
 	}
 	resp, perr := p.signer.PostSigned(payload.Inbox, payload.Body, key)
 	if perr != nil {

@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/shiroha-a/mk/internal/api/apierr"
+	"github.com/shiroha-a/mk/internal/misc/colfit"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
@@ -40,6 +41,13 @@ func (h *Handler) Register(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.Endpoint == "" || req.Auth == "" || req.PublicKey == "" {
 		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "endpoint, auth, and publickey are required.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
 	}
+	// **列に入らない値はここで断る (#3025)。** 下の重複チェックは
+	// `IsNotFound` を「重複ではない」と読んで新規登録へ落ちるので、通すと
+	// INSERT が SQLSTATE 22021 で落ちて 500 になる。**書き込みも必ず失敗する値**
+	// なので「見つからない」に丸めてはいけない数少ない形。
+	if !colfit.Storable(req.Endpoint) || !colfit.Storable(req.Auth) || !colfit.Storable(req.PublicKey) {
+		return c.JSON(http.StatusBadRequest, apierr.Error("INVALID_PARAM", "endpoint, auth, and publickey must not contain an invalid character.", "ed1d7571-a3ac-4370-899c-0dbe5e230cc8"))
+	}
 
 	var swPublicKey *string
 	if m, err := h.metaRepo.Fetch(); err == nil {
@@ -52,6 +60,12 @@ func (h *Handler) Register(c echo.Context) error {
 	// 2-tuple (userId, endpoint) match だと stale キーのまま already-subscribed を
 	// 返して Web Push 配信が無言で壊れていた (#1775)。
 	existing, err := h.repo.FindByUserEndpointAuthKey(user.ID, req.Endpoint, req.Auth, req.PublicKey)
+	// **DB 障害で重複チェックを skip しない** (#2792)。`err == nil` だけを見ると、
+	// 接続断のときに下の新規登録へ落ちる。`sw_subscription` に unique index は
+	// 無いので**重複行が恒久的に残り、その端末へ web push が二重配信される**。
+	if err != nil && !repository.IsNotFound(err) {
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err == nil && existing != nil {
 		return c.JSON(http.StatusOK, map[string]any{
 			"state":           "already-subscribed",

@@ -65,6 +65,9 @@ func (r *noteReactionRepository) Delete(rec *model.NoteReaction) (int64, error) 
 }
 
 func (r *noteReactionRepository) FindByPair(userID, noteID string) (*model.NoteReaction, error) {
+	if !storable(userID) || !storable(noteID) {
+		return nil, ErrNotFound
+	}
 	var rec model.NoteReaction
 	if err := r.db.Where("\"userId\" = ? AND \"noteId\" = ?", userID, noteID).First(&rec).Error; err != nil {
 		return nil, err
@@ -91,6 +94,16 @@ func (r *noteReactionRepository) FindByUserAndNoteIDs(userID string, noteIDs []s
 // reaction string. Uses keyset pagination with paginationOrder (DESC by
 // default; ASC when only sinceID is supplied, upstream parity).
 func (r *noteReactionRepository) ListByNoteID(noteID string, untilID, sinceID string, limit int, reactions []string) ([]*model.NoteReaction, error) {
+	// 列に入らない値はどの行とも一致しえない (#3025)。**引く前に弾く** —
+	// 比較の右辺に載せるとクエリごと落ちて 500 になる。
+	//
+	// **`reactions` は `IN` = OR で畳むが、ここは要素ごとに落とさない。** 呼び出し元
+	// (`reaction.Service.List`) が渡すのは利用者が指定した 1 つの型の派生形だけなので、
+	// 要素ごとに落とすと**残り 0 件でフィルタが消えて全件返る**ほうへ倒れる。
+	// 「絞ったつもりで全部出る」より「一致しえないので空」が安全側。
+	if !storable(noteID) || !allStorable(reactions) {
+		return nil, nil
+	}
 	var rows []*model.NoteReaction
 	q := r.db.Preload("User").Where("\"noteId\" = ?", noteID)
 	if len(reactions) == 1 {
@@ -152,6 +165,26 @@ func (r *noteReactionRepository) ListByUserID(userID, viewerID, untilID, sinceID
 	// 無いので合わせて含めない)。
 	// 条件は core/note.CanSeeNote と一致 (#1454 で共通 helper に集約)。
 	q = applyViewerVisibilityExists(q, `"note_reaction"."noteId"`, viewerID)
+	// **凍結した利用者のノートを出さない。** upstream `users/reactions.ts` は
+	// `generateBlockedHostQueryForNote` と並べて
+	// `generateSuspendedUserQueryForNote` を掛けている。ここはリアクション先の
+	// ノートを返すので、その著者が凍結されていれば出さない。
+	//
+	// **著者だけでなく返信先 / リノート元の著者も見る。** upstream の
+	// `generateSuspendedUserQueryForNote` は `user` / `replyUser` / `renoteUser`
+	// の 3 つを見ており、`reactions.ts` もその 3 つを join している。著者しか
+	// 見ないと、**凍結した利用者のノートが「誰かの返信」として本文ごと出る**。
+	// `note` 側の `applySuspendedAuthorExclusion` と同じ 3 列。
+	suspendedAuthor := func(col string) string {
+		return `NOT EXISTS (SELECT 1 FROM "user" su WHERE su."id" = ` + col + ` AND su."isSuspended" = true)`
+	}
+	q = q.Where(`NOT EXISTS (
+		SELECT 1 FROM "note" sn
+		WHERE sn."id" = "note_reaction"."noteId"
+		  AND NOT (` +
+		suspendedAuthor(`sn."userId"`) +
+		` AND (sn."replyUserId" IS NULL OR ` + suspendedAuthor(`sn."replyUserId"`) + `)` +
+		` AND (sn."renoteUserId" IS NULL OR ` + suspendedAuthor(`sn."renoteUserId"`) + `)))`)
 	if untilID != "" {
 		q = q.Where("id < ?", untilID)
 	}

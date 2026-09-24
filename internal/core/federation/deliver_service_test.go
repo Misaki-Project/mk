@@ -50,7 +50,6 @@ func (s *stubEnqueuer) EnqueuePostScheduledNote(_ queue.PostScheduledNotePayload
 	return nil
 }
 func (s *stubEnqueuer) ClearScheduledNote(_ string) error { return nil }
-func (s *stubEnqueuer) SupportsScheduledNote() bool       { return true }
 
 func newDeliverService(t *testing.T) (*federation.DeliverService, *stubEnqueuer, *testutil.MockUserRepository, *testutil.MockFollowingRepository, *testutil.MockUserKeypairRepository) {
 	t.Helper()
@@ -151,8 +150,14 @@ func TestDeliverToUser_WithEd25519CapableRecipient_AddsEd25519Payload(t *testing
 	require.Len(t, enq.calls, 1)
 	got := enq.calls[0]
 	assert.Equal(t, "https://example.com/users/alice#ed25519-key", got.Ed25519KeyID)
-	assert.Equal(t, "PRIV-ED", got.Ed25519PrivPEM)
-	assert.Equal(t, "PEM-DATA", got.KeyPEM, "RSA も並行で詰められる (Processor 側 fallback 用)")
+	// **鍵そのものは payload に載せない** — `admin/queue/jobs` が job を
+	// moderator へ返すため。worker は SignerUserID から配送時に引く。
+	// Ed25519 を使うかの判定は Ed25519KeyID の有無で行う。
+	assert.Empty(t, got.Ed25519PrivPEM, "Ed25519 署名鍵は payload に載せない")
+	assert.Empty(t, got.KeyPEM, "RSA 署名鍵は payload に載せない")
+	assert.Equal(t, "alice", got.SignerUserID, "worker が鍵を引くための署名者")
+	assert.Equal(t, "https://example.com/users/alice#main-key", got.KeyID,
+		"RSA の keyID は fallback 用に並行で詰める")
 }
 
 // recipient が Ed25519 capable でない → payload に Ed25519 鍵情報なし
@@ -408,7 +413,9 @@ func TestDeliverActivity_EnqueuesUniqueInboxes(t *testing.T) {
 	assert.ElementsMatch(t, []string{"https://a.example/inbox", "https://b.example/inbox"}, got)
 	assert.Equal(t, body, enq.calls[0].Body)
 	assert.Equal(t, "https://example.com/users/alice#main-key", enq.calls[0].KeyID)
-	assert.Equal(t, "PEM-DATA", enq.calls[0].KeyPEM)
+	// 署名鍵は payload に載せず、worker が SignerUserID から引く。
+	assert.Empty(t, enq.calls[0].KeyPEM, "署名鍵は payload に載せない")
+	assert.Equal(t, "alice", enq.calls[0].SignerUserID)
 }
 
 func TestDeliverActivity_EmptyInboxes_NoEnqueue(t *testing.T) {
@@ -478,7 +485,12 @@ func TestDeliverToFollowers_ThreadsSharedInboxFlag(t *testing.T) {
 }
 
 // #1811: DeliverToUser は recipient の sharedInbox を IsSharedInbox=true にする。
-func TestDeliverToUser_ThreadsSharedInboxFlag(t *testing.T) {
+// **1:1 配送は個別 inbox を使う** (upstream の direct recipe と同じ)。
+//
+// sharedInbox へ送ると、(a) shared inbox で非公開 activity を扱わない実装で
+// DM や Follow が黙って落ち、(b) 410 Gone が `IsSharedInbox` 経由で host 単位の
+// gone 判定へ届き **1 通の失敗でインスタンス全体を suspend** しうる。
+func TestDeliverToUser_UsesIndividualInbox(t *testing.T) {
 	svc, enq, userRepo, _, keypairRepo := newDeliverService(t)
 	installLocalSigner(t, userRepo, keypairRepo)
 	host := "remote.example"
@@ -487,17 +499,32 @@ func TestDeliverToUser_ThreadsSharedInboxFlag(t *testing.T) {
 	recipient := &model.User{ID: "bob", Host: &host, SharedInbox: &shared, Inbox: &personal}
 	require.NoError(t, svc.DeliverToUser("alice", recipient, []byte(`{}`)))
 	require.Len(t, enq.calls, 1)
+	assert.Equal(t, personal, enq.calls[0].Inbox)
+	assert.False(t, enq.calls[0].IsSharedInbox,
+		"個別 inbox なので host 単位の gone 判定へ届かせないこと")
+}
+
+// **sharedInbox しか無い行はそこへ倒す** (upstream は skip するが、送れるなら
+// 送る方が利用者の意図に近い)。そのときは `IsSharedInbox` が立つ。
+func TestDeliverToUser_FallsBackToSharedInbox(t *testing.T) {
+	svc, enq, userRepo, _, keypairRepo := newDeliverService(t)
+	installLocalSigner(t, userRepo, keypairRepo)
+	host := "remote.example"
+	shared := "https://remote.example/inbox"
+	recipient := &model.User{ID: "bob", Host: &host, SharedInbox: &shared}
+	require.NoError(t, svc.DeliverToUser("alice", recipient, []byte(`{}`)))
+	require.Len(t, enq.calls, 1)
 	assert.Equal(t, shared, enq.calls[0].Inbox)
 	assert.True(t, enq.calls[0].IsSharedInbox)
 }
 
 func TestDeliverToFollowers_RepoError(t *testing.T) {
-	svc, _, userRepo, _, keypairRepo := newDeliverService(t)
+	_, _, userRepo, _, keypairRepo := newDeliverService(t)
 	installLocalSigner(t, userRepo, keypairRepo)
 	// failingFollowingRepo を使うため、独自構造を組み立てる
 	failing := &failingListInboxesRepo{MockFollowingRepository: testutil.NewMockFollowingRepository()}
 	urls := activitypub.NewURLBuilder("https://example.com")
-	svc = federation.NewDeliverService(&stubEnqueuer{}, userRepo, failing, keypairRepo, urls)
+	svc := federation.NewDeliverService(&stubEnqueuer{}, userRepo, failing, keypairRepo, urls)
 	err := svc.DeliverToFollowers("alice", []byte(`{}`))
 	assert.Error(t, err)
 }
@@ -579,11 +606,11 @@ func TestDeliverToFollowersExcluding_ThreadsSharedInboxFlag(t *testing.T) {
 }
 
 func TestDeliverToFollowersExcluding_RepoError(t *testing.T) {
-	svc, _, userRepo, _, keypairRepo := newDeliverService(t)
+	_, _, userRepo, _, keypairRepo := newDeliverService(t)
 	installLocalSigner(t, userRepo, keypairRepo)
 	failing := &failingListInboxesRepo{MockFollowingRepository: testutil.NewMockFollowingRepository()}
 	urls := activitypub.NewURLBuilder("https://example.com")
-	svc = federation.NewDeliverService(&stubEnqueuer{}, userRepo, failing, keypairRepo, urls)
+	svc := federation.NewDeliverService(&stubEnqueuer{}, userRepo, failing, keypairRepo, urls)
 	err := svc.DeliverToFollowersExcluding("alice", []byte(`{}`), map[string]bool{"https://x/inbox": true})
 	assert.Error(t, err)
 }
@@ -602,6 +629,8 @@ func TestDeliverToUser_NilRecipient(t *testing.T) {
 	require.NoError(t, svc.DeliverToUser("alice", nil, []byte(`{}`)))
 }
 
+// 両方ある行では個別 inbox が選ばれる (上のテストと同じ不変条件を
+// DeliverToUser の呼び出し形で押さえる)。
 func TestDeliverToUser_RemoteWithSharedInbox(t *testing.T) {
 	svc, enq, userRepo, _, keypairRepo := newDeliverService(t)
 	installLocalSigner(t, userRepo, keypairRepo)
@@ -611,7 +640,7 @@ func TestDeliverToUser_RemoteWithSharedInbox(t *testing.T) {
 	rem := &model.User{ID: "r1", Username: "r", Host: &host, SharedInbox: &shared, Inbox: &inbox}
 	require.NoError(t, svc.DeliverToUser("alice", rem, []byte(`{}`)))
 	require.Len(t, enq.calls, 1)
-	assert.Equal(t, shared, enq.calls[0].Inbox)
+	assert.Equal(t, inbox, enq.calls[0].Inbox)
 }
 
 func TestDeliverToUser_RemoteFallbackToInbox(t *testing.T) {

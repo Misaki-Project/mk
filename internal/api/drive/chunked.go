@@ -2,7 +2,6 @@ package drive
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -122,8 +121,16 @@ func (h *Handler) FilesCreateChunkedAppend(c echo.Context) error {
 	if err != nil || index < 0 {
 		return apierr.JSONInvalidParam(c)
 	}
-	chunk, err := readMultipartChunk(c)
+	// **セッションの上限を読む前に引く (#3037 レビュー)。** `AppendChunk` は
+	// `size > sess.ChunkSize` を拒否するが、そこへ届く時点でチャンクは全部
+	// メモリに載っている。body limit はこの経路で 33MiB なので、既定 10MiB の
+	// セッションでも 1 リクエストあたり 33MiB を確保させられていた。
+	maxChunk, _ := h.svc.SessionChunkSize(user, uploadID)
+	chunk, err := readMultipartChunk(c, maxChunk)
 	if err != nil {
+		if errors.Is(err, coredrive.ErrInvalidChunkSize) {
+			return h.chunkedError(c, err)
+		}
 		return apierr.JSONInvalidParam(c)
 	}
 
@@ -166,17 +173,31 @@ func (h *Handler) FilesCreateChunkedAbort(c echo.Context) error {
 
 // readMultipartChunk extracts the chunk bytes from the "chunk" form field.
 // テスト用に差し替え可能にするのは readMultipartFile と同じ理由。
-var readMultipartChunk = func(c echo.Context) ([]byte, error) {
+var readMultipartChunk = func(c echo.Context, maxBytes int64) ([]byte, error) {
 	fileHeader, err := c.FormFile("chunk")
 	if err != nil {
 		return nil, err
 	}
-	src, err := fileHeader.Open()
+	// 申告が上限を超えていれば開かない (`readMultipartFile` と同じ形)。
+	if maxBytes > 0 && fileHeader.Size > maxBytes {
+		return nil, coredrive.ErrInvalidChunkSize
+	}
+	// `openMultipartFile` を通す (`readMultipartFile` と同じ差し替え口)。
+	src, err := openMultipartFile(fileHeader)
 	if err != nil {
 		return nil, err
 	}
 	defer src.Close()
-	return io.ReadAll(src)
+	body, err := readAtMost(src, maxBytes)
+	if err != nil {
+		if errors.Is(err, coredrive.ErrMaxFileSizeExceeded) {
+			// **チャンクの上限超過は `ErrInvalidChunkSize`。**
+			// `AppendChunk` が同じ条件で返すエラーに揃える。
+			return nil, coredrive.ErrInvalidChunkSize
+		}
+		return nil, err
+	}
+	return body, nil
 }
 
 // chunkedError maps core errors to Misskey-shaped responses.
@@ -233,7 +254,10 @@ func (h *Handler) chunkedError(c echo.Context, err error) error {
 		return c.JSON(http.StatusBadRequest, apierr.Error("UNALLOWED_FILE_TYPE",
 			"Cannot upload the file because it is an unallowed file type.",
 			"4becd248-7f2c-48c4-a9f0-75edc4f9a1ea"))
-	case errors.Is(err, coredrive.ErrMaxFileSizeExceeded):
+	// **`ErrUndecodableImage` も 413 に寄せる (#3037 レビュー 2 周目)。**
+	// 新しい wire コードを足すとフロントエンドに分岐が無く汎用の失敗になる。
+	// 実際「大きすぎて安全に処理できない」なので意味も近い。
+	case errors.Is(err, coredrive.ErrMaxFileSizeExceeded), errors.Is(err, coredrive.ErrUndecodableImage):
 		return c.JSON(http.StatusRequestEntityTooLarge, apierr.Error("MAX_FILE_SIZE_EXCEEDED", "Max file size exceeded.", "b9d8c348-33f0-4673-b9a9-5d4da058977a"))
 	case errors.Is(err, coredrive.ErrNoFreeSpace):
 		return c.JSON(http.StatusBadRequest, apierr.Error("NO_FREE_SPACE", "No free space.", "d08dbc37-a6a9-463a-8c47-96c32ab5f064"))

@@ -7,10 +7,9 @@ package moderatoractivity
 
 import (
 	"log/slog"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/shiroha-a/mk/internal/l10n"
 	"github.com/shiroha-a/mk/internal/model"
 )
 
@@ -176,49 +175,35 @@ func (s *Service) Check() error {
 	return nil
 }
 
-// verifiedEmails returns the verified email addresses of the given moderators.
-func (s *Service) verifiedEmails(mods []*model.User) []string {
-	if s.profiles == nil {
+type verifiedRecipient struct {
+	email string
+	lang  string
+}
+
+func (s *Service) instanceLangs() []string {
+	if s.meta == nil {
 		return nil
 	}
-	ids := make([]string, 0, len(mods))
-	for _, m := range mods {
-		ids = append(ids, m.ID)
-	}
-	profiles, err := s.profiles.FindProfilesByUserIDs(ids)
-	if err != nil {
-		slog.Warn("checkModeratorsActivity: load profiles failed", "err", err)
+	meta, err := s.meta.Fetch()
+	if err != nil || meta == nil {
 		return nil
 	}
-	emails := make([]string, 0, len(profiles))
-	for _, p := range profiles {
-		if p.EmailVerified && p.Email != nil && *p.Email != "" {
-			emails = append(emails, *p.Email)
-		}
-	}
-	return emails
+	return l10n.LangsFromMeta(meta)
 }
 
 // notifyInactiveModeratorsWarning emails moderators and dispatches the warning
 // SystemWebhook (upstream notifyInactiveModeratorsWarning).
 func (s *Service) notifyInactiveModeratorsWarning(mods []*model.User, remainingDays, remainingHours int) {
-	subject := "Moderator Inactivity Warning / モデレーター不在の通知"
-	timeVariant := formatRemaining(remainingDays, remainingHours, false)
-	timeVariantJa := formatRemaining(remainingDays, remainingHours, true)
-	body := joinLines(
-		"To moderators,",
-		"",
-		"A moderator has been inactive for a period of time. If there are "+timeVariant+" of inactivity left, it will switch to invitation only.",
-		"If you do not want it to switch to invitation only, log in to Misskey to update your last active date.",
-		"",
-		"To モデレーター各位",
-		"",
-		"モデレーターが一定期間活動していないようです。あと"+timeVariantJa+"活動していない状態が続くと招待制に切り替わります。",
-		"招待制に切り替わることを望まない場合は、Misskeyにログインして最終アクティブ日時を更新してください。",
-	)
+	profileByUser := s.profilesByUserID(mods)
+	metaLangs := s.instanceLangs()
 	if s.sendEmail != nil {
-		for _, email := range s.verifiedEmails(mods) {
-			s.sendEmail(email, subject, body)
+		for _, m := range mods {
+			recipient := s.verifiedRecipientFor(m, profileByUser, metaLangs)
+			if recipient == nil {
+				continue
+			}
+			subject, body := l10n.ModeratorInactivityWarning(recipient.lang, remainingDays, remainingHours)
+			s.sendEmail(recipient.email, subject, body)
 		}
 	}
 	if s.webhook != nil {
@@ -235,21 +220,13 @@ func (s *Service) notifyInactiveModeratorsWarning(mods []*model.User, remainingD
 // moderators and dispatches the invitation-only SystemWebhook (upstream
 // notifyChangeToInvitationOnly).
 func (s *Service) notifyChangeToInvitationOnly(mods []*model.User) {
-	subject := "Change to Invitation-Only / 招待制に変更されました"
-	body := joinLines(
-		"To moderators,",
-		"",
-		"Changed to invitation only because no moderator activity was detected for 7 days.",
-		"To turn off invitation only, you need to access the control panel.",
-		"",
-		"To モデレーター各位",
-		"",
-		"モデレーターの活動が7日間検出されなかったため、招待制に変更されました。",
-		"招待制を解除するには、コントロールパネルにアクセスする必要があります。",
-	)
+	profileByUser := s.profilesByUserID(mods)
+	metaLangs := s.instanceLangs()
 
 	if s.announce != nil && s.idGen != nil {
 		for _, m := range mods {
+			lang := s.langForModerator(m, profileByUser, metaLangs)
+			subject, body := l10n.ModeratorInvitationOnlyChanged(lang, inactivityLimitDays)
 			uid := m.ID
 			a := &model.Announcement{
 				ID:                     s.idGen.Generate(s.now()),
@@ -268,8 +245,13 @@ func (s *Service) notifyChangeToInvitationOnly(mods []*model.User) {
 		}
 	}
 	if s.sendEmail != nil {
-		for _, email := range s.verifiedEmails(mods) {
-			s.sendEmail(email, subject, body)
+		for _, m := range mods {
+			recipient := s.verifiedRecipientFor(m, profileByUser, metaLangs)
+			if recipient == nil {
+				continue
+			}
+			subject, body := l10n.ModeratorInvitationOnlyChanged(recipient.lang, inactivityLimitDays)
+			s.sendEmail(recipient.email, subject, body)
 		}
 	}
 	if s.webhook != nil {
@@ -277,21 +259,45 @@ func (s *Service) notifyChangeToInvitationOnly(mods []*model.User) {
 	}
 }
 
-// formatRemaining mirrors upstream timeVariant: "{hours} hours" when days==0,
-// else "{days} days" (Japanese variant when ja=true).
-func formatRemaining(days, hours int, ja bool) string {
-	if days == 0 {
-		if ja {
-			return strconv.Itoa(hours) + "時間"
-		}
-		return strconv.Itoa(hours) + " hours"
+func (s *Service) profilesByUserID(mods []*model.User) map[string]*model.UserProfile {
+	if s.profiles == nil {
+		return nil
 	}
-	if ja {
-		return strconv.Itoa(days) + "日間"
+	ids := make([]string, 0, len(mods))
+	for _, m := range mods {
+		ids = append(ids, m.ID)
 	}
-	return strconv.Itoa(days) + " days"
+	rows, err := s.profiles.FindProfilesByUserIDs(ids)
+	if err != nil {
+		slog.Warn("checkModeratorsActivity: load profiles failed", "err", err)
+		return nil
+	}
+	out := make(map[string]*model.UserProfile, len(rows))
+	for _, p := range rows {
+		out[p.UserID] = p
+	}
+	return out
 }
 
-func joinLines(lines ...string) string {
-	return strings.Join(lines, "\n")
+func (s *Service) langForModerator(m *model.User, profiles map[string]*model.UserProfile, metaLangs []string) string {
+	if profiles != nil {
+		if p := profiles[m.ID]; p != nil {
+			return l10n.Resolve(p.Lang, metaLangs)
+		}
+	}
+	return l10n.Resolve(nil, metaLangs)
+}
+
+func (s *Service) verifiedRecipientFor(m *model.User, profiles map[string]*model.UserProfile, metaLangs []string) *verifiedRecipient {
+	if profiles == nil {
+		return nil
+	}
+	p := profiles[m.ID]
+	if p == nil || !p.EmailVerified || p.Email == nil || *p.Email == "" {
+		return nil
+	}
+	return &verifiedRecipient{
+		email: *p.Email,
+		lang:  l10n.Resolve(p.Lang, metaLangs),
+	}
 }

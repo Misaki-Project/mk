@@ -29,7 +29,7 @@ import (
 )
 
 // makeSyncDeliverHook builds a synchronous AP deliver function for tests
-// (#780). 本番経路は asynq queue 経由だが test では queue worker pickup
+// (#780). 本番経路は queue 経由だが test では queue worker pickup
 // が確認できないので、sign + HTTP POST を inline 実行する。
 //
 // HTTP client は SSRF transport を含めない (e2e は loopback で localhost
@@ -180,7 +180,7 @@ func TestMain(m *testing.M) {
 	}
 	tsA.Start()
 	defer tsA.Close()
-	// reversi 等の deliver queue 経由のテスト用に asynq worker を起動
+	// reversi 等の deliver queue 経由のテスト用に queue worker を起動
 	// (#435)。Server.Start() は HTTP listener も込みで動かしてしまうので、
 	// e2e は test 側で listener を握る都合上 background 部分だけ起動する。
 	if err := srvA.StartBackgroundForTest(); err != nil {
@@ -271,8 +271,10 @@ func createSecondDB(primaryDB *gorm.DB) (*gorm.DB, error) {
 	// testcontainers の接続文字列はホスト名:ポートが動的なので、
 	// primaryDB の接続情報を流用して dbname だけ差し替える
 	var host, port string
-	sqlDB.QueryRow("SELECT inet_server_addr()").Scan(&host)
-	sqlDB.QueryRow("SELECT inet_server_port()").Scan(&port)
+	// host は下のフォールバックが効く。port は失敗すると空のまま DSN に入るが、
+	// 変更前と同じ挙動なのでここでは扱いを変えない。
+	_ = sqlDB.QueryRow("SELECT inet_server_addr()").Scan(&host)
+	_ = sqlDB.QueryRow("SELECT inet_server_port()").Scan(&port)
 	if host == "" {
 		host = "127.0.0.1"
 	}

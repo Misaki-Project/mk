@@ -24,6 +24,10 @@ func (r *Resolver) UpsertAttachments(docs []activitypub.Document, userID, host *
 	return r.upsertAttachments(docs, userID, host)
 }
 
+// SetProbeBudget shrinks the per-document image-probe budget so tests do not
+// have to burn attachmentProbeBudget of wall clock.
+func (r *Resolver) SetProbeBudget(d time.Duration) { r.probeBudget = d }
+
 // CollectAttachedFileTypes exposes the unexported collectAttachedFileTypes for external tests.
 func (r *Resolver) CollectAttachedFileTypes(fileIDs []string) []string {
 	return r.collectAttachedFileTypes(fileIDs)
@@ -36,12 +40,12 @@ var ExtractMentionTags = extractMentionTags
 var MergeMentionIDs = mergeMentionIDs
 
 // ResolveMentionedUserIDs exposes the unexported resolveMentionedUserIDs for external tests.
-func (r *Resolver) ResolveMentionedUserIDs(hrefs []string) []string {
+func (r *Resolver) ResolveMentionedUserIDs(hrefs []string) ([]string, error) {
 	return r.resolveMentionedUserIDs(hrefs)
 }
 
 // ResolveTextMentionUserIDs exposes the unexported resolveTextMentionUserIDs for external tests.
-func (r *Resolver) ResolveTextMentionUserIDs(mentions []corenote.Mention) []string {
+func (r *Resolver) ResolveTextMentionUserIDs(mentions []corenote.Mention) ([]string, error) {
 	return r.resolveTextMentionUserIDs(mentions)
 }
 
@@ -62,3 +66,8 @@ func (r *Resolver) KeyFetchFailureCount() int {
 
 // MarkKeyFetchFailed exposes markKeyFetchFailed for external tests.
 func (r *Resolver) MarkKeyFetchFailed(userID string) { r.markKeyFetchFailed(userID) }
+
+// FeaturedPinLimit exposes the pin cap so external tests do not hardcode it.
+// **同じ値を push 側 (`handleAdd`) と pull 側 (`resolveFeaturedNotes`) が使う**
+// ので、片方だけ変えたらテストが落ちる形にしておく。
+const FeaturedPinLimit = featuredPinLimit

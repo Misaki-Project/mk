@@ -387,8 +387,8 @@ func TestWantsXRD(t *testing.T) {
 		{"application/jrd+json", false},
 		{"application/json", false}, // jrd の sibling は match しない -> JRD (else 分岐)
 		{"application/xrd+xml", true},
-		{"*/*", false}, // tie -> jrd 優先
-		{"application/xrd+xml, application/jrd+json", false},            // 両 q=1 tie -> jrd
+		{"*/*", false},                                       // tie -> jrd 優先
+		{"application/xrd+xml, application/jrd+json", false}, // 両 q=1 tie -> jrd
 		{"application/xrd+xml;q=0.9, application/jrd+json;q=0.5", true}, // xrd 優勢
 		{"application/jrd+json;q=0.9, application/xrd+xml;q=0.5", false},
 		{"application/json, application/xrd+xml", true}, // xrd だけが match
@@ -426,4 +426,56 @@ func TestPreflight(t *testing.T) {
 	assert.Equal(t, "GET, OPTIONS", rec.Header().Get("Access-Control-Allow-Methods"))
 	assert.Equal(t, "*", rec.Header().Get("Access-Control-Allow-Origin"))
 	assert.Equal(t, "Vary", rec.Header().Get("Access-Control-Expose-Headers"))
+}
+
+// --- upstream PR 17901: W3C "A Well-Known URL for Changing Passwords" ---
+
+// パスワードマネージャは 302 の Location しか見ないので、絶対 URL であることを
+// 固定する (upstream は config.url 基準の絶対 URL を返す)。
+func TestChangePassword_RedirectsToSettingsSecurity(t *testing.T) {
+	h, _ := newHandler(t)
+	c, rec := newReq(t, "/.well-known/change-password")
+	require.NoError(t, h.ChangePassword(c))
+	assert.Equal(t, http.StatusFound, rec.Code)
+	assert.Equal(t, "https://example.com/settings/security", rec.Header().Get("Location"))
+	// **global CORS middleware は `/.well-known/` を Skipper で除外している**ので、
+	// handler が付けないとヘッダがゼロになる。upstream は plugin scope の onRequest
+	// hook で 4 つとも付く。
+	assert.Equal(t, "*", rec.Header().Get("Access-Control-Allow-Origin"))
+	assert.Equal(t, "GET, OPTIONS", rec.Header().Get("Access-Control-Allow-Methods"))
+	assert.Equal(t, "Accept", rec.Header().Get("Access-Control-Allow-Headers"))
+	assert.Equal(t, "Vary", rec.Header().Get("Access-Control-Expose-Headers"))
+}
+
+// federation='none' でも 302 を返す。upstream が 403 にするのは host-meta /
+// host-meta.json / nodeinfo / webfinger の 4 本だけで、パスワード変更導線は
+// 連合の可否と無関係。
+func TestChangePassword_NotGatedByFederation(t *testing.T) {
+	h, _ := newHandlerWithFederation(t, "none")
+	c, rec := newReq(t, "/.well-known/change-password")
+	require.NoError(t, h.ChangePassword(c))
+	assert.Equal(t, http.StatusFound, rec.Code)
+	assert.Equal(t, "https://example.com/settings/security", rec.Header().Get("Location"))
+}
+
+// /.well-known/nodeinfo は内容が origin だけから決まる静的文書なので、
+// 未認証 crawler の 1 hit ごとに origin まで届かせない。同ファイルの
+// WebFinger が `public, max-age=180` を返すのに、ここだけ Cache-Control が
+// 無かった。
+func TestNodeInfoDiscovery_CacheControl(t *testing.T) {
+	h, _ := newHandler(t)
+	c, rec := newReq(t, "/.well-known/nodeinfo")
+	require.NoError(t, h.NodeInfoDiscovery(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "public, max-age=600", rec.Header().Get("Cache-Control"))
+}
+
+// 403 (federation=none) には Cache-Control を付けない。付けると連合を
+// 有効に戻したあとも中継が 403 を配り続ける。
+func TestNodeInfoDiscovery_NoCacheControlWhenForbidden(t *testing.T) {
+	h, _ := newHandlerWithFederation(t, "none")
+	c, rec := newReq(t, "/.well-known/nodeinfo")
+	require.NoError(t, h.NodeInfoDiscovery(c))
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Empty(t, rec.Header().Get("Cache-Control"))
 }

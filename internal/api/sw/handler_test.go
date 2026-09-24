@@ -15,6 +15,7 @@ import (
 
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 )
 
@@ -333,4 +334,49 @@ func TestUnregister_InvalidParam(t *testing.T) {
 	h, _ := newTestHandler()
 	rec := post(h.Unregister, `{}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// failingSWRepo makes every subscription lookup look like a database failure.
+type failingSWRepo struct {
+	repository.SwSubscriptionRepository
+	err error
+}
+
+func (r *failingSWRepo) FindByUserEndpointAuthKey(_, _, _, _ string) (*model.SwSubscription, error) {
+	return nil, r.err
+}
+
+// **DB 障害で重複チェックを skip しない** (#2792)。
+//
+// `sw_subscription` に unique index は無いので、skip すると**重複行が恒久的に
+// 残り、その端末へ web push が二重配信される**。
+func TestRegister_DBFailureIsNot2xx(t *testing.T) {
+	swKey := "test-sw-key"
+	metaRepo := &mockMetaRepo{meta: &model.Meta{SwPublicKey: &swKey}}
+	idGen, _ := id.NewGenerator("aidx")
+	h := NewHandler(&failingSWRepo{
+		SwSubscriptionRepository: newMockSwRepo(),
+		err:                      errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"),
+	}, metaRepo, idGen)
+
+	rec := post(h.Register, `{"endpoint":"https://push.example/e","auth":"a","publickey":"k"}`, &model.User{ID: "u1"})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code,
+		"DB 障害で重複チェックが skip されている (#2792)")
+}
+
+// **列に入らない値は 400 (#3025)。** ここは「見つからない」に丸めてはいけない
+// 数少ない形 — 下の重複チェックは `IsNotFound` を「重複ではない」と読んで
+// 新規登録へ進むので、通すと INSERT が SQLSTATE 22021 で落ちて 500 になる。
+func TestRegister_RejectsUnstorableValues(t *testing.T) {
+	for _, body := range []string{
+		`{"endpoint":"a\u0000b","auth":"a1","publickey":"pk1"}`,
+		`{"endpoint":"https://push.example/1","auth":"a\u0000b","publickey":"pk1"}`,
+		`{"endpoint":"https://push.example/1","auth":"a1","publickey":"p\u0000k"}`,
+	} {
+		h, repo := newTestHandler()
+		rec := post(h.Register, body, &model.User{ID: "u1"})
+		assert.Equal(t, http.StatusBadRequest, rec.Code,
+			"列に入らない値を INSERT へ流している: %s", rec.Body.String())
+		assert.Empty(t, repo.subs, "弾いたはずの値で行を作っている")
+	}
 }

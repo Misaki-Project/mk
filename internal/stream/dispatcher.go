@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"container/list"
 	"encoding/json"
 	"log/slog"
 	"sync"
@@ -11,8 +12,10 @@ import (
 // PubSubBus is the minimal pubsub interface that Dispatcher needs. core/event.
 // PubSubService がこれを満たす。reference counting は Dispatcher 側で行う。
 type PubSubBus interface {
-	Subscribe(topic string, handler func([]byte))
-	Unsubscribe(topic string)
+	// Subscribe returns the function that removes this handler again.
+	// **トピック名で解除しない** — 同じトピックを複数の接続が購読するので、
+	// 名前で閉じると他人の購読まで止まる (#H-4)。
+	Subscribe(topic string, handler func([]byte)) func()
 }
 
 // channelEntry holds an active per-connection channel subscription with its
@@ -53,6 +56,34 @@ type NoteVisibilityChecker interface {
 // exhaustion を防ぐ。
 const maxChannelsPerConnection = 32
 
+// maxTopicsPerConnection は 1 WebSocket 接続が保持できる distinct な pubsub
+// トピック数の上限。
+//
+// **チャンネル単位の上限だけでは足りない。** ハッシュタグのチャンネルは
+// 1 つで最大 32 トピックを購読でき (`maxHashtagTopics`)、チャンネルは
+// 1 接続に 32 個まで作れるので、**1 本の接続から distinct な Redis 購読を
+// 1024 個**開ける。`PubSubService` は distinct トピックごとに Redis へ
+// 接続を張るので、`/streaming` を数本開くだけで valkey の `maxclients` に
+// 届き、インスタンス全体が新規接続を拒否する。**`/streaming` は未認証で
+// 張れて接続数の上限も無い。**
+//
+// 128 は「普通の利用者が同時に開く数」より十分大きい — upstream の
+// フロントエンドが張るのは HTL / LTL / STL / GTL / 通知 / メイン +
+// 開いているタブ分で、実測でも 20 を超えない。
+const maxTopicsPerConnection = 128
+
+// maxNoteSubsPerConnection は 1 接続が保持できる subNote (ノート単位の購読)
+// の上限。超えたら**最も古く購読したものから外す** (LRU)。
+//
+// subNote も noteStream:<id> を 1 トピックとして購読するので、上限が無いと
+// maxTopicsPerConnection と同じ理由で Redis の接続を無制限に増やせる。
+// 公開ノートは未認証でも購読できるので、可視性の確認は歯止めにならない。
+// upstream も 1 接続あたりの件数に上限を設けて古いものから外す。値が upstream
+// (1536) より小さいのは、mk-go は購読 1 件ごとに Redis の接続を張るため。
+// フロントエンドは画面に出したノートを購読するので、流れて見えなくなった
+// ものから外れるだけで、表示中のノートの更新は届き続ける。
+const maxNoteSubsPerConnection = 128
+
 // 1 つの Connection に対して 1 つの Dispatcher がぶら下がり、複数の Channel
 // を保持する。pubsub の global subscription 管理は Manager の Router (K-4)
 // に集約するため、Dispatcher は per-channel の subscribe/unsubscribe API を
@@ -65,10 +96,16 @@ type Dispatcher struct {
 	mu       sync.RWMutex
 	channels map[string]*channelEntry   // channel id → entry
 	topics   map[string]map[string]bool // topic → set of channel ids
+	// **bus の解除は名前ではなくハンドルで行う。** 同じトピックを別の接続も
+	// 購読しているので、名前で閉じると他人の購読まで止まる (#H-4)。
+	busCancels map[string]*pendingCancel // topic → この Dispatcher の購読を外す枠
 
 	// subNote の refcount 管理 (noteID → count)
 	noteSubMu      sync.Mutex
 	noteSubs       map[string]int
+	noteCancels    map[string]*pendingCancel // noteID → 購読解除の枠
+	noteOrder      *list.List                // 購読した順 (先頭が最も古い)。値は noteID
+	noteElems      map[string]*list.Element  // noteID → noteOrder の要素
 	notifReader    NotificationReader
 	noteVisibility NoteVisibilityChecker
 }
@@ -77,12 +114,16 @@ type Dispatcher struct {
 // bus が nil の場合、対応する操作は no-op になる (テスト用)。
 func NewDispatcher(conn *Connection, registry *Registry, bus PubSubBus) *Dispatcher {
 	return &Dispatcher{
-		conn:     conn,
-		registry: registry,
-		bus:      bus,
-		channels: make(map[string]*channelEntry),
-		topics:   make(map[string]map[string]bool),
-		noteSubs: make(map[string]int),
+		conn:        conn,
+		registry:    registry,
+		bus:         bus,
+		channels:    make(map[string]*channelEntry),
+		topics:      make(map[string]map[string]bool),
+		busCancels:  make(map[string]*pendingCancel),
+		noteSubs:    make(map[string]int),
+		noteCancels: make(map[string]*pendingCancel),
+		noteOrder:   list.New(),
+		noteElems:   make(map[string]*list.Element),
 	}
 }
 
@@ -300,8 +341,8 @@ func (d *Dispatcher) removeChannel(id string) {
 		d.mu.RLock()
 		stillUsed := len(d.topics[t]) > 0
 		d.mu.RUnlock()
-		if !stillUsed && d.bus != nil {
-			d.bus.Unsubscribe(t)
+		if !stillUsed {
+			d.cancelTopic(t)
 		}
 	}
 	if entry.channel != nil {
@@ -323,17 +364,65 @@ func (d *Dispatcher) CloseAll() {
 	}
 	// noteStream の Redis subscription もクリーンアップ
 	d.noteSubMu.Lock()
-	noteIDs := make([]string, 0, len(d.noteSubs))
-	for noteID := range d.noteSubs {
-		noteIDs = append(noteIDs, noteID)
-	}
-	d.noteSubs = make(map[string]int)
-	d.noteSubMu.Unlock()
-	if d.bus != nil {
-		for _, noteID := range noteIDs {
-			d.bus.Unsubscribe("noteStream:" + noteID)
+	cancels := make([]func(), 0, len(d.noteCancels))
+	// **全ての枠に印を残す。** `noteSubs` に無い枠 (購読の確立中) も含めて
+	// 回らないと、直後に埋まったハンドルが残る。
+	for _, slot := range d.noteCancels {
+		if c := slot.take(); c != nil {
+			cancels = append(cancels, c)
 		}
 	}
+	d.noteSubs = make(map[string]int)
+	d.noteCancels = make(map[string]*pendingCancel)
+	d.noteOrder = list.New()
+	d.noteElems = make(map[string]*list.Element)
+	d.noteSubMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+}
+
+// pendingCancel is the slot that holds the unsubscribe handle for one topic
+// while the subscription is being established.
+//
+// **枠をロック内で先に置く。** `bus.Subscribe` は Redis へ dial するので
+// ロックの外で呼ぶしかないが、その隙間に解除 (`CloseAll` / `unsubscribe`) が
+// 走ると、**まだ空のマップを見て「解除するものは無い」と判断し、直後に
+// 書き込まれたハンドルが誰にも呼ばれなくなる** — ハンドラと Redis 購読が
+// プロセス寿命まで残る。`CloseAll` は読み取りループ以外の goroutine
+// (送信キュー満杯・書き込み失敗・`Manager.Shutdown`) からも呼ばれるので、
+// 読み取り側だけを見ても防げない。
+type pendingCancel struct {
+	cancel   func()
+	canceled bool
+}
+
+// resolve stores the handle, or invokes it immediately when the slot was
+// already canceled while the subscription was being established.
+// 呼び出しはロックの外で行うこと (cancel は pubsub 側のロックを取る)。
+func (p *pendingCancel) resolve(cancel func(), mu sync.Locker) {
+	mu.Lock()
+	if p.canceled {
+		mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return
+	}
+	p.cancel = cancel
+	mu.Unlock()
+}
+
+// take marks the slot canceled and returns the handle to invoke, if it has
+// already arrived. 呼び出し側はロックを保持していること。
+func (p *pendingCancel) take() func() {
+	if p == nil {
+		return nil
+	}
+	p.canceled = true
+	c := p.cancel
+	p.cancel = nil
+	return c
 }
 
 // subscribe registers a topic for a channel id and ensures the bus is listening.
@@ -354,12 +443,27 @@ func (d *Dispatcher) subscribe(channelID, topic string) {
 		set = map[string]bool{}
 		d.topics[topic] = set
 	}
+	// **接続あたりの上限。** チャンネル単位の上限だけでは、ハッシュタグの
+	// ように 1 チャンネルで多数のトピックを購読するものを積まれると
+	// `maxChannelsPerConnection` 倍まで増える。
+	if !exists && len(d.topics) > maxTopicsPerConnection {
+		delete(d.topics, topic)
+		delete(entry.topics, topic)
+		d.mu.Unlock()
+		return
+	}
 	set[channelID] = true
 	first := !exists
+	var slot *pendingCancel
+	if first && d.bus != nil {
+		slot = &pendingCancel{}
+		d.busCancels[topic] = slot
+	}
 	d.mu.Unlock()
 
-	if first && d.bus != nil {
-		d.bus.Subscribe(topic, func(payload []byte) { d.fanout(topic, payload) })
+	if slot != nil {
+		cancel := d.bus.Subscribe(topic, func(payload []byte) { d.fanout(topic, payload) })
+		slot.resolve(cancel, &d.mu)
 	}
 }
 
@@ -384,8 +488,22 @@ func (d *Dispatcher) unsubscribe(channelID, topic string) {
 	}
 	d.mu.Unlock()
 
-	if last && d.bus != nil {
-		d.bus.Unsubscribe(topic)
+	if last {
+		d.cancelTopic(topic)
+	}
+}
+
+// cancelTopic removes this dispatcher's bus handler for topic, if any.
+//
+// **解除はロックの外で呼ぶ。** cancel は pubsub 側のロックを取るので、
+// Dispatcher のロックを持ったまま呼ぶとロック順序が交差する。
+func (d *Dispatcher) cancelTopic(topic string) {
+	d.mu.Lock()
+	cancel := d.busCancels[topic].take()
+	delete(d.busCancels, topic)
+	d.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -533,15 +651,52 @@ func (d *Dispatcher) handleSubNote(body json.RawMessage) {
 	}
 	topic := "noteStream:" + req.ID
 	d.noteSubMu.Lock()
+	// 新しいノートで上限に達していたら、最も古く購読したものを外す。
+	var evicted func()
+	if _, ok := d.noteSubs[req.ID]; !ok && len(d.noteSubs) >= maxNoteSubsPerConnection {
+		evicted = d.evictOldestNoteSubLocked()
+	}
 	d.noteSubs[req.ID]++
-	first := d.noteSubs[req.ID] == 1
+	if e, ok := d.noteElems[req.ID]; ok {
+		d.noteOrder.MoveToBack(e)
+	} else {
+		d.noteElems[req.ID] = d.noteOrder.PushBack(req.ID)
+	}
+	var slot *pendingCancel
+	if d.noteSubs[req.ID] == 1 && d.bus != nil {
+		slot = &pendingCancel{}
+		d.noteCancels[req.ID] = slot
+	}
 	d.noteSubMu.Unlock()
+	if evicted != nil {
+		evicted()
+	}
 
-	if first && d.bus != nil {
-		d.bus.Subscribe(topic, func(payload []byte) {
+	if slot != nil {
+		cancel := d.bus.Subscribe(topic, func(payload []byte) {
 			d.forwardNoteEvent(req.ID, payload)
 		})
+		slot.resolve(cancel, &d.noteSubMu)
 	}
+}
+
+// evictOldestNoteSubLocked drops the least recently subscribed note and
+// returns its bus cancel (nil if none), to be called after unlocking.
+// Caller must hold noteSubMu.
+func (d *Dispatcher) evictOldestNoteSubLocked() func() {
+	front := d.noteOrder.Front()
+	if front == nil {
+		return nil
+	}
+	id := front.Value.(string)
+	d.noteOrder.Remove(front)
+	delete(d.noteElems, id)
+	delete(d.noteSubs, id)
+	// 購読の確立中 (resolve 前) の枠でも take が印を残すので、後から埋まった
+	// ハンドルはその場で外れる (CloseAll と同じ)。
+	cancel := d.noteCancels[id].take()
+	delete(d.noteCancels, id)
+	return cancel
 }
 
 // handleUnsubNote decrements the refcount for a note subscription and
@@ -553,7 +708,6 @@ func (d *Dispatcher) handleUnsubNote(body json.RawMessage) {
 	if err := json.Unmarshal(body, &req); err != nil || req.ID == "" {
 		return
 	}
-	topic := "noteStream:" + req.ID
 	d.noteSubMu.Lock()
 	count, ok := d.noteSubs[req.ID]
 	if !ok {
@@ -563,9 +717,15 @@ func (d *Dispatcher) handleUnsubNote(body json.RawMessage) {
 	count--
 	if count <= 0 {
 		delete(d.noteSubs, req.ID)
+		if e, ok := d.noteElems[req.ID]; ok {
+			d.noteOrder.Remove(e)
+			delete(d.noteElems, req.ID)
+		}
+		cancel := d.noteCancels[req.ID].take()
+		delete(d.noteCancels, req.ID)
 		d.noteSubMu.Unlock()
-		if d.bus != nil {
-			d.bus.Unsubscribe(topic)
+		if cancel != nil {
+			cancel()
 		}
 		return
 	}

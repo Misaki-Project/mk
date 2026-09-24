@@ -470,6 +470,68 @@ func TestPromotePending_WithoutApplicationUnaffected(t *testing.T) {
 	assert.False(t, res.SignupApplicationCompleted)
 }
 
+// 承認制が有効なら、申請に紐付かない pending は昇格させない (#2804)。実 DB 経路。
+//
+// `PendingSignupTTL` は 30 分なので、承認制へ切り替える直前 30 分に発行された確認
+// メールがここに来る。申請 ID を持たないので settleApplicationTx (#2576) を通らず、
+// ゲートが無いと**承認を経ていないローカルアカウント**ができる。
+//
+// ゲートは tx に入る前に返るので**巻き戻すものは無い**。それでも user 行を数えるのは、
+// ゲートを消したり後ろへ動かしたりすると行ができることを検出するため。
+func TestPromotePending_ApprovalRequiredRejectsUnappliedPendingTx(t *testing.T) {
+	db := integrationDB(t)
+	const prefix = "itgate_"
+	defer cleanupSignupRows(t, db, prefix)
+
+	// meta は pointer で渡るので、pending を作った後にフラグを立てられる。
+	meta := &model.Meta{ID: "x"}
+	svc := newTxServiceWithMeta(t, db, meta)
+
+	// 切り替え前に発行された確認メールを再現する (承認制 OFF のうちに作る)。
+	pending, err := svc.CreatePending(prefix+"late", "gate-late@example.com", "hunter22", nil)
+	require.NoError(t, err)
+
+	meta.ApprovalRequiredForSignup = true
+
+	_, err = svc.PromotePending(pending.Code)
+	require.ErrorIs(t, err, signup.ErrApplicationNotApproved)
+
+	var count int64
+	require.NoError(t, db.Model(&model.User{}).
+		Where(`"usernameLower" = ?`, prefix+"late").Count(&count).Error)
+	assert.Equal(t, int64(0), count, "承認を経ないアカウントを作らない")
+
+	// pending は残す。承認制を戻した運用者が状況を追えるようにする。
+	var pendingCount int64
+	require.NoError(t, db.Model(&model.UserPending{}).
+		Where("id = ?", pending.ID).Count(&pendingCount).Error)
+	assert.Equal(t, int64(1), pendingCount)
+}
+
+// 承認制が有効でも、承認済みの申請に紐付く pending は従来どおり通る (#2804)。
+func TestPromotePending_ApprovalRequiredStillAllowsApprovedApplication(t *testing.T) {
+	db := integrationDB(t)
+	const prefix = "itgateok_"
+	defer cleanupSignupRows(t, db, prefix)
+	defer db.Exec(`DELETE FROM "signup_application" WHERE id LIKE ?`, prefix+"%")
+
+	svc := newTxServiceWithMeta(t, db, &model.Meta{ID: "x", ApprovalRequiredForSignup: true})
+
+	app := insertApprovedApplication(t, db, prefix+"app1")
+	appID := app.ID
+	pending, err := svc.CreatePendingForApplication(prefix+"ok", "gate-ok@example.com", "hunter22", nil, &appID)
+	require.NoError(t, err)
+
+	res, err := svc.PromotePending(pending.Code)
+	require.NoError(t, err)
+	assert.True(t, res.SignupApplicationCompleted)
+
+	var count int64
+	require.NoError(t, db.Model(&model.User{}).
+		Where(`"usernameLower" = ?`, prefix+"ok").Count(&count).Error)
+	assert.Equal(t, int64(1), count)
+}
+
 // 申請行が消えていたら通さない。**「見つからない = 承認されていない」に倒す** —
 // 承認の裏付けが無いままアカウントを作らない。
 func TestPromotePending_MissingApplicationIsRejected(t *testing.T) {
@@ -645,7 +707,12 @@ func TestSignupForApplication_RejectsUnusableApplication(t *testing.T) {
 	assert.Equal(t, int64(0), count)
 }
 
-// ticket を渡すと申請に記録される (即時作成でも監査が追える)。
+// ticket を渡すと申請に記録される。
+//
+// **#2813 以降、この引数に非空を渡す本番の呼び出しは無い** (唯一の呼び出し元である
+// 即時作成が `""` を渡す)。メール確認の経路は `SignupForApplication` を通らず、
+// `promotePendingTx` → `settleApplicationTx` が `lockedTicketID` で同じ記録をする。
+// 引数の意味自体は生きているのでここで固定しておく。
 func TestSignupForApplication_RecordsTicket(t *testing.T) {
 	db := integrationDB(t)
 	const prefix = "itimmtkt_"
@@ -750,4 +817,43 @@ func newTxServiceWithMeta(t *testing.T, db *gorm.DB, meta *model.Meta) *signup.S
 	svc.SetSignupApplicationRepo(repository.NewSignupApplicationRepository(db))
 	svc.SetDB(db)
 	return svc
+}
+
+// 申請経由の tx 経路も最小文字数を受ける (#3015)。
+//
+// **mock だけでは踏めない。** db / appRepo が未配線だと
+// `SignupForApplication` は `Signup` へ委譲する fallback に入るので、
+// tx 経路に置いた guard を外しても unit test は緑のまま通る (変異検証で実測)。
+func TestSignupForApplication_RejectsUsernameShorterThanMinimum(t *testing.T) {
+	db := integrationDB(t)
+	const prefix = "itmul_"
+	defer cleanupSignupRows(t, db, prefix)
+	defer db.Exec(`DELETE FROM "signup_application" WHERE id LIKE ?`, prefix+"%")
+
+	svc := newTxServiceWithMeta(t, db, &model.Meta{ID: "x", MinimumUsernameLength: 12})
+	app := insertApprovedApplication(t, db, prefix+"app1")
+
+	// prefix (6) + "short" = 11 文字で n-1。
+	short := prefix + "short"
+	require.Len(t, short, 11)
+	_, err := svc.SignupForApplication(short, "hunter22", app.ID, "")
+	require.ErrorIs(t, err, signup.ErrUsernameTooShort)
+
+	var count int64
+	require.NoError(t, db.Model(&model.User{}).
+		Where(`"usernameLower" = ?`, short).Count(&count).Error)
+	assert.Equal(t, int64(0), count, "弾いたのにアカウントを作っている")
+
+	// **申請は消費されていないこと。** 弾いた時点で tx が始まっていれば
+	// 巻き戻るはずで、消費されていたら承認が 1 回無駄になる。
+	var stored model.SignupApplication
+	require.NoError(t, db.Where("id = ?", app.ID).First(&stored).Error)
+	assert.Equal(t, model.SignupApplicationApproved, stored.Status)
+
+	// 境界の上側は通る。**弾きすぎていないことを見る。**
+	long := prefix + "longenough"
+	require.Len(t, long, 16)
+	res, err := svc.SignupForApplication(long, "hunter22", app.ID, "")
+	require.NoError(t, err)
+	assert.Equal(t, long, res.User.Username)
 }

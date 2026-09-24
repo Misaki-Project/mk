@@ -166,6 +166,18 @@ func (a *AuthMiddleware) Authenticate() echo.MiddlewareFunc {
 	}
 }
 
+// IsSuspendedRequest reports whether the request carried a valid token whose
+// account is suspended. Handlers that do their own credential check (instead of
+// RequireAuth) need this to keep the 403 YOUR_ACCOUNT_SUSPENDED behaviour that
+// credentialRequiredResponse provides.
+//
+// upstream ApiCallService も suspended は 403 にするので、endpoint 固有の
+// CREDENTIAL_REQUIRED を返す handler でも suspended だけは 403 に分ける必要がある。
+func IsSuspendedRequest(c echo.Context) bool {
+	v, _ := c.Get(string(suspendedContextKey)).(bool)
+	return v
+}
+
 // credentialRequiredResponse writes the error for a credential-required gate
 // when GetUser is nil: 403 YOUR_ACCOUNT_SUSPENDED when the request carried a
 // valid token for a suspended account (upstream ApiCallService.ts、#1559)、else
@@ -285,6 +297,32 @@ func RequireScope(kind string) echo.MiddlewareFunc {
 				}
 			}
 			return c.JSON(http.StatusForbidden, apierr.PermissionDenied())
+		}
+	}
+}
+
+// RejectAppToken denies requests authenticated with a third-party app access
+// token. Native login tokens and unauthenticated requests pass through.
+//
+// **`kind` を宣言できない経路のための受け皿 (#3037)。** upstream の
+// `ApiCallService.ts:412-413` は「`kind` が無く、かつ資格情報を要する
+// endpoint」に対し app token を**一律で拒否**する。`RequireScope` が
+// 「`kind` があるとき」の半分で、こちらが残りの半分にあたる。
+//
+// プラグインのルートがこれを要る側になる — 本体は plugin が何を要求するか
+// 知らないので `kind` を決められず、`RequireScope` を配線できない。**gate を
+// 置かないと、`read:account` だけを許可した第三者アプリのトークンで
+// `POST /api/plugin/<name>/...` に到達できる**。プラグインが doc どおり
+// `req.IsModerator()` で守っていても scope は効かず、そこから
+// `ctx.API().AsUser(req.UserID())` (= 対象利用者の native token) 経由で
+// `i/change-password` のような endpoint へ抜けられる。
+func RejectAppToken() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if sc := GetAuthScope(c); sc != nil && sc.IsApp {
+				return c.JSON(http.StatusForbidden, apierr.PermissionDenied())
+			}
+			return next(c)
 		}
 	}
 }

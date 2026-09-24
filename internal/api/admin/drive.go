@@ -11,8 +11,11 @@ import (
 	"github.com/shiroha-a/mk/internal/entity"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
+	"github.com/shiroha-a/mk/internal/repository"
 	"github.com/shiroha-a/mk/internal/server/middleware"
 	"gorm.io/datatypes"
+
+	"github.com/shiroha-a/mk/internal/core/role"
 )
 
 // driveCleanupBatchSize はバルク削除の 1 バッチ件数。upstream の cursor 巡回
@@ -43,11 +46,13 @@ func (h *Handler) DriveCleanRemoteFiles(c echo.Context) error {
 		return c.NoContent(http.StatusNoContent)
 	}
 	if h.storageDeleter == nil {
-		// storage 未配線: DB 行のみ削除 (condition は isLink=false に修正済)。
-		_, _ = h.driveFileRepo.DeleteRemoteCache()
+		// storage 未配線: DB 行を link に倒すだけ (実体はそもそも無い)。
+		_, _ = h.driveFileRepo.ExpireRemoteCache()
 		return c.NoContent(http.StatusNoContent)
 	}
-	if err := h.deleteFilesBatched(c, h.driveFileRepo.ListRemoteCache); err != nil {
+	// **行は消さず link に倒す** (#3102)。upstream と同じ動作で、消すと
+	// `note.fileIds` の指す先が無くなり過去の投稿から添付が黙って消える。
+	if err := h.cleanupFilesBatched(c, h.driveFileRepo.ListRemoteCache, h.driveFileRepo.ExpireByIDs); err != nil {
 		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
 	}
 	return c.NoContent(http.StatusNoContent)
@@ -64,6 +69,20 @@ func (h *Handler) DriveCleanRemoteFiles(c echo.Context) error {
 // ようにする。list / DeleteByIDs (= DB) の失敗は hard error として返し、handler が
 // 500 を返す (DB-only 経路の 500 と整合)。
 func (h *Handler) deleteFilesBatched(c echo.Context, list func(limit int) ([]*model.DriveFile, error)) error {
+	return h.cleanupFilesBatched(c, list, h.driveFileRepo.DeleteByIDs)
+}
+
+// cleanupFilesBatched is deleteFilesBatched with the terminal DB operation
+// parameterised: `finish` either deletes the rows or turns them into link rows.
+//
+// **リモートキャッシュの掃除だけ link に倒す** (#3102)。利用者のファイルを消す
+// ほう (`delete-all-files-of-a-user`) は今までどおり行ごと消す — あちらは
+// 「その利用者のファイルを消す」が目的で、行を残す理由が無い。
+//
+// **`finish` が行を消さない場合、list が同じ行を返し続けない形であること。**
+// link に倒すと `isLink = false` の条件から外れるので `ListRemoteCache` は
+// 次のバッチを返す (消す場合と同じ)。
+func (h *Handler) cleanupFilesBatched(c echo.Context, list func(limit int) ([]*model.DriveFile, error), finish func(ids []string) (int64, error)) error {
 	for i := 0; i < driveCleanupMaxBatches; i++ {
 		files, err := list(driveCleanupBatchSize)
 		if err != nil {
@@ -78,8 +97,8 @@ func (h *Handler) deleteFilesBatched(c echo.Context, list func(limit int) ([]*mo
 			h.deleteFileStorageObjects(c, f)
 			ids = append(ids, f.ID)
 		}
-		if _, err := h.driveFileRepo.DeleteByIDs(ids); err != nil {
-			slog.ErrorContext(c.Request().Context(), "drive cleanup: DeleteByIDs failed", "err", err)
+		if _, err := finish(ids); err != nil {
+			slog.ErrorContext(c.Request().Context(), "drive cleanup: finish failed", "err", err)
 			return err
 		}
 		if len(files) < driveCleanupBatchSize {
@@ -190,7 +209,10 @@ func (h *Handler) DriveFiles(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 	// sinceDate / untilDate を aidx prefix に正規化 (#1173)。
-	sinceID, untilID := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	sinceID, untilID, cursorOK := id.NormalizeCursor(req.SinceID, req.UntilID, req.SinceDate, req.UntilDate)
+	if !cursorOK {
+		return apierr.JSONInvalidParam(c)
+	}
 	// userId に @system が指定されたら system file 専用 listing を返す。
 	// origin / host filter は**無視する** (upstream も userId 指定時は読まない)。
 	// この一覧は local (userHost IS NULL) に限定してあるので、origin=remote を
@@ -269,6 +291,10 @@ func (h *Handler) DriveShowFile(c echo.Context) error {
 	viewer := middleware.GetUser(c)
 	if req.FileID != "" {
 		file, err := h.driveFileRepo.FindByID(req.FileID)
+		if err != nil && !repository.IsNotFound(err) {
+			// **DB 障害を not-found に丸めない** (#2792)。
+			return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+		}
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, apierr.Error("NO_SUCH_FILE", "No such file.", "caf3ca38-c6e5-472e-a30c-b05377dcc240"))
 		}
@@ -290,12 +316,17 @@ func (h *Handler) DriveShowFile(c echo.Context) error {
 }
 
 // packAdminDriveShowFile builds the upstream-compatible admin/drive/show-file
-// response shape. `requestIp` は viewer が moderator のときのみ含め (= 通常
-// admin endpoint は moderator gate されているので常に true 経路だが、防御的
-// に check)、`requestHeaders` は viewer が moderator AND owner が
-// moderator でない場合のみ含める (upstream: モデレーターの個人情報を他の
-// モデレーターから守る制限)。両 field とも `nil` で omit せず明示 null を
-// emit する (upstream の `optional: false, nullable: true` schema 通り)。
+// response shape.
+//
+// `requestIp` は viewer が moderator **かつ `canSearchIpHistory` を持つ**
+// ときだけ含める。**upstream より厳しい** (あちらは moderator であれば返す) —
+// mk-go は IP の閲覧を role policy で絞る仕組みを持っており、`admin/ip/*` が
+// それを要求するのにここだけ素通しだと迂回路になる (`docs/divergence.md`)。
+// `requestHeaders` は上記に加えて owner が moderator でない場合のみ含める
+// (upstream: モデレーターの個人情報を他のモデレーターから守る制限)。
+//
+// 両 field とも `nil` で omit せず明示 null を emit する (upstream の
+// `optional: false, nullable: true` schema 通り)。
 func (h *Handler) packAdminDriveShowFile(f *model.DriveFile, viewer *model.User) map[string]any {
 	// リモートファイルの url/thumbnailUrl/webpublicUrl は外部 URL なので、admin が
 	// drive 一覧を開いただけで moderator の IP が連合先へ漏洩する (issue #1529)。
@@ -341,15 +372,42 @@ func (h *Handler) packAdminDriveShowFile(f *model.DriveFile, viewer *model.User)
 	}
 	// gating: 通常 admin route は moderator/admin gate 済だが、防御的 check。
 	viewerIsModerator := viewer != nil && h.roleService != nil && h.roleService.IsModerator(viewer.ID)
-	if viewerIsModerator {
+	// **IP を出してよいのは `canSearchIpHistory` を持つ相手だけ。**
+	//
+	// #3114 が `admin/show-user` の signin IP に入れたのと同じ条件。あちらだけ
+	// 絞ると、同じ種類の情報 (ローカル利用者の接続元 IP) を素のモデレーター
+	// 権限だけで全件返す口がここに残り、policy が門として成立しない。
+	// `admin/drive/files` に userId を渡してファイル ID を列挙すれば、
+	// アップロード元 IP の履歴がそのまま取れる。
+	//
+	// `HasRolePolicy` は管理者を短絡するので、既定 (policy false) の構成では
+	// 管理者だけが通る = `admin/ip/*` と同じ条件になる。
+	// **roleService 未配線なら伏せる側へ倒す** (fail-closed)。
+	showIPs := viewerIsModerator && h.roleService != nil && viewer != nil &&
+		h.roleService.HasRolePolicy(viewer.ID, role.PolicyCanSearchIPHistory)
+	if showIPs {
 		resp["requestIp"] = f.RequestIP
 		// owner が moderator のときは headers を隠す (upstream 仕様、
 		// モデレーター同士の互いの個人情報保護)。
-		ownerIsModerator := false
-		if f.UserID != nil && *f.UserID != "" && h.roleService != nil {
-			ownerIsModerator = h.roleService.IsModerator(*f.UserID)
+		//
+		// **判定できないときは隠す側に倒す (#3037 レビュー 2 周目)。**
+		// `IsModerator` は判定できないときに false を返すので、素で使うと
+		// `ListByUser` が一時的に失敗する窓で他のモデレーターの
+		// `requestHeaders` が出る。隠して困るのは表示が減ることだけ。
+		ownerIsModerator := true
+		if f.UserID == nil || *f.UserID == "" {
+			ownerIsModerator = false
+		} else if h.roleService != nil {
+			if _, mod, err := h.roleService.RolePrivileges(*f.UserID); err == nil {
+				ownerIsModerator = mod
+			}
+		} else {
+			ownerIsModerator = false
 		}
 		if !ownerIsModerator {
+			// **ヘッダにも接続元 IP が載る。** 本番構成の nginx は
+			// `x-real-ip` / `x-forwarded-for` を必ず付けるので、
+			// `requestIp` だけ絞ってもここから同じ値が読める。
 			resp["requestHeaders"] = driveFileRequestHeaders(f.RequestHeaders)
 		}
 	}

@@ -10,15 +10,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/shiroha-a/mk/internal/entity"
+	"github.com/shiroha-a/mk/internal/misc/colfit"
 	"github.com/shiroha-a/mk/internal/misc/id"
+	"github.com/shiroha-a/mk/internal/misc/imagedecode"
 	"github.com/shiroha-a/mk/internal/model"
 	"github.com/shiroha-a/mk/internal/repository"
+	"github.com/shiroha-a/mk/internal/safehttp"
 	"github.com/shiroha-a/mk/internal/safemath"
+	"golang.org/x/sync/semaphore"
 	"gorm.io/datatypes"
 
 	"github.com/shiroha-a/mk/internal/core/role"
@@ -54,6 +58,16 @@ var (
 	// the user's `maxFileSizeMb` role policy (#1029 PR-2). Handler maps this
 	// to upstream's `MAX_FILE_SIZE_EXCEEDED` 400 response.
 	ErrMaxFileSizeExceeded = errors.New("max file size exceeded")
+
+	// ErrUndecodableImage is returned when an image cannot be decoded and
+	// therefore cannot have its metadata stripped.
+	//
+	// **代替画像の生成は best-effort だが、この形だけは例外 (#3037 レビュー
+	// 2 周目)。** webpublic が作られないと `GetPublicURL` が原本を指すので、
+	// **EXIF の GPS がそのまま公開側へ出る** — この PR が別の経路で塞いだ穴と
+	// 同じもの。しかも同じ理由で `NormalizeImageForDetection` も失敗するので、
+	// センシティブ判定が fail-open で `false` を返す。作れないなら受け取らない。
+	ErrUndecodableImage = errors.New("image cannot be decoded, so its metadata cannot be stripped")
 	// ErrNoFreeSpace is returned when the user's current drive usage plus the
 	// new file size exceeds `driveCapacityMb` (#1029 PR-2). Handler maps this
 	// to upstream's `NO_FREE_SPACE` 400 response. remote user の場合 upstream
@@ -89,13 +103,43 @@ func policyMegabytes(v any) (int64, bool) {
 	return safemath.MulFloat64(mb, 1024*1024), mb > 0
 }
 
+// MaxUploadBytes reports the `maxFileSizeMb` role policy for a user, in bytes.
+//
+// **読み切る前に見るためのもの (#3037)。** `Upload` の中にも同じ判定がある
+// が、あそこに届く時点で**本体はすでに全部メモリに載っている**。既定では
+// policy が 30MB なのに `config.maxFileSize` が 250MB なので、
+// 「30MB しか保存できない利用者が 250MB を送り付けてメモリを確保させる」
+// ことができた。handler が先にこれを引いて、超える分は読まずに落とす。
+//
+// ok=false は「上限なし」(policy 未設定 / 0 以下 / system file / role が
+// 未配線)。判定できないときに勝手な上限を作らないための形で、`Upload` 側の
+// `policyMegabytes` の ok と同じ意味。
+func (s *Service) MaxUploadBytes(user *model.User) (int64, bool) {
+	// system file (user == nil) と remote user は `Upload` 側でも gate の
+	// 対象外なので、ここでも上限を作らない。
+	if user == nil || !user.IsLocal() || s.roleChecker == nil {
+		return 0, false
+	}
+	policies := s.roleChecker.GetUserPolicies(user.ID)
+	if policies == nil {
+		return 0, false
+	}
+	return policyMegabytes(policies["maxFileSizeMb"])
+}
+
 // ValidateFileName mirrors upstream DriveFileEntityService.validateFileName:
 // the trimmed name must be non-empty, at most 200 characters, and must not
 // contain a backslash, a slash, or "..". 長さは JS の String.length (UTF-16)
 // に対し rune 数で近似する (upload-from-url の comment 512 判定と同方針)。
+//
+// **NUL と不正な UTF-8 もここで落とす (#3037)。** `drive_file.name` は
+// varchar なので、そのまま INSERT / UPDATE すると PostgreSQL が SQLSTATE 22021
+// でクエリごと落とし、**認証済みの利用者が 1 文字で 500 を起こせる**。
+// #3022 と同じく**既存の述語に畳んで既存の 400 に落とす** — 利用者にできること
+// は変わらないので、wire に新しいエラーコードを足さない。
 func ValidateFileName(name string) bool {
 	return strings.TrimSpace(name) != "" &&
-		utf8.RuneCountInString(name) <= 200 &&
+		colfit.Fits(name, 200) &&
 		!strings.Contains(name, "\\") &&
 		!strings.Contains(name, "/") &&
 		!strings.Contains(name, "..")
@@ -189,6 +233,50 @@ type Service struct {
 	// objectDeleteEnqueuer は object storage の実体削除を queue に逃がす
 	// (#2325)。nil なら従来どおり同期削除にフォールバックする。
 	objectDeleteEnqueuer ObjectDeleteEnqueuer
+	// mediaSlots は画像 / 動画処理の同時実行枠。**構築時に必ず埋める**
+	// (`NewService`)。nil のまま使うと枠が無いのと同じになる。
+	mediaSlots *semaphore.Weighted
+	// mediaSlotCap は mediaSlots の容量。semaphore.Weighted は容量を公開
+	// しないので、テストと自己検査のために持っておく。
+	mediaSlotCap int
+}
+
+// defaultMediaProcessingConcurrency is how many uploads may decode at once.
+//
+// **枠が無いと確保量を掛け算できた。** `processImage` は寸法 / blurhash /
+// サムネイル / webpublic で**順に 4 回デコードする**ため、GC が前の 1 枚を
+// 返す前に次を確保しうる。認証済みの利用者が並行アップロードを投げるだけで
+// それを人数分重ねられた (`semaphore` / `Acquire(` の grep が 0 件だった)。
+//
+// **1 枠あたりの最悪値は 1GB 級 (#3037 レビュー 2 周目で実測)。**
+// drive が渡すのは `imagedecode.MaxPixels` (64MP) ではなく
+// `UpstreamMaxPixels` (0x3FFF^2 = 268MP) — upstream に揃える判断で、
+// 厳しくすると 102MP の実写真が webpublic を失い EXIF の GPS が公開側へ
+// 出るため (`imagedecode.go` 参照)。16383x16383 の全画素ゼロ PNG は
+// **764 KiB** で作れて `UpstreamMaxPixels` にちょうど一致するので上限を
+// 通り抜け、8 core / 32GB の実測で `processImage` の 4 段を通すと
+// **ピーク RSS 2.23 GiB / 13.6 秒**だった (デコード単体で TotalAlloc 768MiB)。
+//
+// **バイト予算はこの帯を縛らない。** 確保量の判定は
+// `画素数 x 1 画素あたりのバイト数 > 上限画素数 x 4` なので、8bit 画像には
+// 「宣言寸法の cap と同じ」判定にしかならない (16bit 画像を縛るための段)。
+//
+// **枠の本数はこの最悪値を前提にしていない。** 値と根拠は media proxy の枠
+// (#3032) から採っており、あちらは 64MP の cap で測っている。2GB の VPS は
+// `GOMAXPROCS / 2 = 1` なので、764 KiB のアップロード 1 本で RAM を使い切り
+// うる。`GOMEMLIMIT` の設定はリポジトリに無い (grep 0 件)。**残存リスクとして
+// `docs/divergence.md` に記録してある。**
+//
+// **値と根拠は media proxy の枠 (#3032) と同じ。** 同じデコーダで同じ中間
+// バッファを確保するので、あちらの実測 (8 core / AVIF / c=8 で peak RSS が
+// 枠 1 → 131MB、2 → 409MB、4 → 636MB、8 → 995MB、無制限 → 959MB) がそのまま
+// 当てはまる。GOMAXPROCS 全部にすると無制限と区別が付かず枠を持つ意味が無い。
+// 詳細は `internal/core/mediaproxy/cpulimit.go`。
+func defaultMediaProcessingConcurrency() int {
+	if n := runtime.GOMAXPROCS(0) / 2; n > 0 {
+		return n
+	}
+	return 1
 }
 
 // ObjectDeleteEnqueuer queues the removal of one object storage object.
@@ -290,6 +378,138 @@ func (s *Service) storageFor(f *model.DriveFile) Storage {
 	return ResolveStorage(s.storage)
 }
 
+// ReadFileBody reads the stored bytes of f from whichever backend actually
+// holds it (#2966).
+//
+// **HTTP で自分の公開 URL を叩かない。** SSRF ガードと衝突するうえ、非公開
+// URL や内部向けの構成では取れず、DB 上の行と実体の対応も確かめられない。
+// `storageFor` は `storedInternal` を見るので、オブジェクトストレージへ
+// 移行する前に保存されたファイルもローカルから読める。
+//
+// max を超える本体は読まずにエラーにする (絵文字として複製する用途で、
+// 上限なしにすると 1 リクエストで任意サイズをメモリに載せられる)。
+func (s *Service) ReadFileBody(f *model.DriveFile, max int64) ([]byte, error) {
+	if f == nil {
+		return nil, ErrObjectNotFound
+	}
+	// **リンクは実体を持たない。** `isLink` の行は URL を指しているだけなので、
+	// storage から読めない (#2966 の複製はこの経路を使わない前提だが、
+	// 呼び出し側が増えたときに黙って空を返さないようにする)。
+	if f.IsLink {
+		return nil, ErrObjectNotFound
+	}
+	if f.AccessKey == nil || *f.AccessKey == "" {
+		return nil, ErrObjectNotFound
+	}
+	st := s.storageFor(f)
+	if st == nil {
+		return nil, ErrObjectNotFound
+	}
+	rc, err := st.Get(*f.AccessKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return safehttp.ReadAllLimit(rc, max)
+}
+
+// CopyToSystemFile duplicates src as a system-owned drive file (userId /
+// userHost NULL) and returns the copy (#2966).
+//
+// 元のファイルは読むだけで、移動も変更も削除もしない。所有権を移すと、ノートの
+// 添付やプロフィールで使っているファイルが利用者の drive から突然消える。
+//
+// **実体はストレージから直に読む。** 自分の公開 URL を HTTP で叩くと SSRF ガードと
+// 衝突し、非公開 URL の構成では取れず、DB 上の行と実体の対応も確かめられない。
+// `ReadFileBody` の `storageFor` が `storedInternal` を見るので、オブジェクト
+// ストレージへ移行する前に保存されたファイルもローカルから読める。
+//
+// max は読み出しの上限。**ここには既定値を置かない** — 用途ごとの上限を呼び出し側が
+// 1 箇所で定義できるようにするため (絵文字は core/emojiapplication の
+// MaxEmojiCopyBytes が唯一の定義で、申請側と承認側で食い違うと「申請はできたのに
+// 承認だけが恒久的に失敗する」サイズ帯が生まれる)。
+//
+// 実体が無い行 (isLink / accessKey 無し / ストレージから消えた) は
+// ErrObjectNotFound、上限超過は safehttp.ErrResponseTooLarge が `%w` で伝わるので、
+// 呼び出し側は errors.Is で種別を分けられる。
+func (s *Service) CopyToSystemFile(ctx context.Context, src *model.DriveFile, name string, sensitive bool, max int64) (*model.DriveFile, error) {
+	if src == nil {
+		return nil, fmt.Errorf("no source file")
+	}
+	body, err := s.ReadFileBody(src, max)
+	if err != nil {
+		return nil, fmt.Errorf("read source file: %w", err)
+	}
+
+	driveName := name
+	if driveName == "" {
+		driveName = src.Name
+	}
+	// **`User: nil` が system-owned の作り方。** 利用者に紐付けると、ロールの
+	// 変更やアカウント削除で巻き込まれる。`Force` は user==nil のとき dedup が
+	// 元から効かないので no-op だが、「重複しても新しいファイルを作る」契約を
+	// 読み手に示すために明示する。
+	df, err := s.Upload(ctx, UploadInput{
+		User:  nil,
+		Body:  body,
+		Name:  driveName,
+		Force: true,
+		// **センシティブの指定は引き継ぐ。** 元ファイルに印が無くても、呼び出し側
+		// (申請) が sensitive を指定していれば複製にも付ける。
+		IsSensitive: src.IsSensitive || sensitive,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("upload copy to drive: %w", err)
+	}
+	return df, nil
+}
+
+// IsSystemOwned reports whether f belongs to the instance itself rather than to
+// a local user or to a remote author.
+//
+// **条件は孤児 cleanup の guard (`orphanWhere`) と同じ。** あちらが
+// `"userId" IS NULL AND "userHost" IS NULL` を system 所有の定義にしているので、
+// ここで片方だけを見ると「cleanup からは守られないのに複製も要らない」と判定する
+// 行が生まれる。リモート由来の行 (`userHost` 非 NULL) は
+// `admin/drive/clean-remote-files` で消えるので system 所有ではない。
+func IsSystemOwned(f *model.DriveFile) bool {
+	return f != nil && f.UserID == nil && f.UserHost == nil
+}
+
+// PreferWebpublicURL returns f's webpublic URL when present, else its canonical
+// URL (upstream `webpublicUrl ?? url`).
+//
+// **絵文字の `originalUrl` にはこれを使わない。** drive の孤児 cleanup は
+// `emoji.originalUrl = drive_file.url` または `publicUrl = url` を参照保護の条件に
+// しているので、`originalUrl` に webpublic だけを入れると保護が外れて消される。
+func PreferWebpublicURL(f *model.DriveFile) string {
+	if f == nil {
+		return ""
+	}
+	if f.WebpublicURL != nil && *f.WebpublicURL != "" {
+		return *f.WebpublicURL
+	}
+	return f.URL
+}
+
+// PreferWebpublicType returns f's webpublic MIME when present, else its
+// canonical type (upstream `webpublicType ?? type`). Returned as a pointer so a
+// non-empty value lands in emoji.type and NULL when both are empty.
+func PreferWebpublicType(f *model.DriveFile) *string {
+	if f == nil {
+		return nil
+	}
+	if f.WebpublicType != nil && *f.WebpublicType != "" {
+		t := *f.WebpublicType
+		return &t
+	}
+	if f.Type != "" {
+		t := f.Type
+		return &t
+	}
+	return nil
+}
+
 // SetSensitiveDetection attaches the sensitive media detector and config.
 func (s *Service) SetSensitiveDetection(detector SensitiveDetector, cfg SensitiveConfig) {
 	s.sensitiveDetector = detector
@@ -327,11 +547,30 @@ func NewService(
 	idGen id.Generator,
 ) *Service {
 	return &Service{
-		fileRepo:   fileRepo,
-		folderRepo: folderRepo,
-		storage:    storage,
-		idGen:      idGen,
+		fileRepo:     fileRepo,
+		folderRepo:   folderRepo,
+		storage:      storage,
+		idGen:        idGen,
+		mediaSlots:   semaphore.NewWeighted(int64(defaultMediaProcessingConcurrency())),
+		mediaSlotCap: defaultMediaProcessingConcurrency(),
 	}
+}
+
+// SetMediaProcessingConcurrency resizes the image/video processing pool.
+//
+// n <= 0 は既定に戻す。**枠を無くす指定は用意しない** — 無制限にすると、
+// 認証済みの利用者が並行アップロードだけでプロセスを落とせる状態に戻る。
+//
+// **起動時専用。goroutine-safe ではない。** `mediaproxy.SetCPUConcurrency` と
+// 同じ理由で、リクエストを捌いている最中に呼ぶと (a) `acquireMediaSlot` の
+// 読みとの間でデータ競合になり、(b) 旧枠の保持者と新枠の容量で一瞬 2n 本が
+// 同時にデコードする = **この枠が守っている不変条件そのものが破れる**。
+func (s *Service) SetMediaProcessingConcurrency(n int) {
+	if n <= 0 {
+		n = defaultMediaProcessingConcurrency()
+	}
+	s.mediaSlotCap = n
+	s.mediaSlots = semaphore.NewWeighted(int64(n))
 }
 
 // SetStreamingPublisher attaches a StreamingPublisher invoked best-effort
@@ -487,6 +726,10 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (*model.DriveFile,
 	if in.User != nil && in.FolderID != nil {
 		folder, err := s.folderRepo.FindByID(*in.FolderID)
 		if err != nil {
+			// **DB 障害を not-found に丸めない** (#2799)。
+			if !repository.IsNotFound(err) {
+				return nil, err
+			}
 			return nil, ErrFolderNotFound
 		}
 		if folder.UserID == nil || *folder.UserID != in.User.ID {
@@ -501,6 +744,34 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (*model.DriveFile,
 	// PreStored (#2313) の場合も同じ backend を使う。分割アップロードは
 	// MultipartStorage を要求するので backend は必ず object storage 側であり、
 	// storedInternal は false になる。
+	// **メタデータを落とせない画像は受け取らない (#3037 レビュー 2 周目)。**
+	//
+	// 代替画像の生成は best-effort だが、`webpublic` が作られないと
+	// `GetPublicURL` が原本へ落ちるので、**EXIF の GPS がそのまま公開側へ出る**
+	// — この PR が `entity/drive.go` 側で塞いだ穴と同じもの。
+	// `SandboxedDecoderMaxBytes` は #3037 が新しく入れた上限なので、**それが
+	// 原因で落ちる入力だけ**を「作れないなら受け取らない」に倒す (元から
+	// デコードできない形式の扱いは変えない)。
+	//
+	// 条件に `hasStrippableMetadata` を入れてあるので、落とすものが無い画像は
+	// 従来どおり通る (その場合は原本を出しても漏れない)。
+	//
+	// **AVIF だけは別に見る。** `hasStrippableMetadata` は AVIF に false を
+	// 返す — 「AVIF は寸法に関わらず webpublic を作る枝が別にある」ことが
+	// 前提だが、**デコードできなければその枝も動かない**。AVIF の原本は
+	// Mastodon / MS Edge が表示できないので、通すと壊れた添付になる。
+	//
+	// **`backend.Put` より前に置く (#3037 レビュー 3 周目)。** 後ろに置くと
+	// 本体だけがストレージに残り、`drive_file` 行が無いので
+	// `UsageByUser` にも `DeleteOrphans` (行ベース) にも乗らない =
+	// **恒久的にリークする**。実測で拒否 1 回あたり 34,603,050 バイトが
+	// 残った。分割アップロードは `discardChunkedObject` が消すので
+	// 残らないが、`drive/files/create` と `upload-from-url` は残る。
+	if isMimeImage(info.MimeType) && imagedecode.ExceedsSandboxedDecoderSize(info.Body) &&
+		(hasStrippableMetadata(info.Body, info.MimeType) || info.MimeType == "image/avif") {
+		return nil, ErrUndecodableImage
+	}
+
 	backend := ResolveStorage(s.storage)
 	storedInternal := StorageIsLocal(backend)
 
@@ -529,7 +800,7 @@ func (s *Service) Upload(ctx context.Context, in UploadInput) (*model.DriveFile,
 	var blurhash *string
 	var properties datatypes.JSON
 
-	alts := s.generateAlts(in.Body, info.MimeType)
+	alts := s.generateAlts(ctx, in.Body, info.MimeType)
 	if alts != nil {
 		thumbnail = alts.thumbnail
 		webpublic = alts.webpublic
@@ -711,7 +982,7 @@ func (s *Service) detectSensitiveOfficial(ctx context.Context, body []byte, mime
 			slog.Warn("drive: official sensitive detection for videos requires FFmpeg video processor", "mime", mime)
 			return false
 		}
-		frames, err := extractor.ExtractDetectionFrames(body)
+		frames, err := extractor.ExtractDetectionFrames(ctx, body)
 		if err != nil || len(frames) == 0 {
 			if err != nil {
 				slog.Warn("drive: detection frame extraction failed", "mime", mime, "err", err)
@@ -740,6 +1011,19 @@ func (s *Service) detectSensitiveOfficial(ctx context.Context, body []byte, mime
 		return false
 	}
 
+	// **ここも枠を取る (#3037)。** `NormalizeImageForDetection` は
+	// `decodeImage` (= `DecodeWithPixelCap(body, UpstreamMaxPixels)`) +
+	// `imaging.Fill` で、`processImage` と**同じ cap・同じ大きさ**の中間
+	// バッファを確保する。枠の外に置くと、並行アップロードのぶんだけ
+	// 無制限に積み上がって「同時にデコードする本数を縛る」という枠の不変条件が
+	// 成立しない。
+	release, slotOK := s.acquireMediaSlot(ctx)
+	if !slotOK {
+		slog.Warn("drive: センシティブ判定の枠を待っている間に中断されました", "mime", mime)
+		return false
+	}
+	defer release()
+
 	normalized, err := NormalizeImageForDetection(body, mime)
 	if err != nil {
 		slog.Warn("drive: image normalization for detection failed", "mime", mime, "err", err)
@@ -763,17 +1047,80 @@ type generateAltsResult struct {
 
 // generateAlts runs image or video processing on the uploaded file.
 // processor が nil の場合や処理失敗時は nil を返す (best-effort)。
-func (s *Service) generateAlts(body []byte, mimeType string) *generateAltsResult {
-	if isMimeImage(mimeType) && s.imageProcessor != nil {
-		return s.processImage(body, mimeType)
+//
+// **同時実行枠を取ってから走る。** デコードは 1 枚で数百 MB を確保しうるので、
+// 並行アップロードで掛け算されるとプロセスごと落ちる (Go の大確保失敗は
+// `throw("out of memory")` で recover できない)。枠が空くまで待つのは、
+// アップロード自体を失敗させるより背圧として素直なため。
+func (s *Service) generateAlts(ctx context.Context, body []byte, mimeType string) *generateAltsResult {
+	image := isMimeImage(mimeType) && s.imageProcessor != nil
+	video := isMimeVideo(mimeType) && s.videoProcessor != nil
+	if !image && !video {
+		return nil
 	}
-	if isMimeVideo(mimeType) && s.videoProcessor != nil {
-		thumb, _ := s.videoProcessor.GenerateThumbnail(body, mimeType)
+	if video {
+		// **ffmpeg は枠の外で回す。** 別プロセスなので Go ヒープの中間バッファを
+		// 1 つも抱えない一方、ffmpeg 自身は 1 本で何十秒も回りうるので、枠の
+		// 内側に入れると**動画 1 本がその間ずっと枠を占有する**。既定枠は
+		// `GOMAXPROCS / 2` (2 core の VPS では 1) なので、大きい動画 1 本で
+		// 画像アップロードのサムネイル生成が全部止まる。
+		//
+		// **#3037 で ffmpeg 側に ctx と timeout を入れた**ので「何分でも
+		// 居座る」ことは無くなったが、枠の外に置く判断は変えていない
+		// (timeout は 60 秒で、枠 1 つがその間塞がるのは変わらない)。
+		//
+		// media proxy の枠も同じ理由で「囲むのは decode/resize/encode だけ」と
+		// 決めてある (`internal/core/mediaproxy/cpulimit.go`)。
+		thumb, _ := s.videoProcessor.GenerateThumbnail(ctx, body, mimeType)
 		if thumb != nil {
 			return &generateAltsResult{thumbnail: thumb}
 		}
+		return nil
 	}
-	return nil
+
+	release, ok := s.acquireMediaSlot(ctx)
+	if !ok {
+		// **ctx が切れたときだけここへ来る。** 呼び出し元が諦めている状態なので
+		// 代替画像を作っても捨てられる。best-effort の契約どおり nil を返す。
+		slog.Warn("drive: メディア処理の枠を待っている間に中断されました", "mimeType", mimeType)
+		return nil
+	}
+	defer release()
+	return s.processImage(body, mimeType)
+}
+
+// acquireMediaSlot takes one processing slot, returning the release func.
+//
+// ok=false は ctx が切れた場合だけ。**待ちに固有の上限は置かない** — 待って
+// いるのはアップロード中のリクエストで、その ctx は利用者が接続を切れば切れる
+// ので、待ち時間はそこで頭打ちになる。media proxy と違って途中で 503 に倒さ
+// ないのは、代替画像を作れなかったアップロードは**やり直しが効かない**ため
+// (ファイル自体は保存済みで、サムネイルだけが恒久的に欠ける)。
+//
+// **取った semaphore をクロージャに捕まえる。** `SetMediaProcessingConcurrency`
+// は `s.mediaSlots` を差し替えるので、解放時にフィールドを読み直すと acquire
+// したのと別の Weighted へ Release が入り `semaphore: released more than held`
+// で **panic してプロセスが落ちる** (`mediaproxy.acquireCPU` と同じ理由)。
+//
+// 枠が未配線 (テストが Service を構造体リテラルで組んだ場合など) なら
+// 素通しする。`NewService` は必ず張るので production では起きない
+// (`TestMediaProcessingConcurrency_Defaults` が固定)。
+func (s *Service) acquireMediaSlot(ctx context.Context) (func(), bool) {
+	slots := s.mediaSlots
+	if slots == nil {
+		return func() {}, true
+	}
+	if err := slots.Acquire(ctx, 1); err != nil {
+		return nil, false
+	}
+	var released bool
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		slots.Release(1)
+	}, true
 }
 
 // processImage runs all image processing steps (best-effort).
@@ -820,6 +1167,10 @@ func (s *Service) Show(user *model.User, id string) (*model.DriveFile, error) {
 	}
 	f, err := s.fileRepo.FindByID(id)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrFileNotFound
 	}
 	return s.authorizeFileRead(user, f)
@@ -834,6 +1185,10 @@ func (s *Service) ShowByURL(user *model.User, url string) (*model.DriveFile, err
 	}
 	f, err := s.fileRepo.FindByAnyURL(url)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrFileNotFound
 	}
 	return s.authorizeFileRead(user, f)
@@ -869,6 +1224,10 @@ func (s *Service) findOwnedFile(user *model.User, id string) (*model.DriveFile, 
 	}
 	f, err := s.fileRepo.FindByID(id)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrFileNotFound
 	}
 	if f.UserID == nil || *f.UserID != user.ID {
@@ -947,6 +1306,10 @@ func (s *Service) Update(user *model.User, id string, in UpdateInput) (*model.Dr
 		if *in.FolderID != nil {
 			folder, err := s.folderRepo.FindByID(**in.FolderID)
 			if err != nil {
+				// **DB 障害を not-found に丸めない** (#2799)。
+				if !repository.IsNotFound(err) {
+					return nil, err
+				}
 				return nil, ErrFolderNotFound
 			}
 			if folder.UserID == nil || *folder.UserID != user.ID {
@@ -1011,6 +1374,52 @@ func (s *Service) Delete(user *model.User, id string) error {
 	return nil
 }
 
+// DeleteSystemFile removes a system-owned file (userId IS NULL) by id (#2966).
+//
+// **所有者チェックを通せないので別の口にする。** `Delete` は
+// `findOwnedFile` が user を要求するが、絵文字の実体として作るファイルは
+// 誰のものでもない。代わりに**「利用者のファイルではないこと」を確かめる** —
+// id を取り違えたときに利用者のファイルを消さないため。
+//
+// 承認が途中で失敗したときの後始末に使う。存在しない id は成功として扱う
+// (二重に呼ばれても壊れない)。
+func (s *Service) DeleteSystemFile(id string) error {
+	if id == "" {
+		return nil
+	}
+	f, err := s.fileRepo.FindByID(id)
+	if err != nil {
+		if repository.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if f.UserID != nil || f.UserHost != nil {
+		// **利用者のファイルは消さない。** 呼び出し側が id を取り違えたときに
+		// 申請者のファイルを消すのが最悪の壊れ方なので、ここで止める。
+		//
+		// **`userHost` も見る (レビュー M1)。** `userId IS NULL` かつ
+		// `userHost` 付きの行は、著者をまだ materialize していないリモートの
+		// 添付ファイル (#2717) で、**表示中の note が参照している**。
+		// `orphanWhere` (`internal/repository/drive_file.go`) も同じ理由で
+		// `"userHost" IS NULL` を要求しており、そちらより緩いと守る範囲が
+		// 食い違う。
+		return ErrAccessDenied
+	}
+	if err := s.deleteFileObjects(f); err != nil {
+		return err
+	}
+	if err := s.fileRepo.Delete(f); err != nil {
+		return err
+	}
+	if s.chartHook != nil {
+		s.chartHook.OnFileDeleted(f)
+	}
+	// **イベントは出さない。** `publishEvent` は利用者の stream 宛てで、
+	// system ファイルには宛先が無い。
+	return nil
+}
+
 // DeleteAllByHost physically deletes every drive file uploaded from the given
 // remote host and decrements drive usage charts, then bulk-deletes the rows.
 // Used by admin/federation/delete-all-files (upstream iterates driveService
@@ -1046,6 +1455,10 @@ func (s *Service) CreateFolder(user *model.User, name string, parentID *string) 
 	if parentID != nil {
 		parent, err := s.folderRepo.FindByID(*parentID)
 		if err != nil {
+			// **DB 障害を not-found に丸めない** (#2799)。
+			if !repository.IsNotFound(err) {
+				return nil, err
+			}
 			return nil, ErrFolderNotFound
 		}
 		// upstream folders/create は parent を findOneBy({id, userId: me.id}) で
@@ -1077,6 +1490,10 @@ func (s *Service) ShowFolder(user *model.User, id string) (*model.DriveFolder, e
 	}
 	f, err := s.folderRepo.FindByID(id)
 	if err != nil {
+		// **DB 障害を not-found に丸めない** (#2799)。
+		if !repository.IsNotFound(err) {
+			return nil, err
+		}
 		return nil, ErrFolderNotFound
 	}
 	// upstream folders/{show,update,delete} は findOneBy({id, userId: me.id}) で
@@ -1114,6 +1531,10 @@ func (s *Service) UpdateFolder(user *model.User, id string, in UpdateFolderInput
 			}
 			parent, err := s.folderRepo.FindByID(**in.ParentID)
 			if err != nil {
+				// **DB 障害を not-found に丸めない** (#2799)。
+				if !repository.IsNotFound(err) {
+					return nil, err
+				}
 				// folders/update では parent が未存在のときに upstream は
 				// NO_SUCH_PARENT_FOLDER (#977) を返すので、target 不在の
 				// ErrFolderNotFound と区別する。

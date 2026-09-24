@@ -1,6 +1,7 @@
 package notifications
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -29,6 +30,24 @@ func (h *Handler) Grouped(c echo.Context) error {
 		return apierr.JSONInvalidParam(c)
 	}
 
+	// upstream i/notifications-grouped.ts も getNotifications の前に同じ 2 つの
+	// 早期 return を持つ (#2835)。
+	//
+	// **下の `len(all) > 0` では止まらない。** svc.List の exclude filter は
+	// `excludeSet[n.Type]` の一致しか見ないので、**notificationTypeList に無い
+	// type の行は excludeTypes 全指定でも生き残る**。該当するのは obsolete
+	// (`pollVote` / `groupInvited`) と mk-go 固有 (`importCompleted` /
+	// `abuseReport`)。前者の producer は無いが、それ以前に積まれた行は
+	// ストリームに残りうる。後者の `abuseReport` は現に produce される (#2868)。
+	// 1 件あるだけで `len(all) > 0` が成立し既読化まで走ってしまう。
+	// upstream は早期 return するので `[]` が正。
+	if emptyByTypeFilter(req) {
+		return c.JSON(http.StatusOK, []any{})
+	}
+	// 早期 return の**後**に obsolete を除去する (#2837)。順序が結果を分ける。
+	req.IncludeTypes = stripObsoleteTypes(req.IncludeTypes)
+	req.ExcludeTypes = stripObsoleteTypes(req.ExcludeTypes)
+
 	// **drop 前の全列を受け取る** (#2739)。grouping は全列で行い、drop 済みは
 	// グループの中身から外す。drop 済みを列から抜いてから畳むと、挟まった通知が
 	// 区切りとして働かず両隣が 1 グループになる。
@@ -56,7 +75,12 @@ func (h *Handler) Grouped(c echo.Context) error {
 			Note: noteByID[n.NoteID],
 		})
 	}
-	packed := entity.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), h.notificationOptions(user.ID)...)
+	opts, err := h.notificationOptions(user.ID, items)
+	if err != nil {
+		slog.Error("notifications-grouped: resolve abuse report states failed", "err", err)
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
+	packed := entity.PackNotifications(items, h.idGen, h.instanceLookup(), h.emojiLookup(), opts...)
 	// depth-2 embed hide (#1570): grouping の前に通知 note の renote/reply embed と
 	// 著者設定ゲートを viewer 可視性で適用する。Show と同じく #1444 CanSeeNote gate は
 	// 落とすだけで embed に再帰しないため、ここで hide しないと grouped 経由で
@@ -72,7 +96,21 @@ func (h *Handler) Grouped(c echo.Context) error {
 		grouped = grouped[:(*req.Limit)]
 	}
 
-	h.maybeMarkAsRead(c, user, req)
+	// **取得が 0 件なら既読化しない** (#2833)。upstream i/notifications-grouped.ts は
+	// `notifications.length === 0` で `readAllNotification` を呼ぶ前に return する
+	// (i/notifications 側には無い、grouped だけの早期 return)。
+	//
+	// MarkAllAsRead が進める先は「fetch が返した行」ではなく**ストリームの最新
+	// エントリ**なので、0 件の fetch で呼ぶと、ユーザーが一度も受け取っていない
+	// 通知まで既読位置が飛ぶ。
+	//
+	// 判定は `all` = svc.List の生の結果で、upstream の `getNotifications` 戻り値に
+	// あたる。**grouped ではなく all を見る** — pack / 可視性 drop の後で判定すると
+	// upstream より後ろの位置になり、逆向きの乖離を作る (upstream はそこでは
+	// 既読化する)。
+	if len(all) > 0 {
+		h.maybeMarkAsRead(c, user, req)
+	}
 	return c.JSON(http.StatusOK, grouped)
 }
 

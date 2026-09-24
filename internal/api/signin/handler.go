@@ -16,6 +16,7 @@ import (
 	coreemail "github.com/shiroha-a/mk/internal/core/email"
 	"github.com/shiroha-a/mk/internal/core/twofactor"
 	"github.com/shiroha-a/mk/internal/entity"
+	"github.com/shiroha-a/mk/internal/l10n"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/misc/password"
 	miscsmtp "github.com/shiroha-a/mk/internal/misc/smtp"
@@ -26,9 +27,27 @@ import (
 	"gorm.io/gorm"
 )
 
-// IPLogger records user IPs on successful authentication.
-type IPLogger interface {
-	Upsert(userID, ip string) error
+type pendingPasswordMigration struct {
+	stored string
+	plain  string
+}
+
+const pendingPasswordMigrationKey = "signin.pendingPasswordMigration"
+
+func setPendingPasswordMigration(c echo.Context, scheme password.Scheme, verified bool, stored, plain string) {
+	if verified && scheme == password.SchemeArgon2id {
+		c.Set(pendingPasswordMigrationKey, pendingPasswordMigration{stored: stored, plain: plain})
+	}
+}
+
+// IPRecorder records the IP an authenticated request came from.
+// Implemented by core/iplog.Service.
+//
+// **記録するかどうかの判断は実装側に任せる (#3103)。** 以前は起動時に
+// `meta.enableIpLogging` を読んで bool で渡していたが、その形だと管理画面で
+// 有効にしても再起動するまで記録が始まらなかった (#3107)。
+type IPRecorder interface {
+	Record(userID, ip string)
 }
 
 // MainStreamPublisher emits real-time events to a single user's `main`
@@ -45,8 +64,7 @@ type Handler struct {
 	webauthnSvc         *twofactor.WebAuthnService
 	securityKeyRepo     repository.UserSecurityKeyRepository
 	captchaSvc          *captcha.Service
-	ipLogger            IPLogger
-	ipLoggingOn         bool
+	ipRecorder          IPRecorder
 	signinRepo          repository.SigninRepository
 	idGen               id.Generator
 	mainStreamPublisher MainStreamPublisher
@@ -56,6 +74,13 @@ type Handler struct {
 	emailSender func(to string, msg miscsmtp.Message)
 	// serverURL はメール footer の link 先。emailSender とセットで設定。
 	serverURL string
+	// testMode は captcha をバイパスする (本家 `process.env.NODE_ENV !== 'test'`
+	// 相当)。**signup 側にだけあって signin 側に無かった (#3037 レビュー
+	// 2 周目)** — upstream `SigninApiService.ts:184` は signin も囲っている。
+	// captcha を有効にした e2e 構成を作ると signup だけ通って signin が落ちる。
+	testMode bool
+	// metaRepo はメール l10n の instance fallback 用。未配線なら英語 fallback。
+	metaRepo repository.MetaRepository
 }
 
 // LoginNotifier records a 'login' notification on signin success (#1559)。
@@ -77,10 +102,15 @@ func (h *Handler) SetEmailSender(serverURL string, send func(to string, msg misc
 	h.emailSender = send
 }
 
-// SetIPLogger attaches an IPLogger and enables IP logging.
-func (h *Handler) SetIPLogger(logger IPLogger, enabled bool) {
-	h.ipLogger = logger
-	h.ipLoggingOn = enabled
+// SetMetaRepo wires meta lookup for email locale fallback.
+func (h *Handler) SetMetaRepo(r repository.MetaRepository) { h.metaRepo = r }
+
+// HasMetaRepo reports whether the meta repository was wired for email l10n.
+func (h *Handler) HasMetaRepo() bool { return h.metaRepo != nil }
+
+// SetIPRecorder attaches the IP recorder. 未設定なら記録しない。
+func (h *Handler) SetIPRecorder(rec IPRecorder) {
+	h.ipRecorder = rec
 }
 
 // NewHandler creates a new signin Handler.
@@ -98,6 +128,12 @@ func (h *Handler) SetSigninRepo(repo repository.SigninRepository, idGen id.Gener
 // the captcha token on the password step (same as original Misskey).
 func (h *Handler) SetCaptcha(svc *captcha.Service) {
 	h.captchaSvc = svc
+}
+
+// SetTestMode enables the captcha bypass (本家 `process.env.NODE_ENV !== 'test'`
+// 相当)。signup 側の同名 setter と対にして配線する。
+func (h *Handler) SetTestMode(v bool) {
+	h.testMode = v
 }
 
 // SetWebAuthn attaches optional WebAuthn dependencies to enable 2FA login
@@ -135,6 +171,14 @@ func (h *Handler) Signin(c echo.Context) error {
 	var req struct {
 		Username string  `json:"username"`
 		Password *string `json:"password"`
+		// captcha のトークン。**`signin-flow` と同じ field 名で受ける。**
+		// この endpoint は upstream に無い互換 shim だが、パスワードを検証する
+		// 以上 captcha も同じように見る必要がある。
+		HcaptchaResponse    string `json:"hcaptcha-response"`
+		RecaptchaResponse   string `json:"g-recaptcha-response"`
+		TurnstileResponse   string `json:"turnstile-response"`
+		McaptchaResponse    string `json:"m-captcha-response"`
+		TestcaptchaResponse string `json:"testcaptcha-response"`
 	}
 	if err := c.Bind(&req); err != nil || req.Username == "" {
 		return c.JSON(http.StatusBadRequest, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
@@ -142,6 +186,10 @@ func (h *Handler) Signin(c echo.Context) error {
 
 	// ユーザー検索
 	user, err := h.userRepo.FindByUsernameLower(req.Username, nil)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil {
 		return c.JSON(http.StatusNotFound, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
 	}
@@ -160,14 +208,47 @@ func (h *Handler) Signin(c echo.Context) error {
 
 	// Step 2: パスワード検証
 	profile, err := h.userRepo.FindProfileByUserID(user.ID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil || profile.Password == nil {
 		return c.JSON(http.StatusForbidden, errBody("932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(*req.Password)); err != nil {
+	// **captcha を検証する。** この endpoint は `signin-flow` に統合される前の
+	// 互換 shim (`docs/divergence.md`) だが、**captcha だけ見ていなかった**。
+	// 運営者が captcha を有効にしてもこちらは素通りするので、2FA 無効の利用者に
+	// 対するクレデンシャルスタッフィング対策が効かなかった。upstream には
+	// この endpoint 自体が無く、`signin-flow` 相当は 5 provider すべてを検証する。
+	//
+	// **2FA 有効なら見ない。** あちらは challenge を返すだけで token を発行せず、
+	// `signin-flow` も同じ条件で分けている。
+	if !h.testMode && !profile.TwoFactorEnabled && h.captchaSvc != nil {
+		tokens := captcha.CaptchaTokens{
+			Hcaptcha:    req.HcaptchaResponse,
+			Recaptcha:   req.RecaptchaResponse,
+			Turnstile:   req.TurnstileResponse,
+			Mcaptcha:    req.McaptchaResponse,
+			Testcaptcha: req.TestcaptchaResponse,
+		}
+		if err := h.captchaSvc.Verify(c.Request().Context(), tokens); err != nil {
+			return apierr.FastifyReply(c, http.StatusBadRequest, "CAPTCHA_FAILED")
+		}
+	}
+
+	storedPassword := *profile.Password
+	scheme, passwordOK, handled := h.verifyPassword(c, user.ID, storedPassword, *req.Password)
+	if handled {
+		return nil
+	}
+	setPendingPasswordMigration(c, scheme, passwordOK, storedPassword, *req.Password)
+	if !passwordOK {
 		return h.fail(c, user, http.StatusForbidden, "932c904e-9460-45b7-9ce6-7ed33be7eb2c")
 	}
-	h.maybeRehashPassword(user.ID, *profile.Password, *req.Password)
+	if scheme == password.SchemeBcrypt {
+		h.maybeRehashPassword(user.ID, storedPassword, *req.Password)
+	}
 
 	// #2106 H2 (CRITICAL): 2FA 有効ユーザーには password のみで token を発行しない。
 	// レガシー /api/signin は 2 要素を完遂できない (req に token/credential が無い)
@@ -224,6 +305,10 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 
 	// ユーザー検索 (小文字で検索)
 	user, err := h.userRepo.FindByUsernameLower(req.Username, nil)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil {
 		return c.JSON(http.StatusNotFound, errBody("6cc579cc-885d-43d8-95c2-b8c7fc963280"))
 	}
@@ -251,19 +336,50 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 
 	// Step 2: パスワード検証
 	profile, err := h.userRepo.FindProfileByUserID(user.ID)
+	if err != nil && !repository.IsNotFound(err) {
+		// **DB 障害を not-found に丸めない** (#2792)。
+		return c.JSON(http.StatusInternalServerError, apierr.InternalError())
+	}
 	if err != nil || profile.Password == nil {
 		return c.JSON(http.StatusForbidden, errBody("932c904e-9460-45b7-9ce6-7ed33be7eb2c"))
 	}
 
-	passwordOK := bcrypt.CompareHashAndPassword([]byte(*profile.Password), []byte(*req.Password)) == nil
-	if passwordOK {
-		h.maybeRehashPassword(user.ID, *profile.Password, *req.Password)
+	storedPassword := *profile.Password
+
+	// **passkey で認証できる利用者は、枠が取れなくても 503 にしない** (#2853)。
+	// `OutcomeUnavailable` は「password が正しいか分からない」であって
+	// 「間違っている」ではない。下の credential 分岐は
+	// `!passwordOK && !profile.UsePasswordLessLogin` で素通しにするので、
+	// passwordless 利用者はそこで認証できる。503 を返すと **passkey を持っている
+	// のにパスワード検証の輻輳でログインできない**。
+	//
+	// **検証自体は飛ばさない。** `migratePendingPassword` は `h.ok` 内でしか
+	// 走らず、step 2 は challenge を返すだけなので、**passkey でログインする
+	// 利用者にとっては** step 3 (`{username, password, credential}`) が唯一の
+	// 移行機会になる (TOTP で入る利用者は step 3 の token 経路で移行する)。
+	// 飛ばすと passkey 利用者が永久に argon2id のまま毎回 1 枠消費し続ける。fork frontend は
+	// passkey 完了時も実際の password を送る (`MkSignin.vue` の `onPasskeyDone`、
+	// 入力欄は `required`)。
+	// **token が来ていたら許容しない。** token 分岐は credential 分岐より前にあり、
+	// 先頭で `!passwordOK` を弾くので「password 不一致が素通しになる経路」では
+	// ない。許容すると、正しい password でも 403 (「パスワードが違います」) を
+	// 返し、身に覚えのない失敗ログイン履歴まで残す。
+	tolerateUnavailable := profile.UsePasswordLessLogin && profile.TwoFactorEnabled &&
+		len(req.Credential) > 0 && (req.Token == nil || *req.Token == "")
+
+	scheme, passwordOK, handled := h.verifyPasswordTolerant(c, user.ID, storedPassword, *req.Password, tolerateUnavailable)
+	if handled {
+		return nil
+	}
+	setPendingPasswordMigration(c, scheme, passwordOK, storedPassword, *req.Password)
+	if passwordOK && scheme == password.SchemeBcrypt {
+		h.maybeRehashPassword(user.ID, storedPassword, *req.Password)
 	}
 
 	// CAPTCHA 検証 (password step 完了後、2FA 無しの場合のみ)。
 	// 本家 Misskey と同じく 2FA 有効なユーザーはキーデバイスが人間性を担保する
 	// ため CAPTCHA をスキップする。
-	if !profile.TwoFactorEnabled && h.captchaSvc != nil {
+	if !h.testMode && !profile.TwoFactorEnabled && h.captchaSvc != nil {
 		tokens := captcha.CaptchaTokens{
 			Hcaptcha:    req.HcaptchaResponse,
 			Recaptcha:   req.RecaptchaResponse,
@@ -305,15 +421,39 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 		}
 		// まず TOTP を試す。失敗したらバックアップコードにフォールバック。
 		// ValidateWithReplay は RFC 6238 §5.2 に従い同コードの 2 回目以降
-		// (acceptance window 内) を拒否する (mk-go 独自 hardening、upstream
-		// Misskey TS は持たない)。
+		// (acceptance window 内) を拒否する。**upstream も 2026.6.0 で同等の
+		// 機構を持つ** (`UserAuthService.validateOtp`)。mk-go が先行実装したもの。
 		if profile.TwoFactorSecret != nil && twofactor.ValidateWithReplay(c.Request().Context(), h.totpReplayGuard, user.ID, *req.Token, *profile.TwoFactorSecret) {
 			return h.ok(c, user)
 		}
-		if remaining, berr := twofactor.ConsumeBackupCode([]string(profile.TwoFactorBackupSecret), *req.Token); berr == nil {
-			_ = h.userRepo.UpdateProfile(user.ID, map[string]any{
-				"twoFactorBackupSecret": model.StringArray(remaining),
-			})
+		if _, berr := twofactor.ConsumeBackupCode([]string(profile.TwoFactorBackupSecret), *req.Token); berr == nil {
+			ctx := c.Request().Context()
+			// **DB へ書く前に予約する** (#2862)。ここは i/* と同じ guard・同じ
+			// keyspace (twofactor.BackupCodeGuardKey) を使う。分けると、
+			// 「同じコードで同時にログイン」も「ログインしながら 2FA を解除」も
+			// 素通りする。
+			//
+			// guard が無い構成では今までどおり素通しする (fail-open)。
+			if !twofactor.ReserveOnce(ctx, h.totpReplayGuard, user.ID, twofactor.BackupCodeGuardKey(*req.Token)) {
+				return h.fail(c, user, http.StatusForbidden, "cdf1235b-ac71-46d4-a3a6-84ccce48df6f")
+			}
+			// **読んだ配列を書き戻さない** (#2862)。別のコードを使う同時実行が
+			// 互いの消費を打ち消し合い、使ったはずのコードが復活する
+			// ([c1 c2 c3] から A が c1、B が c2 を消すと、後勝ちで片方が戻る)。
+			if err := h.userRepo.RemoveBackupCode(user.ID, *req.Token); err != nil {
+				// **消費できなかったら通さない。** 通すと、DB への書き込みが
+				// 落ちているあいだ同じコードで何度でもセッションを取れる。
+				// upstream も同じ挙動になる。UserAuthService が
+				// `await ...update(...)` していて自分では catch しないので、
+				// rejection が SigninApiService の catch に届いてこの 403 になる。
+				//
+				// **そのうえで予約は解放する。** 403 を返す以上、利用者は打ち直す。
+				// 残すと DB が復帰したあとも TTL のあいだ同じコードを弾き続ける。
+				// signin は未認証経路なので、締め出しの影響が i/* より大きい。
+				slog.Warn("signin: failed to consume backup code", "userId", user.ID, "err", err)
+				twofactor.ReleaseReservation(ctx, h.totpReplayGuard, user.ID, twofactor.BackupCodeGuardKey(*req.Token))
+				return h.fail(c, user, http.StatusForbidden, "cdf1235b-ac71-46d4-a3a6-84ccce48df6f")
+			}
 			return h.ok(c, user)
 		}
 		return h.fail(c, user, http.StatusForbidden, "cdf1235b-ac71-46d4-a3a6-84ccce48df6f")
@@ -379,6 +519,7 @@ func (h *Handler) SigninFlow(c echo.Context) error {
 // ok returns the standard "logged in" response. 認証経路 (TOTP / WebAuthn /
 // pwd-only) すべてで同じ shape を返したいのでヘルパに切り出している。
 func (h *Handler) ok(c echo.Context, user *model.User) error {
+	h.migratePendingPassword(c, user.ID)
 	h.RecordSuccessfulSignin(user.ID, c.RealIP(), c.Request().Header.Clone())
 	token := ""
 	if user.Token != nil {
@@ -389,6 +530,40 @@ func (h *Handler) ok(c echo.Context, user *model.User) error {
 		"id":       user.ID,
 		"i":        token,
 	})
+}
+
+func (h *Handler) migratePendingPassword(c echo.Context, userID string) {
+	pending, ok := c.Get(pendingPasswordMigrationKey).(pendingPasswordMigration)
+	if !ok {
+		return
+	}
+	fresh, err := password.Hash(pending.plain)
+	if err != nil {
+		if errors.Is(err, bcrypt.ErrPasswordTooLong) {
+			// **恒久保留。** bcrypt は 72 byte で切るので、移行すると password が
+			// 黙って弱くなる。この利用者はログインのたびにここへ来るので Warn だと
+			// ログを埋める。直せる異常ではないので Info に落とす (#2850)。
+			slog.Info("signin: Argon2 password migration permanently deferred",
+				"userId", userID, "category", "password_too_long")
+			return
+		}
+		slog.Warn("signin: Argon2 password migration skipped",
+			"userId", userID, "category", "hash_error", "err", err)
+		return
+	}
+	updated, err := h.userRepo.UpdatePasswordIfCurrent(userID, pending.stored, fresh)
+	if err != nil {
+		// **err を落とさない** (#2850)。無いと DB 障害と制約違反の切り分けが
+		// できない。GORM の error に平文は乗らない。
+		slog.Warn("signin: Argon2 password migration skipped",
+			"userId", userID, "category", "persistence_error", "err", err)
+		return
+	}
+	if !updated {
+		// 競合して負けただけで異常ではない。
+		slog.Info("signin: Argon2 password migration skipped",
+			"userId", userID, "category", "concurrent_update")
+	}
 }
 
 // RecordSuccessfulSignin fires the side-effects of a successful login:
@@ -404,8 +579,9 @@ func (h *Handler) ok(c echo.Context, user *model.User) error {
 // (#2454)。`login` 通知はアプリ内にしか出ないので、乗っ取られた側がクライアントを
 // 開かない限り気付けない。メールはその唯一の外向き経路にあたる。
 func (h *Handler) RecordSuccessfulSignin(userID, ip string, headers http.Header) {
-	if h.ipLoggingOn && h.ipLogger != nil {
-		go h.ipLogger.Upsert(userID, ip)
+	if h.ipRecorder != nil {
+		// 書き込みを goroutine へ逃がすのは recorder 側の仕事。
+		h.ipRecorder.Record(userID, ip)
 	}
 	if h.signinRepo != nil && h.idGen != nil {
 		go h.recordSignin(userID, ip, headers, true)
@@ -417,15 +593,6 @@ func (h *Handler) RecordSuccessfulSignin(userID, ip string, headers http.Header)
 		go h.sendNewLoginEmail(userID)
 	}
 }
-
-// newLoginEmailSubject / newLoginEmailBody are upstream's wording, verbatim.
-//
-// 文面を変えない。TS から切り替えた instance の利用者が、同じ通知を別の文面で
-// 受け取ると「別のサービスから届いた」と読めてしまう。
-const (
-	newLoginEmailSubject = "New login / ログインがありました"
-	newLoginEmailBody    = "There is a new login. If you do not recognize this login, update the security status of your account, including changing your password. / 新しいログインがありました。このログインに心当たりがない場合は、パスワードを変更するなど、アカウントのセキュリティ状態を更新してください。"
-)
 
 // sendNewLoginEmail notifies the user by email that their account was signed
 // into. Mirrors upstream SigninService: only when the address is present *and*
@@ -447,16 +614,25 @@ func (h *Handler) sendNewLoginEmail(userID string) {
 	if profile == nil || profile.Email == nil || *profile.Email == "" || !profile.EmailVerified {
 		return
 	}
-	text, bodyHTML := coreemail.PlainText(newLoginEmailBody)
+	var metaLangs []string
+	if h.metaRepo != nil {
+		if meta, err := h.metaRepo.Fetch(); err == nil {
+			metaLangs = l10n.LangsFromMeta(meta)
+		}
+	}
+	lang := l10n.Resolve(profile.Lang, metaLangs)
+	subject, body := l10n.NewLogin(lang)
+	text, bodyHTML := coreemail.PlainText(body)
 	html := coreemail.WrapHTML(coreemail.HTMLWrapInput{
 		SiteURL: h.serverURL,
-		Subject: newLoginEmailSubject,
+		Subject: subject,
 		// 認証済 user 向けなので二段 footer (reset-password / email 変更と同じ)。
-		EmailSettingsURL: h.serverURL + "/settings/email",
-		BodyHTML:         bodyHTML,
+		EmailSettingsURL:   h.serverURL + "/settings/email",
+		EmailSettingsLabel: l10n.EmailSettingsLabel(lang),
+		BodyHTML:           bodyHTML,
 	})
 	h.emailSender(*profile.Email, miscsmtp.Message{
-		Subject: newLoginEmailSubject,
+		Subject: subject,
 		Text:    text,
 		HTML:    html,
 	})
@@ -501,6 +677,75 @@ func (h *Handler) recordSignin(userID, ip string, headers http.Header, success b
 		h.mainStreamPublisher.PublishMainEvent(userID, "signin", entity.PackSignin(s, h.idGen))
 	}
 }
+
+// verifyPassword wraps password.Verify and answers the request itself when the
+// verifier could not take a slot (#2849).
+//
+// **応答済みかどうかは error ではなく handled で返す。** `echo.Context.JSON` は
+// 書き込みに**成功すると nil を返す**ので、その戻り値を「応答した印」に使うと
+// `if err != nil` が一度も成立しない。初版がこれを踏み、503 を書いた後も処理が
+// 続いて (a) body に JSON が 2 つ連結され、(b) `h.fail` が偽の失敗ログイン履歴を
+// 残し、(c) SigninFlow では captcha の単回使用トークンまで消費していた。
+//
+// handled が真なら**呼び出し側は即座に nil を返すこと**。
+func (h *Handler) verifyPassword(c echo.Context, userID, stored, plain string) (scheme password.Scheme, ok, handled bool) {
+	return h.verifyPasswordTolerant(c, userID, stored, plain, false)
+}
+
+// verifyPasswordTolerant is verifyPassword with an opt-out from the 503.
+//
+// **`tolerateUnavailable` は「password が通らなくても他の要素で認証できる」
+// 呼び出し側だけが渡す** (#2853)。枠が取れなかったときに 503 で終わらせず、
+// `ok = false` で呼び出し側へ返す。passkey を持っている利用者が、使わない
+// パスワード検証の輻輳でログインできなくなるのを防ぐ。
+//
+// **渡してよいのは、その先で password 不一致が素通しになる経路だけ。** そうで
+// ないと「枠が取れなかった」が「パスワードが違う」に化ける。
+func (h *Handler) verifyPasswordTolerant(c echo.Context, userID, stored, plain string, tolerateUnavailable bool) (scheme password.Scheme, ok, handled bool) {
+	scheme, outcome := password.Verify(c.Request().Context(), stored, plain)
+	switch outcome {
+	case password.OutcomeUnavailable:
+		// **403 に潰さない。** 枠を取れなかっただけで password は正しいかも
+		// しれず、「間違っています」と伝えると利用者が不要な reset に進む。
+		//
+		// **失敗ログイン履歴 (h.fail) も残さない。** password を一度も検証して
+		// いないので、残すと身に覚えのない失敗が signin-history に並ぶ。
+		if tolerateUnavailable {
+			// 呼び出し側が他の要素で認証できるので、503 にせず進める。
+			slog.Warn("signin: password verification unavailable, falling through to the second factor",
+				"path", c.Path(), "userId", userID, "scheme", scheme.String())
+			return scheme, false, false
+		}
+		slog.Warn("signin: password verification unavailable",
+			"path", c.Path(), "userId", userID, "scheme", scheme.String())
+		writeVerifierUnavailable(c)
+		return scheme, false, true
+	case password.OutcomeUnsupported:
+		// **profile だけ出す。** salt / digest は診断に不要 (ProfileForLog)。
+		// これが出続けるなら移行元が想定と違う argon2 実装を使っている。
+		// **userId を出す** — 「全員ログインできない」ときに、どのアカウントが
+		// 壊れているかを追えないと切り分けが進まない。
+		slog.Warn("signin: unsupported password hash",
+			"path", c.Path(), "userId", userID, "profile", password.ProfileForLog(stored))
+	}
+	return scheme, outcome.OK(), false
+}
+
+// writeVerifierUnavailable writes the shared 503 body plus Retry-After.
+//
+// **Retry-After は rate limit の窓から逆算する。** rate limit は handler より前の
+// middleware が数えるので 503 でも 1 消費される (返金の口が無い)。素直に従った
+// クライアントが枠を使い切ると 1 時間ログインできなくなる — #2849 が問題にした
+// 被害そのもの。signin は 1h/10 なので、窓を割った 3600/10 = 360 秒なら
+// 従っている限り枠を使い切らない。
+func writeVerifierUnavailable(c echo.Context) {
+	c.Response().Header().Set("Retry-After", verifierRetryAfterSeconds)
+	_ = c.JSON(http.StatusServiceUnavailable, apierr.PasswordVerificationUnavailable())
+}
+
+// verifierRetryAfterSeconds は 503 の Retry-After。上のコメントの理由で
+// rate limit の窓 (1h) を上限回数 (10) で割った値にしてある。
+const verifierRetryAfterSeconds = "360"
 
 // fail records a failed signin (success:false) for the already-resolved user
 // and returns the error response. upstream SigninApiService.fail() は password
@@ -563,8 +808,19 @@ func (h *Handler) maybeRehashPassword(userID, storedHash, plain string) {
 		slog.Warn("signin: failed to rehash password", "userId", userID, "err", err)
 		return
 	}
-	if err := h.userRepo.UpdateProfile(userID, map[string]any{"password": fresh}); err != nil {
+	// **CAS で書く** (#2850)。無条件の UpdateProfile だと、cost を上げた instance で
+	// 「ログイン (旧パスワードで検証成功)」と「別タブでパスワード変更」が競合した
+	// とき、rehash が**旧パスワードの hash** を書き戻して新しいパスワードが消える。
+	// #2842 が Argon2 移行のために UpdatePasswordIfCurrent を新設したのに、隣の
+	// 同種の書き込みだけ無防備なままだった。
+	updated, err := h.userRepo.UpdatePasswordIfCurrent(userID, storedHash, fresh)
+	if err != nil {
 		slog.Warn("signin: failed to store rehashed password", "userId", userID, "err", err)
+		return
+	}
+	if !updated {
+		// 競合して負けただけ。認証は済んでいるのでログインは成立させる。
+		slog.Info("signin: skipped password rehash (concurrent update)", "userId", userID)
 	}
 }
 

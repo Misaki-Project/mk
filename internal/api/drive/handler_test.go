@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var stubError = errors.New("stub error")
+var errStub = errors.New("stub error")
 
 func newHandler(t *testing.T) (*Handler, *testutil.MockDriveFileRepository, *testutil.MockDriveFolderRepository) {
 	t.Helper()
@@ -202,7 +204,7 @@ type failingFileRepo struct {
 }
 
 func (f *failingFileRepo) Create(_ *model.DriveFile) error {
-	return stubError
+	return errStub
 }
 
 func TestFilesCreate_RepoError(t *testing.T) {
@@ -460,7 +462,7 @@ type failingUpdateFileRepo struct {
 }
 
 func (f *failingUpdateFileRepo) Update(_ string, _ map[string]any) error {
-	return stubError
+	return errStub
 }
 
 func TestFilesUpdate_RepoError(t *testing.T) {
@@ -652,7 +654,7 @@ type failingFolderRepo struct {
 }
 
 func (f *failingFolderRepo) Create(_ *model.DriveFolder) error {
-	return stubError
+	return errStub
 }
 
 func TestFoldersCreate_RepoError(t *testing.T) {
@@ -1269,4 +1271,318 @@ func TestFilesList_EmptyFolderIDTreatedAsRoot(t *testing.T) {
 	assert.Equal(t, http.StatusOK, rec.Code)
 	// "" → nil 正規化により root の file が返る。
 	assert.Contains(t, rec.Body.String(), "root.png")
+}
+
+// **列に入らないカーソルは 400 (#3025)。** NUL を含む値は `id < ?` の bind
+// parameter に載せた時点で PostgreSQL が落とすので、そのまま repository へ渡すと
+// 500 になる。**JSON では NUL をエスケープで送る** — 生バイトを body に載せると
+// JSON として不正になり、`Bind` の 400 で guard まで届かない。
+func TestCursorGuardRejectsUnstorableCursor(t *testing.T) {
+	const body = `{"untilId":"a\u0000b"}`
+	for _, tt := range []struct {
+		name string
+		fn   func(h *Handler) func(echo.Context) error
+	}{
+		{"FilesList", func(h *Handler) func(echo.Context) error { return h.FilesList }},
+		{"FilesAttachedNotes", func(h *Handler) func(echo.Context) error { return h.FilesAttachedNotes }},
+		{"Stream", func(h *Handler) func(echo.Context) error { return h.Stream }},
+		{"FoldersList", func(h *Handler) func(echo.Context) error { return h.FoldersList }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _, _ := newHandlerWithRepos(t)
+			c, rec := newJSONReq(t, body)
+			setUser(c, "alice")
+			require.NoError(t, tt.fn(h)(c))
+			assert.Equal(t, http.StatusBadRequest, rec.Code,
+				"列に入らないカーソルを repository へ渡している (SELECT がそこで落ちる)")
+			assert.Contains(t, rec.Body.String(), "INVALID_PARAM")
+		})
+	}
+}
+
+// --- multipart の error を捨てない (#3037) ---
+
+// failingMultipartFile yields n bytes then fails, standing in for a temp file
+// that becomes unreadable mid-upload (disk full / removed / I/O error).
+type failingMultipartFile struct {
+	data []byte
+	pos  int
+	stop int
+	err  error
+}
+
+func (f *failingMultipartFile) Read(p []byte) (int, error) {
+	if f.pos >= f.stop {
+		return 0, f.err
+	}
+	n := copy(p, f.data[f.pos:f.stop])
+	f.pos += n
+	return n, nil
+}
+func (f *failingMultipartFile) ReadAt([]byte, int64) (int, error) { return 0, f.err }
+func (f *failingMultipartFile) Seek(int64, int) (int64, error)    { return 0, f.err }
+func (f *failingMultipartFile) Close() error                      { return nil }
+
+// **`Open` の失敗を捨てない。** 以前は `src, _ :=` と書いていたので、
+// `src` が nil のまま `defer src.Close()` に落ちて **nil 参照 panic** していた。
+// echo の multipart パーサは `maxMemory` を超えた分を一時ファイルへ落とすので、
+// `Open` は実ファイルを開く = 失敗しうる。
+func TestReadMultipartFile_OpenFailureIsReported(t *testing.T) {
+	prev := openMultipartFile
+	t.Cleanup(func() { openMultipartFile = prev })
+	openMultipartFile = func(*multipart.FileHeader) (multipart.File, error) {
+		return nil, errors.New("disk is gone")
+	}
+
+	c, _ := newMultipartReq(t, "hello.txt", "hello", nil)
+	require.NotPanics(t, func() {
+		body, name, err := readMultipartFile(c, 0)
+		assert.Error(t, err, "Open の失敗を握り潰している")
+		assert.Nil(t, body)
+		assert.Empty(t, name)
+	})
+}
+
+// **`ReadAll` の途中失敗を捨てない。** 以前は `body, _ :=` と書いていたので、
+// **無言で切り詰められた本体**がそのまま保存され、MD5 / size / MIME がその
+// 切れ端で確定していた (利用者には成功として返る)。
+func TestReadMultipartFile_ReadFailureIsReported(t *testing.T) {
+	prev := openMultipartFile
+	t.Cleanup(func() { openMultipartFile = prev })
+	openMultipartFile = func(*multipart.FileHeader) (multipart.File, error) {
+		return &failingMultipartFile{
+			data: []byte("hello world"),
+			stop: 5, // 5 バイト読めた時点で失敗する
+			err:  errors.New("input/output error"),
+		}, nil
+	}
+
+	c, _ := newMultipartReq(t, "hello.txt", "hello world", nil)
+	body, _, err := readMultipartFile(c, 0)
+	require.Error(t, err, "途中で切れた本体を成功として返している")
+	assert.Nil(t, body, "切れ端を返している")
+}
+
+// 切れ端が保存されないこと、**かつ 5xx で返ること**を handler まで通して見る。
+//
+// `Open` / `ReadAll` の失敗はディスク満杯 / fd 枯渇 / 一時ファイル消失で、
+// 全部サーバー側の事象。`INVALID_PARAM` に潰すと利用者もフロントも再試行せず、
+// 監視にも 4xx しか出ないので障害が見えない (#2792)。
+func TestFilesCreate_ReadFailureDoesNotStoreTruncatedFile(t *testing.T) {
+	prev := openMultipartFile
+	t.Cleanup(func() { openMultipartFile = prev })
+	openMultipartFile = func(*multipart.FileHeader) (multipart.File, error) {
+		return &failingMultipartFile{
+			data: []byte("hello world"),
+			stop: 5,
+			err:  errors.New("input/output error"),
+		}, nil
+	}
+
+	h, fileRepo, _ := newHandler(t)
+	c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
+	setUser(c, "u1")
+	require.NoError(t, h.FilesCreate(c))
+	assert.Equal(t, http.StatusInternalServerError, rec.Code,
+		"サーバー側の I/O 障害をクライアントエラーに潰している")
+	assert.Empty(t, fileRepo.Files, "切れ端が保存されている")
+}
+
+// **普通のアップロードは通ったまま。** これが無いと「常にエラーを返す」実装でも
+// 上のテストが通る。
+func TestReadMultipartFile_OrdinaryUploadStillReads(t *testing.T) {
+	c, _ := newMultipartReq(t, "hello.txt", "hello world", nil)
+	body, name, err := readMultipartFile(c, 0)
+	require.NoError(t, err)
+	assert.Equal(t, "hello world", string(body))
+	assert.Equal(t, "hello.txt", name)
+}
+
+// **`file` フィールドが無いのは本当にクライアント起因なので 400 のまま。**
+// これが無いと「multipart の失敗を全部 500 にする」実装でも上のテストが通る。
+func TestFilesCreate_MissingFileFieldStays400(t *testing.T) {
+	h, fileRepo, _ := newHandler(t)
+	c, rec := newMultipartReq(t, "", "", map[string]string{"name": "x"})
+	setUser(c, "u1")
+	require.NoError(t, h.FilesCreate(c))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Empty(t, fileRepo.Files)
+}
+
+// roleStub は maxFileSizeMb policy だけを返す最小の RoleChecker。
+type roleStub struct {
+	maxFileSizeMb any
+}
+
+func (roleStub) IsModerator(string) bool { return false }
+
+func (r roleStub) GetUserPolicies(string) map[string]any {
+	return map[string]any{"maxFileSizeMb": r.maxFileSizeMb}
+}
+
+// **policy の上限は読み切る前に効くこと (#3037)。**
+//
+// 既定では `maxFileSizeMb` が 30MB なのに `config.maxFileSize` が 250MB
+// なので、判定が `Upload` の中だけだと「30MB しか保存できない利用者が
+// 250MB を送り付けてメモリを確保させる」ことができた。
+func TestReadMultipartFile_StopsAtPolicyLimit(t *testing.T) {
+	// 11 バイトの本体に 5 バイトの上限。
+	c, _ := newMultipartReq(t, "hello.txt", "hello world", nil)
+	body, _, err := readMultipartFile(c, 5)
+	require.ErrorIs(t, err, coredrive.ErrMaxFileSizeExceeded)
+	assert.Nil(t, body, "上限を超えた本体を返している")
+
+	// 上限ちょうどは通る。
+	c, _ = newMultipartReq(t, "hello.txt", "hello", nil)
+	body, _, err = readMultipartFile(c, 5)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(body))
+}
+
+// **`FileHeader.Size` だけに頼らない。** あれはパーサが数えた値なので、
+// 実際の読み込み量と食い違いうる。上限を強制するのは実際に読む側。
+func TestReadMultipartFile_LimitsEvenWhenHeaderSizeLies(t *testing.T) {
+	prev := openMultipartFile
+	t.Cleanup(func() { openMultipartFile = prev })
+	// FileHeader.Size は 5 のまま、実体は 11 バイト返す。
+	openMultipartFile = func(*multipart.FileHeader) (multipart.File, error) {
+		return &failingMultipartFile{data: []byte("hello world"), stop: 11, err: io.EOF}, nil
+	}
+
+	c, _ := newMultipartReq(t, "hello.txt", "hello", nil)
+	_, _, err := readMultipartFile(c, 5)
+	require.ErrorIs(t, err, coredrive.ErrMaxFileSizeExceeded)
+}
+
+// handler まで通して 413 になること。**`Upload` が返すのと同じ応答**なので、
+// 読む前に落ちたか後で落ちたかで挙動は変わらない。
+func TestFilesCreate_PolicyLimitReturns413(t *testing.T) {
+	h, fileRepo, _ := newHandler(t)
+	h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 0.000001}) // 約 1 バイト
+
+	c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
+	setUser(c, "u1")
+	require.NoError(t, h.FilesCreate(c))
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	assert.Contains(t, rec.Body.String(), "MAX_FILE_SIZE_EXCEEDED")
+	assert.Empty(t, fileRepo.Files, "上限を超えたファイルが保存されている")
+}
+
+// **普通のアップロードは通ったまま。** これが無いと「常に 413 を返す」実装でも
+// 上のテストが通る。
+func TestFilesCreate_UnderPolicyLimitStillUploads(t *testing.T) {
+	h, fileRepo, _ := newHandler(t)
+	h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 30})
+
+	c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
+	setUser(c, "u1")
+	require.NoError(t, h.FilesCreate(c))
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Len(t, fileRepo.Files, 1)
+}
+
+// countingMultipartFile records how many bytes were actually read.
+type countingMultipartFile struct {
+	data []byte
+	pos  int
+	read int
+}
+
+func (f *countingMultipartFile) Read(p []byte) (int, error) {
+	if f.pos >= len(f.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[f.pos:])
+	f.pos += n
+	f.read += n
+	return n, nil
+}
+func (f *countingMultipartFile) ReadAt([]byte, int64) (int, error) { return 0, io.EOF }
+func (f *countingMultipartFile) Seek(int64, int) (int64, error)    { return 0, nil }
+func (f *countingMultipartFile) Close() error                      { return nil }
+
+// **上限を超える本体を「最後まで読んでから」落としていないこと (#3037)。**
+//
+// 応答だけを見ると、読む前に落としても `Upload` が落としても同じ 413 に
+// なるので区別が付かない。**実際に読んだバイト数**を見る。
+func TestFilesCreate_DoesNotReadPastPolicyLimit(t *testing.T) {
+	const size = 64 * 1024
+
+	// **申告どおりの大きさなら、そもそも開かない。** `FileHeader.Size` で
+	// 落とせる早い枝。
+	t.Run("申告が正しければ開きもしない", func(t *testing.T) {
+		opened := false
+		prev := openMultipartFile
+		t.Cleanup(func() { openMultipartFile = prev })
+		openMultipartFile = func(fh *multipart.FileHeader) (multipart.File, error) {
+			opened = true
+			return prev(fh)
+		}
+
+		h, fileRepo, _ := newHandler(t)
+		h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 1.0 / 1024}) // 1KiB
+
+		c, rec := newMultipartReq(t, "big.bin", strings.Repeat("x", size), nil)
+		setUser(c, "u1")
+		require.NoError(t, h.FilesCreate(c))
+
+		assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+		assert.Empty(t, fileRepo.Files)
+		assert.False(t, opened, "上限超過が申告で分かるのに本体を開いている")
+	})
+
+	// **申告が嘘でも、読むのは上限 +1 バイトまで。**
+	t.Run("申告が嘘でも読み切らない", func(t *testing.T) {
+		var seen *countingMultipartFile
+		prev := openMultipartFile
+		t.Cleanup(func() { openMultipartFile = prev })
+		openMultipartFile = func(*multipart.FileHeader) (multipart.File, error) {
+			seen = &countingMultipartFile{data: bytes.Repeat([]byte("x"), size)}
+			return seen, nil
+		}
+
+		h, fileRepo, _ := newHandler(t)
+		h.svc.SetRoleChecker(roleStub{maxFileSizeMb: 1.0 / 1024}) // 1KiB
+
+		// 申告は 5 バイト (上限内) なので Size の枝は通り抜ける。
+		c, rec := newMultipartReq(t, "small.bin", "hello", nil)
+		setUser(c, "u1")
+		require.NoError(t, h.FilesCreate(c))
+
+		assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+		assert.Empty(t, fileRepo.Files)
+		require.NotNil(t, seen, "openMultipartFile が呼ばれていない")
+		assert.LessOrEqual(t, seen.read, 1024+1,
+			"上限を超えた本体を最後まで読んでいる (読んだのは %d バイト)", seen.read)
+	})
+}
+
+// **`maxBytes+1` のオーバーフローで 0 バイトの本体を保存しない (#3037 レビュー)。**
+//
+// `policyMegabytes` は `safemath.MulFloat64` で `MaxInt64` に飽和するので、
+// `maxFileSizeMb` に `math.MaxFloat64` (= このリポジトリが「無制限」の意味で
+// 使うイディオム) を入れると `maxBytes+1` が `MinInt64` になり、
+// `io.LimitReader` が即 EOF を返す。**error 無しで空の本体が保存される**という、
+// この関数の doc が塞いだばかりの形。
+func TestReadAtMost_SaturatedLimitIsTreatedAsUnlimited(t *testing.T) {
+	body, err := readAtMost(strings.NewReader("hello world"), math.MaxInt64)
+	require.NoError(t, err)
+	assert.Equal(t, "hello world", string(body), "飽和した上限で本体が切り詰められている")
+}
+
+func TestFilesCreate_SaturatedPolicyStillUploads(t *testing.T) {
+	h, fileRepo, _ := newHandler(t)
+	h.svc.SetRoleChecker(roleStub{maxFileSizeMb: math.MaxFloat64})
+
+	c, rec := newMultipartReq(t, "hello.txt", "hello world", nil)
+	setUser(c, "u1")
+	require.NoError(t, h.FilesCreate(c))
+
+	require.Equal(t, http.StatusOK, rec.Code, "無制限の policy でアップロードが落ちている")
+	require.Len(t, fileRepo.Files, 1)
+	for _, f := range fileRepo.Files {
+		assert.Equal(t, len("hello world"), f.Size, "0 バイトで保存されている")
+	}
 }

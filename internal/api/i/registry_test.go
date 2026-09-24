@@ -2,6 +2,7 @@ package i
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -259,4 +260,125 @@ func TestRegistryScopesWithDomain_ReturnsDistinctPairs(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Nil(t, got[0].Domain)
 	assert.Len(t, got[0].Scopes, 2)
+}
+
+// failingRegistryRepo makes every Get look like a database failure.
+type failingRegistryRepo struct {
+	*testutil.MockRegistryRepository
+	err error
+}
+
+func (r *failingRegistryRepo) Get(string, string, []string, *string) (*model.RegistryItem, error) {
+	return nil, r.err
+}
+
+// **DB 障害を「そんなキーは無い」にしない** (#2792)。
+//
+// registry はクライアントの設定同期に使うので、障害を 400 で返すと「消えた」と
+// 判断して既定値で上書きしうる。not-found だけが 400。
+func TestRegistryGet_DBFailureIsNot4xx(t *testing.T) {
+	dbErr := errors.New("dial tcp 127.0.0.1:5432: connect: connection refused")
+
+	for _, tt := range []struct {
+		name string
+		call func(*Handler) func(echo.Context) error
+	}{
+		{"i/registry/get", func(h *Handler) func(echo.Context) error { return h.RegistryGet }},
+		{"i/registry/get-detail", func(h *Handler) func(echo.Context) error { return h.RegistryGetDetail }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newExtraHandler(t)
+			h.SetRegistryRepo(&failingRegistryRepo{
+				MockRegistryRepository: testutil.NewMockRegistryRepository(),
+				err:                    dbErr,
+			})
+
+			rec := postRegistryWithScope(tt.call(h),
+				`{"key":"theme","scope":["client"]}`, stubUser, nil)
+			assert.Equal(t, http.StatusInternalServerError, rec.Code,
+				"DB 障害が 4xx に化けている (#2792)")
+		})
+	}
+
+	t.Run("not-found は 400 のまま", func(t *testing.T) {
+		h, _ := newExtraHandler(t)
+		h.SetRegistryRepo(testutil.NewMockRegistryRepository()) // 空 = ErrNotFound
+
+		rec := postRegistryWithScope(h.RegistryGet,
+			`{"key":"missing","scope":["client"]}`, stubUser, nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "NO_SUCH_KEY")
+	})
+}
+
+// **列に入らない registry の値を弾く (#3037)。**
+//
+// `i/registry/*` は**任意の認証ユーザー**が叩ける。`key` varchar(1024) /
+// `domain` varchar(512) / `scope` varchar(1024)[] を超える値は SQLSTATE 22001 で
+// クエリごと落ちるので、長い文字列 1 つで 500 を起こせていた。NUL (#3025) は
+// 既に塞いであったが、幅は見ていなかった。
+func TestRegistryGuards_RejectOverwideValues(t *testing.T) {
+	long := strings.Repeat("a", 1025)
+
+	assert.False(t, storableRegistryWrite(long, nil), "key の幅を見ていない")
+	domain := strings.Repeat("d", 513)
+	assert.False(t, storableRegistryWrite("k", &domain), "domain の幅を見ていない")
+	assert.False(t, validRegistryScope([]string{long}), "scope の幅を見ていない")
+
+	// NUL は従来どおり (回帰していないこと)。
+	assert.False(t, storableRegistryValue("a\x00b", nil))
+	nulDomain := "a\x00b"
+	assert.False(t, storableRegistryValue("k", &nulDomain))
+
+	// **読み取り側は幅を見ない。** 列幅を超えた値は比較の右辺では落ちない
+	// (`varchar(10)` の列に 2000 文字を比べても 0 行が返るだけ、実測) ので、
+	// 応答は従来どおり `NO_SUCH_KEY` でなければならない。幅で 400 にすると
+	// wire のエラーコードが変わる。
+	assert.True(t, storableRegistryValue(long, nil), "読み取り側で幅を弾いている")
+	assert.True(t, storableRegistryValue("k", &domain), "読み取り側で幅を弾いている")
+}
+
+// **境界ちょうどと普通の値は通ったまま。** これが無いと「常に拒否する」実装でも
+// 上のテストが通る。
+func TestRegistryGuards_AcceptOrdinaryValues(t *testing.T) {
+	assert.True(t, storableRegistryWrite(strings.Repeat("a", 1024), nil), "key の上限ちょうどを弾いている")
+	domain := strings.Repeat("d", 512)
+	assert.True(t, storableRegistryWrite("k", &domain), "domain の上限ちょうどを弾いている")
+	assert.True(t, validRegistryScope([]string{strings.Repeat("a", 1024)}), "scope の上限ちょうどを弾いている")
+	assert.True(t, storableRegistryValue("client", nil))
+	assert.True(t, validRegistryScope([]string{"client", "base"}))
+	assert.True(t, validRegistryScope(nil))
+}
+
+// **value は jsonb 列へそのまま入る (#3037)。** PostgreSQL は NUL エスケープを
+// SQLSTATE 22P05 でクエリごと落とすので、引く前に弾かないと**任意の認証
+// ユーザーが 500 を起こせる**。
+func TestRegistrySet_UnstorableValueIs400(t *testing.T) {
+	esc := `\u0000`
+	for name, body := range map[string]string{
+		"値に NUL":  `{"key":"theme","value":{"a":"x` + esc + `y"},"scope":["client"]}`,
+		"キーに NUL": `{"key":"theme","value":{"x` + esc + `y":"a"},"scope":["client"]}`,
+		"配列の中":    `{"key":"theme","value":["ok","x` + esc + `y"],"scope":["client"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, _ := newExtraHandler(t)
+			reg := testutil.NewMockRegistryRepository()
+			h.SetRegistryRepo(reg)
+			rec := postRegistryWithScope(h.RegistrySet, body, stubUser, nil)
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "列に入らない value を受け入れている")
+			assert.Empty(t, reg.Items)
+		})
+	}
+}
+
+// **普通の値は通ったまま。** これが無いと「常に拒否する」実装でも上が通る。
+// バックスラッシュ自体がエスケープされた形 (ただの 6 文字) も通ること。
+func TestRegistrySet_OrdinaryValueStillPasses(t *testing.T) {
+	h, _ := newExtraHandler(t)
+	reg := testutil.NewMockRegistryRepository()
+	h.SetRegistryRepo(reg)
+	rec := postRegistryWithScope(h.RegistrySet,
+		`{"key":"theme","value":{"あ":"絵文字","b":"x\\u0000y"},"scope":["client"]}`, stubUser, nil)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	assert.Len(t, reg.Items, 1)
 }

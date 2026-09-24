@@ -6,18 +6,118 @@ on:
   pull_request:
     branches: [main, develop]
 
+# GITHUB_TOKEN の既定権限を最小化する。全jobはcheckout/build/testのみで
+# リポジトリへの書き込みやPR/issueへの操作を行わないため、workflow直下で
+# contents: readに絞れば全job分満たせる (jobごとの上書きは不要)。
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       - name: Build
         run: go build ./...
+
+      # submodule の pointer が fork へ push 済みかを見る (#2845)。
+      #
+      # **required check で submodule を取っているものが 1 つも無い。** ci.yml で
+      # `submodules: recursive` を指定しているのは frontend-check だけで、build /
+      # test-shards / lint はいずれも取らない。submodule を取る他の workflow
+      # (diff-e2e / playwright / upstream-backend-e2e / dropin-e2e / docker) も全て
+      # 非 required。したがって pointer が未 push の SHA を指していても **required は
+      # 全部緑のままマージでき**、develop に誰も解決できない pointer が載る。復旧は
+      # その commit を持っている本人にしかできない。
+      #
+      # **`git ls-remote | grep` は使えない。** ls-remote が列挙するのは ref の
+      # 先端だけなので、push 済みブランチの祖先 commit を取りこぼして誤検知する。
+      # GitHub は SHA 指定の fetch を許可しているので、1 commit だけ shallow に
+      # 取れるかで判定する (実測 1.8 秒 / 13 MB。未 push は
+      # `upload-pack: not our ref` で exit 128)。
+      #
+      # 同 job の checkout は submodule を取らないが、gitlink の SHA は
+      # `git ls-tree` で読めるので追加の取得は要らない。
+      - name: Check submodule commit is pushed
+        run: |
+          set -euo pipefail
+          path=third_party/misskey
+          sha=$(git ls-tree HEAD "$path" | awk '{print $3}')
+          if [ -z "$sha" ]; then
+            echo "::error::$path の gitlink を読めませんでした。submodule の構成が変わったならこの step も直してください"
+            exit 1
+          fi
+          url=$(git config -f .gitmodules --get "submodule.$path.url")
+          echo "$path -> $sha ($url)"
+          if ! git fetch --depth=1 -q "$url" "$sha"; then
+            echo "::error::submodule の commit $sha が $url に存在しません。fork へ先に push してください (git -C $path push origin <branch>)"
+            exit 1
+          fi
+
+          # **doc の pin が指す tag が、gitlink と同じ commit か。**
+          # `make submodulepin-check` は SHA だけを突き合わせる — tag から SHA を
+          # 解くにはネットワークが要り、`make gates` はそれを前提にできないため。
+          # **tag 名の正しさを見られるのはここだけ** (#2969)。
+          # #2963 の事故は「tag だけ直して gitlink を忘れた」形だったので、
+          # SHA 側を書き換え忘れると gates は素通りする。ここで塞ぐ。
+          n=$(grep -c '\*\*現在の pin は ' docs/divergence.md || true)
+          if [ "$n" != "1" ]; then
+            echo "::error::docs/divergence.md の pin 行が $n 件です。ちょうど 1 件にしてください (書式: **現在の pin は \`<tag>\` (\`<短縮 SHA>\`)。**)"
+            exit 1
+          fi
+          # shellcheck disable=SC2016  # sed の後方参照なのでシェルに展開させない
+          tag=$(sed -n 's/.*\*\*現在の pin は `\([^`]*\)`.*/\1/p' docs/divergence.md)
+          # annotated tag なら `^{}` が commit を指す。fork の tag は lightweight だが
+          # 将来変わっても壊れないよう両方見る。
+          tagsha=$(git ls-remote "$url" "refs/tags/${tag}^{}" | cut -f1)
+          [ -n "$tagsha" ] || tagsha=$(git ls-remote "$url" "refs/tags/${tag}" | cut -f1)
+          if [ -z "$tagsha" ]; then
+            echo "::error::docs/divergence.md の pin が指す tag $tag が $url にありません。tag を push し忘れていませんか"
+            exit 1
+          fi
+          if [ "$tagsha" != "$sha" ]; then
+            echo "::error::docs/divergence.md の tag $tag は $tagsha を指しますが、gitlink は $sha です。doc と pointer のどちらかが古いままです"
+            exit 1
+          fi
+          echo "pin ok: $tag -> $tagsha"
+
+          # **§4-2 の表の tag が fork に実在するか (#3144)。**
+          # あの表は「還元不能な差分の一覧」の錨なので、typo した tag が残ると行が
+          # 指す先を追えなくなる。`assertForkTagSequence` は表の中の連番しか見て
+          # おらず、実在しない tag を書いても通る。
+          # **submodule の checkout は shallow で tag が降りてこない**ので Go 側の
+          # gate では見られない。`git ls-remote --tags` は ref の一覧だけを取るので
+          # 1 往復で済む (実測 0.5 秒 / 121 tag)。
+          git ls-remote --tags "$url" | sed 's/.*refs\/tags\///; s/\^{}$//' | sort -u > /tmp/fork-tags.txt
+          # shellcheck disable=SC2016  # sed の後方参照なのでシェルに展開させない
+          sed -n 's/^| `\([0-9][0-9.]*-mk\.[0-9][0-9]*[a-z]*\)` |.*/\1/p' docs/divergence.md | sort -u > /tmp/doc-tags.txt
+          doccount=$(wc -l < /tmp/doc-tags.txt)
+
+          # **件数は冒頭サマリの宣言値と一致すること。** 「1 件以上」のような下限だと
+          # 全滅しか見られず、書式が少し変わって 115 行中 114 行が抽出から落ちても
+          # 緑になる (#3142 のレビューで実測)。サマリの値は `TestDivergenceDoc_*` が
+          # §4-2 の行数と一致することを別途強制しているので、ここと突き合わせれば
+          # 「抽出できた数 == 表の行数 == 宣言値」が閉じる。
+          declared=$(sed -n 's/^| fork frontend の独自変更 | \([0-9]*\) tag .*/\1/p' docs/divergence.md)
+          if [ -z "$declared" ]; then
+            echo "::error::docs/divergence.md 冒頭サマリの \`fork frontend の独自変更\` 行から件数を読めませんでした。書式を変えたならこの step も直してください"
+            exit 1
+          fi
+          if [ "$doccount" != "$declared" ]; then
+            echo "::error::docs/divergence.md §4-2 から $doccount 件しか tag を拾えませんでした (冒頭サマリの宣言は $declared 件)。表の書式を変えたならこの step も直してください"
+            exit 1
+          fi
+          missing=$(comm -23 /tmp/doc-tags.txt /tmp/fork-tags.txt)
+          if [ -n "$missing" ]; then
+            echo "::error::docs/divergence.md §4-2 の tag が $url にありません: $(echo "$missing" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "§4-2 tags ok: $doccount 件すべて fork に存在"
 
       # 同梱サンプルは **既定無効** (#2495)。clone しただけの運営者のバイナリ・
       # フロント・DB に勝手に入らないようにするため。有効なままだと、設定して
@@ -132,9 +232,9 @@ jobs:
       SHARD_TOTAL: 4
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -147,21 +247,45 @@ jobs:
         id: shard
         run: |
           ALL=$(go list -f '{{if (or .TestGoFiles .XTestGoFiles)}}{{.ImportPath}}{{end}}' ./... | awk 'NF' | sort)
-          PKGS=$(echo "$ALL" | awk -v s=$SHARD_INDEX -v n=$SHARD_TOTAL 'NR % n == (s % n)' | tr '\n' ' ')
+          PKGS=$(echo "$ALL" | awk -v s="$SHARD_INDEX" -v n="$SHARD_TOTAL" 'NR % n == (s % n)' | tr '\n' ' ')
           echo "Shard $SHARD_INDEX/$SHARD_TOTAL packages:"
           echo "$PKGS" | tr ' ' '\n' | sed '/^$/d'
           echo "pkgs=$PKGS" >> "$GITHUB_OUTPUT"
 
       # pipefailを明示的に立てないと`go test ... | tee`が失敗を握りつぶす
       # (teeのexit 0がパイプライン全体の結果になる) ため設定する。
+      #
+      # -shuffle は固定seedで回す (#2795)。テストの実行順に依存する実装
+      # (プロセス共有の状態を張り替えて戻さない等) をここで落とす。
+      #
+      # `on` (毎回ランダム) にしない: 失敗を手元で再現できず、required checkの
+      # `test`が不定期に赤くなる。
+      #
+      # **shard番号をseedにしない**: shard配属は`NR % 4`なので、テスト
+      # パッケージが1つ増えるだけで既存パッケージのseedが変わり、順序が丸ごと
+      # 入れ替わる。**無関係なPRが未実行の順序を引いて赤くなる**ため、
+      # ランダムseedと同じ問題を別経路で持ち込む。
+      #
+      # 全shard共通の固定値なら順序はshard配属に依存しない。1パッケージが
+      # 試す順序は1通りなので、`-shuffle`だけで全ての順序依存が見つかるわけでは
+      # ない。
+      #
+      # **seedは実測で選ぶこと。** 覚えやすい値 (issue番号など) を置くと、
+      # 検出力を持たない値を引く。#2795で実測したところ、restoreを無効化した
+      # 変異が落ちるseedは12個中7個だけだった (2795自身は落ちない側)。
+      # 3は最も強く6テストが落ちる。変えるときは
+      # `internal/server/global_state_test.go`のrestoreProcessGlobalsの
+      # cleanup本体を`if true { return }`で潰し、その状態で落ちることを
+      # 確認してから差し替える。
       - name: Run tests with coverage
         run: |
           set -o pipefail
           go test ${{ steps.shard.outputs.pkgs }} \
             -race \
             -count=1 \
+            -shuffle=3 \
             -timeout 10m \
-            -coverprofile=coverage-shard-${SHARD_INDEX}.out \
+            "-coverprofile=coverage-shard-${SHARD_INDEX}.out" \
             -covermode=atomic 2>&1 | tee test_output.txt
 
       - name: Enforce per-package coverage
@@ -192,7 +316,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-shard-${{ matrix.shard }}
           path: coverage-shard-${{ matrix.shard }}.out
@@ -252,9 +376,9 @@ jobs:
       MK_PLUGIN_TESTS_REQUIRE_DB: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -288,19 +412,28 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       - name: Vet
         run: go vet ./...
 
+      # **`make` 経由で呼ぶ。** actionlint の版は Makefile 側に 1 つだけ置く。
+      # ここに書き写すと #2841 (make test と CI の flag がずれていた) と同じ
+      # ドリフトが起きる。
+      - name: Actionlint
+        run: make actionlint
+
+      # **gofmt の終了コードも見る。** Go 1.27 から `gofmt -d` は差分があると
+      # exit 1 を返すので、`diff=$(...)` を素で書くと `bash -e` がそこで step を
+      # 止め、**差分を 1 行も出さずに落ちる** (実測)。`if` の条件に置けば `-e` は
+      # 効かない。構文エラー (stderr) も一緒に出す。
       - name: Format check
         run: |
-          diff=$(gofmt -s -d .)
-          if [ -n "$diff" ]; then
+          if ! diff=$(gofmt -s -d . 2>&1) || [ -n "$diff" ]; then
             echo "$diff"
             exit 1
           fi
@@ -319,7 +452,7 @@ jobs:
       - name: Check duplicate test fixture IDs
         run: |
           set -e
-          dupes=$(grep -rh 'insertTestUser(t, "\|insertRemoteTestUser(t, "' \
+          dupes=$(grep -rh 'insertTestUser(t, "\|insertRemoteTestUser(t, "\|createTestUser(t, "' \
             internal/repository/*_test.go \
             | awk -F'"' '{print $2}' | sort | uniq -c | sort -rn \
             | awk '$1 > 1')
@@ -335,12 +468,20 @@ jobs:
               grep -n "\"$id\"" internal/repository/*_test.go | sed 's/^/    /'
               echo ""
             done <<< "$dupes"
-            echo "Each insertTestUser / insertRemoteTestUser caller must use"
+            echo "Each insertTestUser / insertRemoteTestUser / createTestUser caller must use"
             echo "a unique ID literal across the repository package. Rename"
             echo "the duplicates to file-specific prefixes (e.g. u_<file>_*)."
             exit 1
           fi
           echo "No duplicate test fixture IDs."
+
+      # **`make` 経由で呼ぶ。** 版の定義は Makefile 側に 1 つだけ置く
+      # (#2841 と同じドリフトを避ける)。
+      #
+      # **一番重いので最後に置く。** 他は grep / gofmt / actionlint で数秒だが
+      # これは分単位なので、速い検査で落ちるものは先に落とす。
+      - name: Golangci-lint
+        run: make golangci-lint
 
   # fork frontend (third_party/misskey) の型チェック。
   #
@@ -354,19 +495,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           # pnpm のバージョンは submodule 側 package.json の packageManager から
           # 取る。mk リポジトリ直下には package.json が無い。
           package_json_file: third_party/misskey/package.json
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: third_party/misskey/.node-version
           cache: pnpm
@@ -390,7 +531,7 @@ jobs:
       # plugin-api.ts を壊してもサンプル側では検出されない。サンプルは
       # mk-plugin.yml で既定無効 (#2495) なので、disabled も含める
       # plugins-all を使う。
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -409,19 +550,52 @@ jobs:
       - name: Type check (vue-tsc)
         run: make frontend-check
 
+      # fork frontend の eslint (#2843)。**型だけでは足りない。** 1.0 以降
+      # fork frontend は mk-go 独自に進化させる方針で、独自コードは増え続ける
+      # (docs/divergence.md §4-2)。型は vue-tsc が見るが、それ以外の規約違反は
+      # 誰も見ていなかった。実際 mk-go 独自ファイル 2 つに commit 済みの
+      # 違反が 4 箇所残っていた (2026.7.0-mk.22j で修正)。
+      #
+      # upstream AGENTS.md も「変更を出す前の最低チェック」に pnpm lint
+      # (typecheck + eslint) を挙げている。範囲はその `pnpm eslint` と同じ
+      # `src/**/*.{ts,vue}` にする — **`eslint .` にしないこと**。upstream が
+      # lint していない test/ まで拾い、追従のたびに他人の負債で落ちる
+      # (実測で test/ 込みだと 115 件)。
+      #
+      # 依存インストールと workspace ビルドは上の step で済んでいるので、
+      # 追加コストは eslint の実行時間だけ。
+      - name: Lint (eslint)
+        working-directory: third_party/misskey/packages/frontend
+        run: pnpm eslint
+
+      # fork frontend の vitest (#2844)。**どの workflow でも実行されていなかった。**
+      # spec は 20 本あるが ci.yml にも他の workflow にも実行箇所が無く、
+      # dropin-frontend-e2e は cypress で別物。
+      #
+      # #2831 で実際に効いた: frontend の修正 (WebSocket 再接続時の未読件数の
+      # 再同期) は in-flight 重複排除 / スロットル / 世代カウンタの 3 つのガードが
+      # 相互作用する実装なのに、敵対的レビューの「テストがゼロ」という指摘に対して
+      # **テスト基盤が無いこと**を理由に見送っている。
+      #
+      # 依存インストールと workspace ビルドは上の step で済んでいるので、追加
+      # コストは vitest の実行時間だけ。手元の再現は `make frontend-test`。
+      - name: Unit test (vitest)
+        working-directory: third_party/misskey/packages/frontend
+        run: pnpm test
+
   vulncheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       # Dockerfile の builder は go.mod の `go` directive と同じ patch version を
       # 指していないといけない。govulncheck が見るのは go.mod 側なので、ここが
       # ずれていると **CI は緑のまま、実際に配る image だけが脆弱**になる。
-      # floating tag (`golang:1.26-alpine`) に戻すと再現性も失われる。
+      # floating tag (`golang:1.27-alpine`) に戻すと再現性も失われる。
       - name: Go version pin is consistent between go.mod and Dockerfile
         run: |
           gomod=$(awk '/^go [0-9]/ {print $2; exit}' go.mod)

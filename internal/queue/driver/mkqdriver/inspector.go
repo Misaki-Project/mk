@@ -15,10 +15,10 @@ import (
 // surface mkq exposes (Counts / ListJobs / Get / RemoveJob /
 // PromoteJob / RetryJob).
 //
-// State strings returned in TaskSummary mirror BullMQ buckets ("wait",
-// "active", "delayed", "prioritized", "completed", "failed", "paused")
-// rather than the asynq state strings — this keeps the bull-board /
-// Misskey admin UI rendering correct without an extra translation.
+// State strings returned in TaskSummary are the BullMQ bucket names
+// ("wait", "active", "delayed", "prioritized", "completed", "failed",
+// "paused") — this keeps the bull-board / Misskey admin UI rendering
+// correct without an extra translation.
 type Inspector struct {
 	driver *Driver
 }
@@ -37,8 +37,8 @@ func (i *Inspector) Queues() ([]string, error) {
 }
 
 // GetQueueInfo returns the wait / active / delayed / completed /
-// failed counters for the named queue. Pending maps to mkq's wait
-// bucket (asynq's pending semantics).
+// failed counters for the named queue. InspectorInfo.Pending maps to
+// mkq's wait bucket.
 //
 // Retry / Scheduled semantics: mkq の delayed bucket は scheduled
 // (cron / 初回 delayed enqueue) と retry-backoff 待ち (= 失敗して次の
@@ -47,11 +47,11 @@ func (i *Inspector) Queues() ([]string, error) {
 // bucket を `atm` (= attemptsMade、BullMQ HASH field) で filter し、
 // `atm == 0` を Scheduled / `atm > 0` を Retry にマッピングする。
 // `failed` bucket は permanent failure (= dead letter) のみで Retry には
-// 含めない。これにより asynq semantic と完全一致する (#1187):
+// 含めない。driver.InspectorInfo の各欄との対応は以下 (#1187):
 //
-//	asynq.Scheduled = delayed[atm==0] + repeat ZSET
-//	asynq.Retry     = delayed[atm>0]
-//	asynq.Failed    = failed bucket size
+//	Scheduled = delayed[atm==0] + repeat ZSET
+//	Retry     = delayed[atm>0]
+//	Failed    = failed bucket size
 //
 // cost: delayed bucket 全件 ListJobs (ZRANGE + N×HGETALL pipeline) が
 // publisher の 3 秒間隔で走る。通常 < 100 件で問題なし、federation 障害
@@ -88,11 +88,10 @@ func (i *Inspector) GetQueueInfo(qname string) (*driver.InspectorInfo, error) {
 		retryCount = 0
 	}
 
-	// Size mirrors asynq.QueueInfo.Size:
-	//   "sum of Pending, Active, Scheduled, Retry, Aggregating and Archived"
-	// — explicitly excluding Completed (asynq treats stored completed
-	// tasks as retention storage, not queue residents). 旧実装と同様、
-	// delayed 全体 + failed bucket + repeat を入れる。
+	// Size は「キューに居るジョブ数」= Pending + Active + Scheduled + Retry +
+	// Failed。**Completed は入れない** (完了済みは retention として保存されて
+	// いるだけでキューの住人ではない)。delayed 全体 + failed bucket + repeat
+	// を入れる。
 	//
 	// #1187 で内訳が変わったが合計値は不変: scheduledCount + retryCount ==
 	// counts.Delayed (= 同じ delayed bucket を partition しただけ) なので、
@@ -117,26 +116,38 @@ func (i *Inspector) GetQueueInfo(qname string) (*driver.InspectorInfo, error) {
 	}, nil
 }
 
-// PendingCount returns the `wait` list length for the named queue.
+// DispatchableCount returns the `wait` list length for the named queue,
+// or 0 while the queue is paused.
 //
 // GetQueueInfo derives Pending from the same list (`Pending:
-// int(counts.Wait)`), so this is exactly equal — it just skips the rest
-// of the summary. **オートスケーラの 1Hz ポーリング用**で、admin 表示には
-// 使わない (#2605)。
-func (i *Inspector) PendingCount(qname string) (int, error) {
+// int(counts.Wait)`), so outside a pause the two are exactly equal — this
+// just skips the rest of the summary. **オートスケーラの 1Hz ポーリング用**で、
+// admin 表示には使わない (#2605)。
+//
+// pause の判定は LLEN と同じ pipeline に載せる。コマンドはキューあたり 1 → 2 に
+// 増えるが往復は 1 回のまま (#3166)。
+func (i *Inspector) DispatchableCount(qname string) (int, error) {
 	if i.driver.queueFor(qname) == nil {
 		return 0, fmt.Errorf("mkqdriver: unknown queue %q", qname)
 	}
-	n, err := i.driver.rdb.LLen(inspectorCtx(), i.driver.waitKey(qname)).Result()
-	if err != nil {
-		return 0, fmt.Errorf("mkqdriver: llen wait %q: %w", qname, err)
+	ctx := inspectorCtx()
+	pipe := i.driver.rdb.Pipeline()
+	waitLen := pipe.LLen(ctx, i.driver.waitKey(qname))
+	paused := pipe.HExists(ctx, i.driver.metaKey(qname), "paused")
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, fmt.Errorf("mkqdriver: dispatchable count %q: %w", qname, err)
 	}
-	return int(n), nil
+	if paused.Val() {
+		return 0, nil
+	}
+	return int(waitLen.Val()), nil
 }
 
-// PauseQueue pauses the named queue via mkq's BullMQ-compatible Queue.Pause
-// (meta.paused フラグ + wait→paused list 移動)。paused 中の enqueue も paused に
-// 入り orphan しない (mkq v1.0.3 #70)。
+// PauseQueue pauses the named queue via mkq's BullMQ-compatible Queue.Pause.
+//
+// mkq v1.1.0 (BullMQ 6) からは meta.paused フラグだけで dequeue を止め、ジョブは
+// wait に残したまま動かさない (v5 は wait を paused list へ移していた)。だから
+// pause 中も Pending に backlog が見える (DispatchableCount は pause 中 0 を返す)。
 func (i *Inspector) PauseQueue(qname string) error {
 	q := i.driver.queueFor(qname)
 	if q == nil {
@@ -148,8 +159,9 @@ func (i *Inspector) PauseQueue(qname string) error {
 	return nil
 }
 
-// UnpauseQueue resumes the named queue via mkq's Queue.Resume (paused→wait に
-// 戻し marker を poke して blocking worker を起こす)。
+// UnpauseQueue resumes the named queue via mkq's Queue.Resume (フラグを外し
+// marker を poke して blocking worker を起こす)。v5 時代に paused list へ退避
+// されたジョブが残っていれば、Resume がそれも wait へ戻す。
 func (i *Inspector) UnpauseQueue(qname string) error {
 	q := i.driver.queueFor(qname)
 	if q == nil {
@@ -233,9 +245,8 @@ func (i *Inspector) DeleteTask(qname, taskID string) error {
 
 // DeleteAllPendingTasks drains the wait bucket. Returns the number of
 // jobs that were removed; mkq's DrainPending does not currently report
-// the count, so this returns 0 even on success — matching the asynq
-// driver's "best-effort count" semantics for callers that only need
-// success/failure.
+// the count, so this returns 0 even on success. 呼び出し側 (admin の
+// 「Remove all jobs」) は成功 / 失敗しか見ないので実害は無い。
 func (i *Inspector) DeleteAllPendingTasks(qname string) (int, error) {
 	q := i.driver.queueFor(qname)
 	if q == nil {
@@ -247,12 +258,12 @@ func (i *Inspector) DeleteAllPendingTasks(qname string) (int, error) {
 	return 0, nil
 }
 
-// RunTask re-enqueues a task back into wait state, equivalent to asynq's
-// `Inspector.RunTask`. asynq の RunTask は delayed (= scheduled) と retry
-// 両方を受け入れるが、mkq では bucket 別に API が分かれている:
+// RunTask re-enqueues a task back into wait state. 呼び出し側は bucket を
+// 知らずに「今すぐ実行」を要求してくるが、mkq では bucket 別に API が
+// 分かれている:
 //
 //   - PromoteJob: delayed → wait 専用 (失敗時 `ErrJobNotInDelayed`)
-//   - RetryJob:   failed → wait 専用 (asynq RunTask の後半相当)
+//   - RetryJob:   failed → wait 専用
 //
 // よって PromoteJob を先に試し、delayed 状態でなければ RetryJob に
 // fallback する。これで「Retry all queues now」(admin/queue/promote-jobs)
@@ -268,13 +279,11 @@ func (i *Inspector) DeleteAllPendingTasks(qname string) (int, error) {
 // そのまま返す。job が wait や active など別 bucket に既に居る場合も
 // 同様に PromoteJob の error が caller に届く。
 //
-// semantic 差の注記: mkq の `RetryJob` は default で attempt 数 (`atm` /
-// `ats` BullMQ HASH counter) を 0 リセットする (`WithResetAttempts(true)`
-// 相当)。asynq の `Inspector.RunTask` は attempt 数を保持するので、
-// failed bucket path では mkq 側が「fresh start」semantic で、asynq 側が
-// 「resume with same attempts」semantic、という違いがある。admin の
-// 「Retry all queues now」の運用としては、operator が手動で promote した
-// 時点で fresh start が直感的なので、この semantic 差は意図通り。
+// 注記: mkq の `RetryJob` は default で attempt 数 (`atm` / `ats` BullMQ
+// HASH counter) を 0 リセットする (`WithResetAttempts(true)` 相当)。
+// failed bucket から戻した job は「fresh start」になり、残り試行回数を
+// 引き継がない。admin の「Retry all queues now」の運用としては、operator が
+// 手動で promote した時点で fresh start が直感的なので意図通り。
 func (i *Inspector) RunTask(qname, taskID string) error {
 	q := i.driver.queueFor(qname)
 	if q == nil {
@@ -313,6 +322,12 @@ func (i *Inspector) ListFailedTasks(qname string, page, pageSize int) ([]*driver
 	return i.list(qname, mkq.JobBucketFailed, page, pageSize)
 }
 
+// ListDelayedTasks returns up to pageSize entries of the whole delayed
+// bucket (scheduled + retry-backoff), latest fire time first.
+func (i *Inspector) ListDelayedTasks(qname string, page, pageSize int) ([]*driver.TaskSummary, error) {
+	return i.list(qname, mkq.JobBucketDelayed, page, pageSize)
+}
+
 // ListScheduledTasks returns up to pageSize tasks scheduled for first-time
 // processing (= delayed bucket entries with `atm == 0`). cron / 初回
 // delayed enqueue 等が含まれる。retry-backoff 待ち (= `atm > 0`) は
@@ -345,7 +360,8 @@ func (i *Inspector) listDelayedFiltered(qname string, retry bool, page, pageSize
 	if pageSize <= 0 || pageSize > 100 {
 		pageSize = 30
 	}
-	listed, err := q.ListJobs(inspectorCtx(), mkq.JobBucketDelayed, 0, -1, true)
+	// 新しい順 (発火予定が遅い順) で取る。list と揃える (#3167)。
+	listed, err := q.ListJobs(inspectorCtx(), mkq.JobBucketDelayed, 0, -1, false)
 	if err != nil {
 		return nil, fmt.Errorf("mkqdriver: list delayed %s: %w", qname, err)
 	}
@@ -419,7 +435,7 @@ func deriveJobState(st *mkq.JobState) string {
 
 // list normalises mkq.ListJobs inputs (1-indexed page/pageSize) into
 // 0-indexed [start, end] zranges and decodes the resulting jobs into
-// driver.TaskSummary slices.
+// driver.TaskSummary slices, newest first (BullMQ getJobs with asc=false).
 func (i *Inspector) list(qname string, bucket mkq.JobBucket, page, pageSize int) ([]*driver.TaskSummary, error) {
 	q := i.driver.queueFor(qname)
 	if q == nil {
@@ -434,7 +450,14 @@ func (i *Inspector) list(qname string, bucket mkq.JobBucket, page, pageSize int)
 	start := int64((page - 1) * pageSize)
 	end := start + int64(pageSize) - 1
 
-	jobs, err := q.ListJobs(inspectorCtx(), bucket, start, end, true)
+	// **新しい順で取る (#3167)。** upstream の admin/queue/jobs は
+	// `queue.getJobs(types, 0, 100)` で asc=false (新しい順)。古い順だと、
+	// 完了済みが数万件溜まったキューで何か月も前の job しか見えない。
+	// 予約投稿の取り消し (`ClearScheduledNote`) は全ページを走査するので並びに
+	// 依存しない。**admin の clear / promote は先頭ページ (100 件) しか見ない**ので
+	// 依存する — clear は先頭ページが保護対象 (予約投稿) で埋まると打ち切り、
+	// promote はどの 100 件を促進するかがこの並びで決まる。
+	jobs, err := q.ListJobs(inspectorCtx(), bucket, start, end, false)
 	if err != nil {
 		return nil, fmt.Errorf("mkqdriver: list %s/%s: %w", qname, bucket, err)
 	}
@@ -490,8 +513,8 @@ func jobToSummary(queue, state string, job *mkq.Job[framedPayload], st *mkq.JobS
 		s.ReturnValue = st.ReturnValue
 		s.Progress = st.Progress
 		s.AttemptsAt = st.AttemptsAt
-		// CompletedAt は asynq driver と揃えて「成功完了したジョブ」
-		// のみセット。failed (FailedReason != "") の場合は LastFailedAt
+		// CompletedAt は「成功完了したジョブ」のみセット。
+		// failed (FailedReason != "") の場合は LastFailedAt
 		// 側に出すので、ここでは触らない。admin UI が completedAt 列を
 		// 失敗ジョブにも表示してしまうと operator が混乱するため。
 		if !st.FinishedOn.IsZero() && st.FailedReason == "" {

@@ -4,9 +4,8 @@
 // underlying queue runtime — that lives behind queue/driver.
 //
 // AP delivery, webhooks, web push, and maintenance / chart cron
-// jobs all flow through this package. Driver swaps (asynq → mkq)
-// touch only the wiring code that constructs the driver.Driver in
-// internal/server.
+// jobs all flow through this package. Swapping the driver touches only
+// the wiring code that constructs the driver.Driver in internal/server.
 package queue
 
 import (
@@ -104,13 +103,6 @@ type Enqueuer interface {
 	// payload.NoteDraftID 一致を DeleteTask)。caller (NoteDraftService.update
 	// / delete) が re-schedule / unschedule する際に呼ぶ (#1045 Phase 2-C)。
 	ClearScheduledNote(draftID string) error
-	// SupportsScheduledNote は driver が scheduled note 機能 (= delayed
-	// enqueue + clearSchedule の確実な動作) を提供するかを返す。mk-go の
-	// asynq driver は task ID 仕様の制約で確実な clearSchedule が困難な
-	// ため false。mkq driver は true (#1045 Phase 2-C)。handler はこの
-	// flag が false なら scheduled note 作成を `TOO_MANY_SCHEDULED_NOTES`
-	// で拒否する。
-	SupportsScheduledNote() bool
 	Close() error
 }
 
@@ -127,10 +119,6 @@ type Client struct {
 	// (#1045 Phase 2-C)。enqueue 経路は inner.Client のみ使用、inspector
 	// は lazy に Driver から取得しキャッシュする。
 	inspector driver.Inspector
-	// supportsScheduledNote は scheduled note 機能が確実に動作する driver
-	// (= mkq) で wire 時に true、それ以外 (= asynq) は false。handler の
-	// scheduled note 経路で capability gate として参照する (#1045 Phase 2-C)。
-	supportsScheduledNote bool
 
 	mu       sync.RWMutex
 	policies PolicyMap
@@ -142,23 +130,6 @@ func NewClient(d driver.Driver) *Client {
 		inner:     d.Client(),
 		inspector: d.Inspector(),
 	}
-}
-
-// SetSupportsScheduledNote toggles the driver capability flag exposed via
-// `SupportsScheduledNote`. wire 時に driver kind を見て router で設定する
-// (= mkq → true, asynq → false)。default は false (= 安全側)。
-func (c *Client) SetSupportsScheduledNote(b bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.supportsScheduledNote = b
-}
-
-// SupportsScheduledNote returns the capability flag. handler はこの flag が
-// false なら scheduled note 作成を `TOO_MANY_SCHEDULED_NOTES` で拒否する。
-func (c *Client) SupportsScheduledNote() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.supportsScheduledNote
 }
 
 // SetPolicy registers a runtime Policy for queueName. EnqueueDeliver
@@ -268,7 +239,6 @@ func (c *Client) EnqueueDeliver(payload DeliverPayload, opts ...driver.EnqueueOp
 	// ため admin の Delayed が常に空に見える。Policy で上書き可 (#1405 / #1406)。
 	base = append(base, backoffOptFromPolicy(p))
 	// completed / failed bucket retention を Policy から組み立てる (#1184 / #1193)。
-	// mkqdriver 経路でのみ効き、asynqdriver では silent no-op。
 	base = append(base, retentionOptsFromPolicy(p)...)
 	merged := append(base, opts...)
 	return c.inner.Enqueue(context.Background(), TaskTypeDeliver, body, merged...)
@@ -279,8 +249,25 @@ func (c *Client) EnqueueDeliver(payload DeliverPayload, opts ...driver.EnqueueOp
 // で `scheduledAt - now` を指定する想定 (#1040)。
 func (c *Client) EnqueuePostScheduledNote(payload PostScheduledNotePayload, opts ...driver.EnqueueOption) error {
 	body := mustMarshal(payload)
+	p := c.policyFor(QueueName)
 	base := []driver.EnqueueOption{driver.WithQueue(QueueName)}
-	base = append(base, c.retentionOpts(QueueName)...)
+	// **attempts を積む** (#3121)。積まないと mkq の `attempts <= 0` で
+	// **初回失敗でそのまま failed** になり、publish 前の一時的な DB 障害だけで
+	// 予約投稿が失われる。publish そのものの失敗は processor が ack するので
+	// (二重 publish / 二重通知を避けるための意図的な設計、#2106 L61)、ここで
+	// retry されるのは **publish に到達する前の失敗だけ**。
+	//
+	// **policy は deliver キューのもの** (`QueueName` == "deliver")。この job は
+	// 元から deliver に積んでいるので専用の設定項目は無く、`deliverJobMaxAttempts`
+	// を 1 にした運用では予約投稿も retry しない。既定 (12) では backoff が
+	// `(2^n-1)*60s` なので、publish 前の失敗が続くと最大 30 時間ほど遅れて
+	// 公開されうる。その間に予約時刻を変えても取り消せるよう、
+	// `ClearScheduledNote` は retry bucket も走査する。
+	if p.MaxAttempts > 0 {
+		base = append(base, driver.WithMaxRetry(p.MaxAttempts-1))
+	}
+	base = append(base, backoffOptFromPolicy(p))
+	base = append(base, retentionOptsFromPolicy(p)...)
 	merged := append(base, opts...)
 	return c.inner.Enqueue(context.Background(), TaskTypePostScheduledNote, body, merged...)
 }
@@ -290,28 +277,66 @@ func (c *Client) EnqueuePostScheduledNote(payload PostScheduledNotePayload, opts
 // 抑えつつ大量 delayed task の場合も全件走査できる pragmatic な閾値。
 const clearScheduledNotePageSize = 100
 
-// ClearScheduledNote scans the deliver queue's delayed bucket for tasks
-// matching noteDraftId == draftID and deletes them. inspector が未配線の
+// ClearScheduledNote scans the deliver queue for tasks matching
+// noteDraftId == draftID and deletes them. inspector が未配線の
 // 場合は no-op (= test fixture / wire 未配線 path)。upstream の線形探索
 // と同 pattern (`getJobs(['delayed', 'waiting', 'active'])` → match →
-// `job.remove()`) を asynq/mkq の inspector API で再現する。
+// `job.remove()`) を driver の inspector API で再現する。
 //
-// 削除 failure は集約して error として返す。partial success 時も err 経路
-// に流すことで caller (DraftsUpdate / DraftsDelete) が log を残し handler
-// 戻り値で 500 を返せるようにする。
+// **delayed だけでなく retry も走査する** (#3121)。attempts を積むように
+// なったので、予約投稿の job は「backoff 待ち」の状態を取りうる。そちらは
+// `ListRetryTasks` にしか出ないので、delayed だけ見ていると **取り消しや
+// 再スケジュールが古い job に届かず、backoff 明けに予定と違う時刻で公開
+// される** (取り消しは draft が消えているので processor 側が not-found で
+// ack して救われるが、再スケジュールは draft が残るので救われない)。
+//
+// 削除 failure は集約して error として返す。**caller は log を残すが 500 には
+// しない** — draft の更新 / 削除そのものは成功しており、そこを 500 にすると
+// 「保存できたのに失敗と表示される」ほうが利用者に不利益。upstream も
+// `clearSchedule` を fire-and-forget で呼ぶ。
+//
+// **active な job は消せない。** mkq の `RemoveJob` は locked な job に
+// `ErrJobActive` を返す。走査に active を含めているのは「実行中のものを
+// 見つけて報告する」ためで、消せるわけではない (実行が終われば
+// completed / failed へ移るので、そこで初めて消える)。
 func (c *Client) ClearScheduledNote(draftID string) error {
 	if c.inspector == nil {
 		return nil
 	}
-	page := 1
 	var firstErr error
+	// **wait / active も走査する。** upstream の `NoteDraftService` は
+	// `getJobs(['delayed', 'waiting', 'active'])` の 3 バケットを見る。
+	// delayed と retry だけだと、予約時刻が来て job が wait へ昇格した後
+	// (ワーカーが詰まっている / キューが pause 中 / backlog が大きいと長い窓に
+	// なる) に利用者が時刻を**後ろへ**変更したとき、古い job が消されずに
+	// そのまま発火し、**取り消したはずの時刻で公開される**。
+	for _, bucket := range []struct {
+		name string
+		list func(string, int, int) ([]*driver.TaskSummary, error)
+	}{
+		{"scheduled", c.inspector.ListScheduledTasks},
+		{"retry", c.inspector.ListRetryTasks},
+		{"pending", c.inspector.ListPendingTasks},
+		{"active", c.inspector.ListActiveTasks},
+	} {
+		if err := c.clearScheduledNoteIn(bucket.name, bucket.list, draftID, &firstErr); err != nil {
+			return err
+		}
+	}
+	return firstErr
+}
+
+// clearScheduledNoteIn は ClearScheduledNote の 1 bucket 分の走査。列挙自体の
+// 失敗は即 return (見落としたまま「消した」と言わない)、削除の失敗は集約する。
+func (c *Client) clearScheduledNoteIn(bucket string, list func(string, int, int) ([]*driver.TaskSummary, error), draftID string, firstErr *error) error {
+	page := 1
 	for {
-		tasks, err := c.inspector.ListScheduledTasks(QueueName, page, clearScheduledNotePageSize)
+		tasks, err := list(QueueName, page, clearScheduledNotePageSize)
 		if err != nil {
-			return fmt.Errorf("list scheduled tasks: %w", err)
+			return fmt.Errorf("list %s tasks: %w", bucket, err)
 		}
 		if len(tasks) == 0 {
-			break
+			return nil
 		}
 		for _, t := range tasks {
 			if t.Type != TaskTypePostScheduledNote {
@@ -327,17 +352,16 @@ func (c *Client) ClearScheduledNote(draftID string) error {
 				continue
 			}
 			if derr := c.inspector.DeleteTask(QueueName, t.ID); derr != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("delete task %s: %w", t.ID, derr)
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf("delete task %s: %w", t.ID, derr)
 				}
 			}
 		}
 		if len(tasks) < clearScheduledNotePageSize {
-			break
+			return nil
 		}
 		page++
 	}
-	return firstErr
 }
 
 // EnqueueExport puts an export task on the queue.
@@ -398,7 +422,7 @@ func (c *Client) EnqueueWebPush(ctx context.Context, payload WebPushPayload) err
 }
 
 // EnqueueUserWebhook puts a user webhook delivery task on the webhook
-// queue. Retry policy: 4 attempts (4xx は processor 側で SkipRetry と
+// queue. Retry policy: 4 attempts (4xx は processor 側で ErrSkipRetry と
 // して扱うため実際のリトライ対象は 5xx とネットワークエラーに限られる)。
 func (c *Client) EnqueueUserWebhook(ctx context.Context, payload WebhookPayload) error {
 	body := mustMarshal(payload)
@@ -639,8 +663,7 @@ type Server struct {
 
 // ServerConfig is kept for backward compatibility with callers that
 // pass a Concurrency value via internal/server. The driver itself
-// gets its own concrete config (e.g. asynqdriver.ServerConfig)
-// at construction time.
+// gets its own concrete config (mkqdriver.Config) at construction time.
 type ServerConfig struct {
 	Concurrency int
 }

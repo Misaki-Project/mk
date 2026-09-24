@@ -1,7 +1,11 @@
 package entitycompat
 
 import (
+	"bytes"
 	"fmt"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -435,10 +439,12 @@ var apiCompatOnlyRe = regexp.MustCompile(`^- mk-go only \(TS spec 外\): \*\*(\d
 
 // forkTagSummaryRe matches the summary row
 // `| fork frontend の独自変更 | 23 tag (`-mk.0` ～ `-mk.22`) | — | — |`.
-var forkTagSummaryRe = regexp.MustCompile("^\\| fork frontend の独自変更 \\| (\\d+) tag \\(`-mk\\.(\\d+[a-z]*)` ～ `-mk\\.(\\d+[a-z]*)`\\)")
+// **範囲は base 込みで書く。** submodule を bump すると `-mk.N` は 0 に戻るので、
+// `-mk.0 ～ -mk.1` のような表記だと base をまたいだ範囲が読めない (#2879)。
+var forkTagSummaryRe = regexp.MustCompile("^\\| fork frontend の独自変更 \\| (\\d+) tag \\(`([0-9.]+-mk\\.\\d+[a-z]*)` ～ `([0-9.]+-mk\\.\\d+[a-z]*)`\\)")
 
 // forkTagRowRe matches a §4-2 table row `| `2026.7.0-mk.12` | ... |`.
-var forkTagRowRe = regexp.MustCompile("^\\| `[0-9.]+-mk\\.(\\d+[a-z]*)` \\|")
+var forkTagRowRe = regexp.MustCompile("^\\| `([0-9.]+)-mk\\.(\\d+[a-z]*)` \\|")
 
 // TestDivergenceDoc_EndpointCountMatchesAPICompat ties §1-1 to the generated
 // matrix. TestDivergenceDoc_EndpointCountMatchesTable only checks that the
@@ -501,14 +507,18 @@ func TestDivergenceDoc_ForkFrontendTagsMatchTable(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("docs/divergence.md のサマリ表に " +
-			"`| fork frontend の独自変更 | N tag (`-mk.X` ～ `-mk.Y`) |` の行が無い")
+			"`| fork frontend の独自変更 | N tag (`X.Y.Z-mk.A` ～ `X.Y.Z-mk.B`) |` の行が無い " +
+			"(**範囲は base 込みで書く** — bump で `-mk.N` は 0 に戻るため)")
 	}
 
 	start, _ := findDivergenceHeading(t, lines, "4-2")
+	type forkTag struct{ base, n string }
+	var rows []forkTag
 	var tags []string
 	for _, line := range sectionLines(lines, start) {
 		if m := forkTagRowRe.FindStringSubmatch(line); m != nil {
-			tags = append(tags, m[1])
+			rows = append(rows, forkTag{base: m[1], n: m[2]})
+			tags = append(tags, m[1]+"-mk."+m[2])
 		}
 	}
 	if len(tags) == 0 {
@@ -521,18 +531,77 @@ func TestDivergenceDoc_ForkFrontendTagsMatchTable(t *testing.T) {
 tag を足したら**サマリの件数と範囲、§4-2 の表の両方**を直すこと。`, declared, len(tags))
 	}
 	if tags[0] != lo || tags[len(tags)-1] != hi {
-		t.Errorf(`docs/divergence.md のサマリの範囲は -mk.%s ～ -mk.%s だが、§4-2 の表は -mk.%s ～ -mk.%s。`,
+		t.Errorf(`docs/divergence.md のサマリの範囲は %s ～ %s だが、§4-2 の表は %s ～ %s。`,
 			lo, hi, tags[0], tags[len(tags)-1])
 	}
-	assertForkTagSequence(t, tags)
+	// **連番は base ごとに見る。** submodule を bump すると `-mk.N` は 0 に戻るので
+	// (`2026.7.0-mk.22j` の次が `2026.9.0-mk.0`)、base をまたいで通し番号を期待すると
+	// 必ず落ちる。#2879 の取り込みで実際に踏んだ。
+	//
+	// **ただし base 同士の関係も見ること。** グループ化だけにすると、base の順序が
+	// 逆でも / 古い base を末尾に足しても / 同じ base が飛び飛びに現れても通ってしまう
+	// (旧実装の flat な連番検査はこれらを捕まえていた)。base をまたぐ検査を丸ごと
+	// 落とすと**検出力が下がる**ので、昇順と一意性をここで見る。
+	seen := make(map[string]bool, len(rows))
+	prevBase := ""
+	for i := 0; i < len(rows); {
+		j := i
+		for j < len(rows) && rows[j].base == rows[i].base {
+			j++
+		}
+		base := rows[i].base
+		if seen[base] {
+			t.Errorf(`docs/divergence.md §4-2 の base %s の行が飛び飛びに現れている。
+同じ base の行はまとめて並べること。`, base)
+		}
+		seen[base] = true
+		if prevBase != "" && compareForkBase(prevBase, base) >= 0 {
+			t.Errorf(`docs/divergence.md §4-2 の base が昇順でない (%s の次が %s)。
+古い順に並べること。`, prevBase, base)
+		}
+		prevBase = base
+
+		group := make([]string, 0, j-i)
+		for _, r := range rows[i:j] {
+			group = append(group, r.n)
+		}
+		assertForkTagSequence(t, group)
+		i = j
+	}
+}
+
+// compareForkBase compares two `X.Y.Z` version strings numerically.
+// 文字列比較だと `2026.10.0` < `2026.9.0` になるので使えない。
+func compareForkBase(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) || i < len(bs); i++ {
+		var x, y int
+		if i < len(as) {
+			x, _ = strconv.Atoi(as[i])
+		}
+		if i < len(bs) {
+			y, _ = strconv.Atoi(bs[i])
+		}
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
 }
 
 // assertForkTagSequence checks that §4-2's rows step through the tag scheme
 // without gaps.
 //
-// **機能追加は N を進め、バグ修正はその N に英字を足す** (`-mk.22` の修正が
-// `-mk.22a`、次が `-mk.22b`)。したがって数字は重複しうるので、単純な連番検査は
-// 使えない。数字は 1 ずつ、同じ数字の中の英字は a から 1 文字ずつ進むこと
+// **機能追加は N を進め、直前の数字タグの後追い修正はその N に英字を足す**
+// (`-mk.22` の修正が `-mk.22a`、次が `-mk.22b`)。**世代をまたぐ修正は新しい数字を
+// 取る** — 英字は列の順序を保つためのものなので、`-mk.24` の後に `-mk.12a` を打つと
+// `git describe --tags` が後戻りして見える (規則の全文は docs/divergence.md の
+// 「fork frontend の変更」。先例は `-mk.23` / `-mk.25` / `-mk.28`)。
+// **英字を足す形があるので数字は重複しうる。** 単純な連番検査は使えないので、
+// 数字は 1 ずつ、同じ数字の中の英字は a から 1 文字ずつ進むこと
 // (#2689)。
 func assertForkTagSequence(t *testing.T, tags []string) {
 	t.Helper()
@@ -783,9 +852,14 @@ var (
 )
 
 // serverPackageSource concatenates internal/server's non-test sources with
-// line comments removed. **package 全体を読む** — router.go だけを見ると別
+// comments removed. **package 全体を読む** — router.go だけを見ると別
 // ファイルからの登録を取りこぼす。実際 plugin_wiring.go は `api.Group(...)` で
 // `/api` 配下を生やしている。
+//
+// **コメントが落ちるのは `parser.ParseFile` の mode が 0 だから。**
+// `parser.ParseComments` に変えると `printer.Fprint` が `*ast.File` の
+// `Comments` を印字するので、`/* */` で囲んだ登録が黙って復活する。
+// `TestServerPackageSourceDropsBlockComments` がそれを固定している。
 func serverPackageSource() (string, error) {
 	files, err := filepath.Glob(filepath.Join("..", "..", "internal", "server", "*.go"))
 	if err != nil {
@@ -802,16 +876,37 @@ func serverPackageSource() (string, error) {
 			return "", err
 		}
 		read++
-		for _, line := range strings.Split(string(src), "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), "//") {
-				body = append(body, line)
-			}
+		stripped, perr := goSourceWithoutComments(f, src)
+		if perr != nil {
+			return "", perr
 		}
+		body = append(body, stripped)
 	}
 	if read == 0 {
 		return "", fmt.Errorf("internal/server/*.go を 1 ファイルも読めない")
 	}
 	return strings.Join(body, "\n"), nil
+}
+
+// goSourceWithoutComments re-prints Go source with every comment dropped.
+//
+// **コメントは AST で落とす (#2856)。** 行頭 `//` だけを除いても `/* */` で
+// 囲んだ登録が生きたものとして通る (実測)。パーサはコメントを構文木に載せない。
+//
+// **mode は 0 でなければならない。** `parser.ParseComments` にすると
+// `printer.Fprint` が `*ast.File` の `Comments` を印字するので、囲んだ登録が
+// 黙って復活する。`TestGoSourceWithoutComments` がそれを固定している。
+func goSourceWithoutComments(path string, src []byte) (string, error) {
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, path, src, 0)
+	if err != nil {
+		return "", fmt.Errorf("parse %s: %w", path, err)
+	}
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, parsed); err != nil {
+		return "", fmt.Errorf("print %s: %w", path, err)
+	}
+	return buf.String(), nil
 }
 
 // docChannelRowRe matches a §4-1 table row `| `notifications` | … |`.
@@ -904,4 +999,32 @@ doc にあって実装に無い (%d 件、= 名前の綴り違いか、消えた
 kebab-case (chat-room.ts) だが wire 上の名前は camelCase (chatRoom)。`,
 		len(missing), strings.Join(missing, "\n  "),
 		len(stale), strings.Join(stale, "\n  "))
+}
+
+// goSourceWithoutComments がブロックコメントを落とすことを固定する (#2856)。
+//
+// **`serverPackageSource` が使う関数をそのまま通す。** 同じ処理をテスト内に
+// 書き写すと、本体の parser mode を変えても落ちない (実測。最初そう書いていた)。
+func TestGoSourceWithoutComments(t *testing.T) {
+	const src = `package p
+
+func f() {
+	/* streamRegistry.Register("ghost", nil) */
+	// streamRegistry.Register("ghost2", nil)
+	streamRegistry.Register("real", nil)
+}
+`
+	body, err := goSourceWithoutComments("x.go", []byte(src))
+	if err != nil {
+		t.Fatalf("goSourceWithoutComments: %v", err)
+	}
+	for _, ghost := range []string{`"ghost"`, `"ghost2"`} {
+		if strings.Contains(body, ghost) {
+			t.Errorf("コメントアウトされた登録 %s が出力に残っている。"+
+				"parser mode が 0 のままか確認すること", ghost)
+		}
+	}
+	if !strings.Contains(body, `"real"`) {
+		t.Error("生きた登録が出力から消えている")
+	}
 }

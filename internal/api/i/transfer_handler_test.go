@@ -94,19 +94,8 @@ func TestExport_NotesNoAuthIfEnqueuerMissing(t *testing.T) {
 }
 
 func TestExport_AllTypesEnqueue(t *testing.T) {
-	cases := []struct {
-		name    string
-		handler func(h *Handler) func(c any) error
-	}{}
-	// map each endpoint to its expected payload type
 	h, enq := newTransferHandler()
 	user := &model.User{ID: "u1"}
-
-	type ex struct {
-		name string
-		fn   func(c *Handler) func() error
-		kind string
-	}
 
 	// Use a simple test invocation approach: call handler via post helper.
 	assertOK := func(recCode int) {
@@ -138,7 +127,6 @@ func TestExport_AllTypesEnqueue(t *testing.T) {
 		assert.Equal(t, "u1", c.UserID)
 	}
 	assert.Len(t, seen, 8)
-	_ = cases
 }
 
 // #1555 export-following の excludeMuting / excludeInactive が ExportPayload に
@@ -468,4 +456,28 @@ func TestImport_WithoutMoveInValidatorKeepsDefaultLimit(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "TOO_BIG_FILE")
 	assert.Empty(t, enq.importCalls)
+}
+
+// failingDriveRepo makes every drive file lookup look like a database failure.
+type failingDriveRepo struct {
+	*testutil.MockDriveFileRepository
+	err error
+}
+
+func (r *failingDriveRepo) FindByID(string) (*model.DriveFile, error) { return nil, r.err }
+
+// **DB 障害を「そんなファイルは無い」にしない** (#2792)。
+//
+// import は利用者がドライブに上げたファイルを指定する。障害を 400 で返すと
+// 「アップロードが失敗した」と読めてしまい、上げ直しを繰り返す。
+func TestImport_DBFailureIsNot4xx(t *testing.T) {
+	h, enq, _ := newTransferHandlerWithDrive()
+	h.SetDriveFileRepo(&failingDriveRepo{
+		MockDriveFileRepository: testutil.NewMockDriveFileRepository(),
+		err:                     errors.New("dial tcp 127.0.0.1:5432: connect: connection refused"),
+	})
+
+	rec := post(h.ImportFollowing, `{"fileId":"`+ownedFileID+`"}`, &model.User{ID: ownerID})
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Empty(t, enq.importCalls, "障害時に job を積んでいる")
 }

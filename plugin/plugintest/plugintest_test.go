@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
@@ -473,4 +476,101 @@ func TestPeer_SendRejectsUnmarshalablePayload(t *testing.T) {
 	_, err := routes.Call(t, "POST /send", plugintest.Request{})
 	assert.Error(t, err)
 	assert.Empty(t, h.PeerSends(), "失敗した Send は記録しない")
+}
+
+// Enqueue は **本番と同じ理由で** Jobs 未宣言を拒否する。ここで通すと、
+// 本番では通らない経路をテストが緑で通してしまう。
+func TestHarness_EnqueueRequiresJobs(t *testing.T) {
+	h := plugintest.New(t)
+
+	routesOnly := plugin.Definition{
+		Name: "demo", APIVersion: plugin.APIVersion,
+		Routes: func(plugin.Context, plugin.Router) error { return nil },
+	}
+	h.Routes(routesOnly)
+	err := h.Context().Queue().Enqueue(context.Background(), "prune", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Definition.Jobs")
+	assert.Empty(t, h.Enqueues())
+
+	withJobs := routesOnly
+	withJobs.Jobs = func(plugin.Context, plugin.Jobs) error { return nil }
+	h.Routes(withJobs)
+	require.NoError(t, h.Context().Queue().Enqueue(context.Background(), "prune",
+		map[string]int{"a": 1}, plugin.WithDelay(time.Minute)))
+
+	got := h.Enqueues()
+	require.Len(t, got, 1)
+	assert.Equal(t, "prune", got[0].Name)
+	assert.JSONEq(t, `{"a":1}`, string(got[0].Payload))
+	assert.Equal(t, time.Minute, got[0].Options.Delay)
+}
+
+// **Definition.Peer で登録したものが DeliverPeer から叩けること (#2819)。**
+// doc は登録を Peer へ移すよう指示しているので、ハーネスが同じ形を実行できないと
+// 「移したらテストが落ちる」ことになる。
+func TestHarness_PeerCallback(t *testing.T) {
+	var gotFrom string
+	var gotReply string
+	def := plugin.Definition{
+		Name: "demo", APIVersion: plugin.APIVersion, Peered: true,
+		Peer: func(_ plugin.Context, p plugin.Peer) error {
+			p.Handle(func(_ context.Context, from string, payload json.RawMessage) (any, error) {
+				gotFrom = from
+				return map[string]any{"echo": json.RawMessage(payload)}, nil
+			})
+			p.OnReply(func(_ context.Context, _, _ string, reply json.RawMessage) error {
+				gotReply = string(reply)
+				return nil
+			})
+			return nil
+		},
+	}
+
+	h := plugintest.New(t)
+	h.Peer(def)
+
+	res, err := h.DeliverPeer("other.example", map[string]int{"a": 1})
+	require.NoError(t, err)
+	assert.Equal(t, "other.example", gotFrom)
+	assert.NotNil(t, res)
+
+	require.NoError(t, h.DeliverPeerReply("other.example", "id1", map[string]int{"b": 2}))
+	assert.JSONEq(t, `{"b":2}`, gotReply)
+}
+
+// Peer が nil でも落ちない (宣言していないプラグインもハーネスに通せる)。
+func TestHarness_PeerCallbackNil(t *testing.T) {
+	h := plugintest.New(t)
+	h.Peer(plugin.Definition{Name: "demo", APIVersion: plugin.APIVersion})
+	assert.Empty(t, h.PeerSends())
+}
+
+// **`ctx.HTTP()` の既定は必ず失敗する client (#3037)。**
+//
+// 素の `&http.Client{}` を既定にすると、テストが気付かないうちに**本物の
+// 外部サービスへ出ていく**。本番の `ctx.HTTP()` は SSRF ガードと運営者の
+// proxy 設定を持つので、テストでも明示的に差し替えさせる。
+func TestHarness_HTTPDefaultsToFailing(t *testing.T) {
+	h := plugintest.New(t)
+	client := h.Context().HTTP()
+	require.NotNil(t, client, "nil を返すとプラグイン側が nil 参照 panic になる")
+
+	_, err := client.Get("https://example.com/")
+	require.Error(t, err, "未設定の client が本当に外へ出ている")
+	assert.Contains(t, err.Error(), "WithHTTPClient")
+}
+
+// 差し替えたものがそのまま返ること。
+func TestHarness_WithHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	h := plugintest.New(t).WithHTTPClient(srv.Client())
+	res, err := h.Context().HTTP().Get(srv.URL)
+	require.NoError(t, err)
+	defer res.Body.Close() //nolint:errcheck // テスト
+	assert.Equal(t, http.StatusOK, res.StatusCode)
 }

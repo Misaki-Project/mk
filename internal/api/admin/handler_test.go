@@ -26,6 +26,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
+
+	"github.com/shiroha-a/mk/internal/core/iplookuplog"
 )
 
 const adminInternalErrorJSON = `{"error":{"message":"Internal error.","code":"INTERNAL_ERROR","id":"5d37dbcb-891e-41ca-a3d6-e690c97775ac","kind":"server"}}`
@@ -260,6 +262,19 @@ func newTestHandlerWithAssign(t *testing.T) (*apiadmin.Handler, *testutil.MockUs
 	return h, userRepo, metaRepo, roleRepo, assignRepo
 }
 
+// newTestHandlerNoRoles builds a handler without a role service, for the
+// fail-closed paths that must not disclose anything when the policy cannot be
+// evaluated (#3114)。
+func newTestHandlerNoRoles(t *testing.T) (*apiadmin.Handler, *testutil.MockUserRepository, *testutil.MockMetaRepository, id.Generator) {
+	t.Helper()
+	userRepo := testutil.NewMockUserRepository()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x"}
+	idGen, _ := id.NewGenerator("aidx")
+	signupSvc := signup.NewService(userRepo, metaRepo, idGen)
+	return apiadmin.NewHandler(signupSvc, nil, metaRepo, userRepo, idGen), userRepo, metaRepo, idGen
+}
+
 func doPost(h func(echo.Context) error, body string, user *model.User) *httptest.ResponseRecorder {
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
@@ -399,11 +414,62 @@ func TestAccountsCreate_InvalidJSON(t *testing.T) {
 }
 
 func TestAccountsCreate_DuplicateUsername(t *testing.T) {
-	h, userRepo, _, _ := newTestHandler(t)
+	// **認証済み admin で叩く。** 以前はここを未認証で叩いて 409 を期待していたが、
+	// それは「利用者が既に居るのに初回セットアップ扱いで到達できる」という
+	// 脆弱な挙動そのものを固定していた (下の
+	// TestAccountsCreate_InitialSetupClosesOnceAUserExists を参照)。
+	h, userRepo, metaRepo, _ := newTestHandler(t)
+	rootID := "root1"
+	metaRepo.Meta.RootUserID = &rootID
 	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "taken", UsernameLower: "taken"}
 
-	rec := doPost(h.AccountsCreate, `{"username":"taken","password":"pass"}`, nil)
+	rootUser := &model.User{ID: "root1", Username: "root"}
+	rec := doPost(h.AccountsCreate, `{"username":"taken","password":"pass"}`, rootUser)
 	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+// 初回セットアップの窓は、ローカル利用者が 1 人でも居れば閉じる。
+//
+// **`meta.rootUserId` だけを条件にすると窓が閉じない。** あれを書くのは signup
+// service の `isInitialSetup` 分岐だけで、公開 `/api/signup` は本番でそこを
+// 通らない。運営者が登録を開放して通常の signup で最初のアカウントを作ると
+// `rootUserId` は永久に NULL のままになり、**この endpoint が未認証のまま
+// 開き続ける**。`update-meta` は `rootUserId` を落とすので手で閉じることも
+// できない。
+func TestAccountsCreate_InitialSetupClosesOnceAUserExists(t *testing.T) {
+	t.Run("利用者が居れば未認証は拒否", func(t *testing.T) {
+		h, userRepo, metaRepo, _ := newTestHandler(t)
+		metaRepo.Meta.RootUserID = nil // 窓が開いている想定
+		userRepo.Users["u1"] = &model.User{ID: "u1", Username: "someone", UsernameLower: "someone"}
+
+		rec := doPost(h.AccountsCreate, `{"username":"attacker","password":"pass1234"}`, nil)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "ACCESS_DENIED")
+		for _, u := range userRepo.Users {
+			assert.NotEqual(t, "attacker", u.UsernameLower, "アカウントが作られている")
+		}
+	})
+
+	// **弾きすぎていないことを見る。** 常に拒否する実装でも上は緑になる。
+	t.Run("誰も居なければ従来どおり通る", func(t *testing.T) {
+		h, _, metaRepo, _ := newTestHandler(t)
+		metaRepo.Meta.RootUserID = nil
+
+		rec := doPost(h.AccountsCreate, `{"username":"firstadmin","password":"pass1234"}`, nil)
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.NotNil(t, metaRepo.Meta.RootUserID, "rootUserId が設定されて窓が閉じる")
+	})
+
+	// 数えられないときは初回セットアップ扱いにしない (fail-closed)。
+	// **ACCESS_DENIED に潰さない** — 「権限が足りない」と誤読されるため。
+	t.Run("数えられなければ 500", func(t *testing.T) {
+		h, userRepo, metaRepo, _ := newTestHandler(t)
+		metaRepo.Meta.RootUserID = nil
+		userRepo.CountLocalUsersErr = assert.AnError
+
+		rec := doPost(h.AccountsCreate, `{"username":"x","password":"pass1234"}`, nil)
+		assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	})
 }
 
 func TestAccountsCreate_MetaFetchError(t *testing.T) {
@@ -461,34 +527,147 @@ func (failingSigninRepo) ListByUserID(string, int, string, string) ([]*model.Sig
 	return nil, assertError{}
 }
 
-func TestShowUser_WithSignins(t *testing.T) {
-	h, userRepo, _, _ := newTestHandler(t)
-	idGen, _ := id.NewGenerator("aidx")
-	uid := idGen.Generate(time.Now())
-	userRepo.Users[uid] = &model.User{ID: uid, Username: "test", AvatarDecorations: []byte("[]")}
-	userRepo.Profiles[uid] = &model.UserProfile{
-		UserID: uid, MutedWords: []byte("[]"), HardMutedWords: []byte("[]"), MutedInstances: []byte("[]"),
+// **`signins` の `ip` は `canSearchIpHistory` を持つ相手にだけ返す** (#3114)。
+//
+// ここは `signin` テーブルのログイン IP をそのまま返す口で、`admin/ip/*` が
+// 要求する policy を通らなかった。#3104 が「IP とアカウントの対応は既定で
+// モデレーターに開かない」と決めた以上、同じ種類の情報をモデレーター権限だけで
+// 全件返すのは、mk-go が自分で作った権限境界と食い違う。
+func TestShowUser_SigninIPsRequirePolicy(t *testing.T) {
+	setup := func(t *testing.T) (*apiadmin.Handler, string, string, *testutil.MockMetaRepository, *testutil.MockRoleRepository, *testutil.MockRoleAssignmentRepository, *stubAuditRepo) {
+		t.Helper()
+		h, userRepo, metaRepo, roleRepo, assignRepo := newTestHandlerWithAssign(t)
+		idGen, _ := id.NewGenerator("aidx")
+		uid := idGen.Generate(time.Now())
+		userRepo.Users[uid] = &model.User{ID: uid, Username: "test", AvatarDecorations: []byte("[]")}
+		userRepo.Profiles[uid] = &model.UserProfile{
+			UserID: uid, MutedWords: []byte("[]"), HardMutedWords: []byte("[]"), MutedInstances: []byte("[]"),
+		}
+		signinRepo := testutil.NewMockSigninRepository()
+		sid := idGen.Generate(time.Now())
+		// **`headers` に nginx が付ける IP を入れる。** これが無いと
+		// `PackSignin` が `{}` を返すので、**漏れる唯一のフィールドだけが
+		// テスト対象から外れる** (敵対的レビューで実測)。
+		signinRepo.Signins = []*model.Signin{{ID: sid, UserID: uid, IP: "203.0.113.5", Success: true,
+			Headers: []byte(`{"X-Real-Ip":["203.0.113.5"],"X-Forwarded-For":["203.0.113.5, 10.0.0.1"]}`)}}
+		h.SetSigninRepo(signinRepo)
+		audit := &stubAuditRepo{}
+		h.SetIPLookupAudit(iplookuplog.NewService(audit, idGen))
+		return h, uid, sid, metaRepo, roleRepo, assignRepo, audit
+	}
+	readSignin := func(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+		t.Helper()
+		var resp map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		signins, ok := resp["signins"].([]any)
+		require.True(t, ok)
+		require.Len(t, signins, 1)
+		return signins[0].(map[string]any)
 	}
 
-	signinRepo := testutil.NewMockSigninRepository()
-	sid := idGen.Generate(time.Now())
-	signinRepo.Signins = []*model.Signin{
-		{ID: sid, UserID: uid, IP: "203.0.113.5", Success: true},
-	}
-	h.SetSigninRepo(signinRepo)
+	t.Run("policy が無ければ ip を伏せる", func(t *testing.T) {
+		h, uid, sid, _, _, _, audit := setup(t)
+		rec := doPost(h.ShowUser, `{"userId":"`+uid+`"}`, &model.User{ID: "mod1"})
+		require.Equal(t, http.StatusOK, rec.Code)
+		entry := readSignin(t, rec)
+		// **key は消さず空文字にする。** json-schema が `ip` を
+		// optional:false / nullable:false と宣言している。
+		assert.Equal(t, "", entry["ip"], "policy が無い相手に IP を返している")
+		// **`headers` も伏せる。** 本番構成の nginx が `X-Real-IP` /
+		// `X-Forwarded-For` を必ず付けるので、`ip` だけ潰しても隣のキーで読める。
+		assert.Equal(t, map[string]any{}, entry["headers"], "headers から IP が読める")
+		raw, _ := json.Marshal(entry)
+		assert.NotContains(t, string(raw), "203.0.113.5", "応答のどこかに IP が残っている")
+		// 伏せた応答は開示が起きていないので記録しない。
+		assert.Empty(t, audit.written)
+		// 他の列はそのまま。
+		assert.Equal(t, sid, entry["id"])
+		assert.Equal(t, true, entry["success"])
+		assert.NotNil(t, entry["createdAt"])
+	})
 
-	rec := doPost(h.ShowUser, `{"userId":"`+uid+`"}`, nil)
-	assert.Equal(t, http.StatusOK, rec.Code)
-	var resp map[string]any
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-	signins, ok := resp["signins"].([]any)
-	require.True(t, ok)
-	require.Len(t, signins, 1)
-	entry := signins[0].(map[string]any)
-	assert.Equal(t, sid, entry["id"])
-	assert.Equal(t, "203.0.113.5", entry["ip"])
-	assert.Equal(t, true, entry["success"])
-	assert.NotNil(t, entry["createdAt"])
+	t.Run("policy を持つモデレーターには返し、監査に残す", func(t *testing.T) {
+		h, uid, _, _, roleRepo, assignRepo, audit := setup(t)
+		roleRepo.Roles["iprole"] = &model.Role{ID: "iprole", Name: "IP",
+			Policies: datatypes.JSON([]byte(`{"canSearchIpHistory":{"useDefault":false,"priority":1,"value":true}}`))}
+		assignRepo.Assignments["mod1:iprole"] = &model.RoleAssignment{ID: "as1", UserID: "mod1", RoleID: "iprole"}
+
+		rec := doPost(h.ShowUser, `{"userId":"`+uid+`"}`, &model.User{ID: "mod1"})
+		require.Equal(t, http.StatusOK, rec.Code)
+		entry := readSignin(t, rec)
+		assert.Equal(t, "203.0.113.5", entry["ip"])
+		// policy があるときは headers もそのまま。
+		assert.NotEqual(t, map[string]any{}, entry["headers"])
+		// **返したときだけ記録する。**
+		require.Len(t, audit.written, 1, "IP を返したのに監査に残していない")
+		got := audit.written[0]
+		assert.Equal(t, "mod1", got.UserID)
+		assert.Equal(t, model.IPLookupKindSignins, got.Kind)
+		assert.Equal(t, uid, got.TargetUserID)
+		assert.Equal(t, 1, got.ResultCount)
+		// 共有キャッシュに残さない (IP が載る応答なので #3106 と同じ扱い)。
+		assert.Contains(t, rec.Header().Get("Cache-Control"), "no-store")
+	})
+
+	// **判定できないときは伏せる側へ倒す** (fail-closed)。roleService が未配線
+	// だったり、呼び出し元が特定できないときに「policy を確かめられなかった」を
+	// 「持っている」に倒すと、配線忘れがそのまま IP の開示になる。
+	t.Run("呼び出し元が特定できなければ伏せる", func(t *testing.T) {
+		h, uid, _, _, _, _, audit := setup(t)
+		rec := doPost(h.ShowUser, `{"userId":"`+uid+`"}`, nil)
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "", readSignin(t, rec)["ip"], "利用者不明でも IP を返している")
+		assert.Empty(t, audit.written)
+	})
+
+	t.Run("roleService が未配線なら伏せる", func(t *testing.T) {
+		// roleService を持たない handler。policy を確かめる手段が無い。
+		h, userRepo, _, _ := newTestHandlerNoRoles(t)
+		idGen, _ := id.NewGenerator("aidx")
+		uid := idGen.Generate(time.Now())
+		userRepo.Users[uid] = &model.User{ID: uid, Username: "test", AvatarDecorations: []byte("[]")}
+		userRepo.Profiles[uid] = &model.UserProfile{
+			UserID: uid, MutedWords: []byte("[]"), HardMutedWords: []byte("[]"), MutedInstances: []byte("[]"),
+		}
+		signinRepo := testutil.NewMockSigninRepository()
+		signinRepo.Signins = []*model.Signin{{ID: idGen.Generate(time.Now()), UserID: uid, IP: "203.0.113.5", Success: true}}
+		h.SetSigninRepo(signinRepo)
+
+		rec := doPost(h.ShowUser, `{"userId":"`+uid+`"}`, &model.User{ID: "mod1"})
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "", readSignin(t, rec)["ip"], "roleService 未配線で IP を返している")
+	})
+
+	// **引けなかった照会は監査に残さない** (#3114 レビュー)。残すと
+	// `ip_lookup_log` 上で「本当に 0 件だった」と「DB が落ちていて何も
+	// 返していない」が区別できなくなる (`admin/get-user-ips` と同じ判断)。
+	t.Run("signins を引けなければ監査に残さない", func(t *testing.T) {
+		h, uid, _, _, roleRepo, assignRepo, audit := setup(t)
+		roleRepo.Roles["iprole"] = &model.Role{ID: "iprole", Name: "IP",
+			Policies: datatypes.JSON([]byte(`{"canSearchIpHistory":{"useDefault":false,"priority":1,"value":true}}`))}
+		assignRepo.Assignments["mod1:iprole"] = &model.RoleAssignment{ID: "as1", UserID: "mod1", RoleID: "iprole"}
+		h.SetSigninRepo(&failingSigninRepo{})
+
+		rec := doPost(h.ShowUser, `{"userId":"`+uid+`"}`, &model.User{ID: "mod1"})
+		require.Equal(t, http.StatusOK, rec.Code)
+		var resp map[string]any
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		assert.Empty(t, resp["signins"])
+		assert.Empty(t, audit.written, "引けていないのに監査に残している")
+		// **内部連絡用のキーを wire へ出さない。**
+		assert.NotContains(t, rec.Body.String(), "__signinsLoaded")
+	})
+
+	t.Run("管理者は policy を短絡して返る", func(t *testing.T) {
+		h, uid, _, metaRepo, _, _, audit := setup(t)
+		// `HasRolePolicy` は administrator を短絡する。root を管理者にする。
+		root := "root1"
+		metaRepo.Meta = &model.Meta{ID: "x", RootUserID: &root}
+		rec := doPost(h.ShowUser, `{"userId":"`+uid+`"}`, &model.User{ID: "root1"})
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "203.0.113.5", readSignin(t, rec)["ip"])
+		require.Len(t, audit.written, 1)
+	})
 }
 
 func TestShowUser_SigninsErrorFallback(t *testing.T) {
@@ -3192,11 +3371,16 @@ func (f *failingUpdateEmojiRepo) UpdateFields(_ string, _ map[string]any) error 
 	return assert.AnError
 }
 
+// UpdateFields が DB 障害を返したら 500 (#2792)。**絵文字を seed するのが要点** —
+// 入れずに書くと FindByID の時点で 404 になり、UpdateFields の枝に入らないまま
+// 緑になる (#3014 でここを分けるまで、実際にそうなっていた)。
 func TestEmojiUpdate_Error(t *testing.T) {
 	h, _, _, _ := newTestHandler(t)
-	h.SetEmojiRepo(&failingUpdateEmojiRepo{testutil.NewMockEmojiRepository()})
+	repo := testutil.NewMockEmojiRepository()
+	require.NoError(t, repo.Create(&model.Emoji{ID: "e1", Name: "happy"}))
+	h.SetEmojiRepo(&failingUpdateEmojiRepo{repo})
 	rec := doPost(h.EmojiUpdate, `{"id":"e1","name":"x"}`, nil)
-	assert.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
 func TestEmojiList_InvalidJSON(t *testing.T) {
@@ -3952,18 +4136,24 @@ func TestAdminMeta_ApprovalRequiredForSignup(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), `"approvalRequiredForSignup":true`)
 }
 
-// 登録可否の組み合わせ (#2565)。
+// 登録可否の組み合わせ (#2565 / #2803)。
 //
-// 唯一の制約は「承認制とメール必須は排他」。承認制それ自体が /api/signup を 403 で
-// 塞ぐので、登録開放は安全性の条件ではなく表示上の整合にすぎない。**「先に開放して
-// から承認制を入れる」手順を強制すると、その間に素通しで登録される窓ができる**ため、
-// 承認制を入れる更新では同じ更新で開放する。
+// 承認制それ自体が /api/signup を 403 で塞ぐので、登録開放は安全性の条件ではなく
+// 表示上の整合にすぎない。**「先に開放してから承認制を入れる」手順を強制すると、
+// その間に素通しで登録される窓ができる**ため、承認制を入れる更新では同じ更新で
+// 開放する。
+//
+// **外す更新では逆に閉じる (#2803)。** 開放は承認制がゲートとして立っていることが
+// 前提の整合なので、ゲートが消える更新で維持すると、招待制 → 承認制 ON → 承認制 OFF
+// の 3 操作で無警告の全開状態が残る。閉じる側は明示指定を尊重し (開ける側は #2565 の
+// 整合の強制として上書きする)、承認制の状態が変わらない更新では触らない。
 func TestUpdateMeta_SignupConditions(t *testing.T) {
 	tests := []struct {
-		name         string
-		current      *model.Meta
-		body         string
-		wantRejected bool
+		name    string
+		current *model.Meta
+		body    string
+		// 400 を期待するときだけ設定する。レスポンスに含まれるべき文言。
+		wantRejectedMessage string
 		// 更新後に期待する各値。nil なら検証しない。
 		wantDisableRegistration *bool
 		wantEmailRequired       *bool
@@ -3992,6 +4182,106 @@ func TestUpdateMeta_SignupConditions(t *testing.T) {
 			name:                    "承認制を切る更新では開放しない",
 			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: true},
 			body:                    `{"approvalRequiredForSignup":false}`,
+			wantDisableRegistration: boolPtr(true),
+		},
+		{
+			// #2803 の本体。承認制で開いた登録は、承認制を外す更新で閉じ直す。
+			// 維持すると、招待制 → 承認制 ON → 承認制 OFF でゲートが 1 つも
+			// 無い全開状態になる。
+			name:                    "承認制を切る更新では登録も閉じる",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: false},
+			body:                    `{"approvalRequiredForSignup":false}`,
+			wantApprovalRequired:    boolPtr(false),
+			wantDisableRegistration: boolPtr(true),
+		},
+		{
+			// 明示指定があれば尊重する。両方送るクライアント (モデレーション
+			// 画面) が「開けたままにする」を選べなくなると意味が無い。
+			name:                    "承認制を切る更新で開放を明示すれば尊重する",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: false},
+			body:                    `{"approvalRequiredForSignup":false,"disableRegistration":false}`,
+			wantApprovalRequired:    boolPtr(false),
+			wantDisableRegistration: boolPtr(false),
+		},
+		{
+			name:                    "承認制を切る更新で閉鎖を明示すれば尊重する",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: false},
+			body:                    `{"approvalRequiredForSignup":false,"disableRegistration":true}`,
+			wantDisableRegistration: boolPtr(true),
+		},
+		{
+			// 元から閉じているサーバーで開放を明示するのも尊重する。既定の
+			// 補完が「閉じ直す」向きなので、こちらは上書きされうる形。
+			name:                    "元が招待制でも承認制を切る更新の開放明示は尊重する",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: true},
+			body:                    `{"approvalRequiredForSignup":false,"disableRegistration":false}`,
+			wantDisableRegistration: boolPtr(false),
+		},
+		{
+			// **型を推測しない (#2803)。** GORM は map の値をそのまま driver へ渡す
+			// ので、string でも PostgreSQL の boolean 入力構文に当たれば列は更新
+			// される。正規化は bool しか見ないため、弾かないと「承認制は外れたのに
+			// 登録は全開のまま」が作れる。
+			//
+			// `disableRegistration` を bool で添えるのは、**弾いたのに書いている
+			// 回帰をこのケース単独でも検出するため**。mock の Update は bool 以外を
+			// 無視するので、string の列だけでは書き込みが起きても差が出ない。
+			name:                "承認制の値が bool でなければ弾く",
+			current:             &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: false},
+			body:                `{"approvalRequiredForSignup":"false","disableRegistration":true}`,
+			wantRejectedMessage: "approvalRequiredForSignup must be a boolean",
+		},
+		{
+			// 逆向き。string で送れると #2565 が防ぐ「承認制 + 招待制」が作れる。
+			name:                "disableRegistration の値が bool でなければ弾く",
+			current:             &model.Meta{ID: "x", ApprovalRequiredForSignup: false, DisableRegistration: false},
+			body:                `{"approvalRequiredForSignup":true,"disableRegistration":"true"}`,
+			wantRejectedMessage: "disableRegistration must be a boolean",
+		},
+		{
+			// **null は弾かず落とす。** upstream の paramDef は `nullable: true` で、
+			// 実装も `typeof === 'boolean'` でしか読まない (= 無指定と同じ)。
+			// misskey-js の生成型も `boolean | null` なので、400 にすると型どおりに
+			// 送るクライアントを壊す。無指定なので閉じる既定が効く。
+			name:                    "disableRegistration が null なら無指定として扱う",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: false},
+			body:                    `{"approvalRequiredForSignup":false,"disableRegistration":null}`,
+			wantApprovalRequired:    boolPtr(false),
+			wantDisableRegistration: boolPtr(true),
+		},
+		{
+			// 承認制側の null も同じ。無指定なので遷移が無く、何も触らない。
+			name:                    "approvalRequiredForSignup が null なら何も触らない",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: false},
+			body:                    `{"approvalRequiredForSignup":null}`,
+			wantApprovalRequired:    boolPtr(true),
+			wantDisableRegistration: boolPtr(false),
+		},
+		{
+			// **開ける側は明示より整合を優先する (#2565)。** 承認制と招待制を
+			// 重ねると登録手段がゼロになるので、同じ更新で両方来ても開く。
+			// 閉じる側と非対称なのは意図的。
+			name:                    "承認制を入れる更新では閉鎖の明示より整合を優先する",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: false, DisableRegistration: false},
+			body:                    `{"approvalRequiredForSignup":true,"disableRegistration":true}`,
+			wantApprovalRequired:    boolPtr(true),
+			wantDisableRegistration: boolPtr(false),
+		},
+		{
+			// **承認制が元から無効な更新で閉じてはいけない。** 管理者が開いた
+			// 操作を黙って巻き戻すことになる。
+			name:                    "承認制が元から無効なまま false を送っても閉じない",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: false, DisableRegistration: false},
+			body:                    `{"approvalRequiredForSignup":false}`,
+			wantApprovalRequired:    boolPtr(false),
+			wantDisableRegistration: boolPtr(false),
+		},
+		{
+			// 逆向きも同じ。承認制が元から有効なだけの更新では開放しない。
+			name:                    "承認制が元から有効なまま true を送っても開放しない",
+			current:                 &model.Meta{ID: "x", ApprovalRequiredForSignup: true, DisableRegistration: true},
+			body:                    `{"approvalRequiredForSignup":true}`,
+			wantApprovalRequired:    boolPtr(true),
 			wantDisableRegistration: boolPtr(true),
 		},
 		{
@@ -4030,11 +4320,24 @@ func TestUpdateMeta_SignupConditions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h, _, metaRepo, _ := newTestHandler(t)
 			metaRepo.Meta = tt.current
+			// **呼び出し前に値でコピーを取る。** mock は metaRepo.Meta の
+			// フィールドを書き換えるので、tt.current と比べても同じポインタを
+			// 両辺に置くだけになり、書き込みが起きても絶対に落ちない。
+			var before model.Meta
+			if tt.current != nil {
+				before = *tt.current
+			}
 
 			rec := doPost(h.UpdateMeta, tt.body, adminUser)
-			if tt.wantRejected {
+			if tt.wantRejectedMessage != "" {
 				assert.Equal(t, http.StatusBadRequest, rec.Code)
-				assert.Contains(t, rec.Body.String(), "INVALID_SIGNUP_CONDITIONS")
+				assert.Contains(t, rec.Body.String(), tt.wantRejectedMessage)
+				// **弾いたなら列も動いていないこと。** 400 を返しつつ書き込んで
+				// いたら、型検査を入れた意味が無い。
+				if tt.current != nil {
+					assert.Equal(t, before.DisableRegistration, metaRepo.Meta.DisableRegistration)
+					assert.Equal(t, before.ApprovalRequiredForSignup, metaRepo.Meta.ApprovalRequiredForSignup)
+				}
 				return
 			}
 			require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
@@ -4052,6 +4355,23 @@ func TestUpdateMeta_SignupConditions(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// meta が引けないときは何も書かない (#2803)。
+//
+// normalizeSignupConditions は current == nil だと遷移を判定できず、承認制を切る
+// 更新でも登録を閉じる補正を掛けられない。**それが fail-open にならないのは、
+// 後段の maybeAutoGenerateVAPID が同じ Fetch の error を返して Update まで
+// 到達しないから。** その前提をここで固定しておかないと、VAPID 側を meta 欠損に
+// 寛容にした瞬間に「承認制は外れたのに登録は開いたまま」が書き込まれる。
+func TestUpdateMeta_MetaUnavailable(t *testing.T) {
+	h, _, metaRepo, _ := newTestHandler(t)
+	metaRepo.Meta = nil
+
+	rec := doPost(h.UpdateMeta, `{"approvalRequiredForSignup":false}`, adminUser)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	// Update が呼ばれていれば mock が Meta を作る。作られていない = 書いていない。
+	assert.Nil(t, metaRepo.Meta)
+}
 
 // 申請フォームの定義を検証する (#2570)。
 //
@@ -4141,4 +4461,151 @@ func TestUpdateMeta_SignupApplicationForm_Null(t *testing.T) {
 	rec := doPost(h.UpdateMeta, `{"signupApplicationForm":null}`, adminUser)
 	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
 	assert.JSONEq(t, `[]`, string(metaRepo.Meta.SignupApplicationForm))
+}
+
+// --- #2973: 凍結の由来 ---
+
+// stubOriginRepo is an in-memory UserSuspensionOriginRepository.
+type stubOriginRepo struct {
+	origins map[string]string
+	setErr  error
+}
+
+func newStubOriginRepo() *stubOriginRepo {
+	return &stubOriginRepo{origins: map[string]string{}}
+}
+
+func (s *stubOriginRepo) Origin(userID string) (string, error) { return s.origins[userID], nil }
+
+func (s *stubOriginRepo) Set(userID, origin string) error {
+	if s.setErr != nil {
+		return s.setErr
+	}
+	s.origins[userID] = origin
+	return nil
+}
+
+func (s *stubOriginRepo) Clear(userID string) error { delete(s.origins, userID); return nil }
+
+// **モデレーターの凍結は local として刻む。** 刻まないと、リモート actor が
+// `toot:suspended` を下ろした時点で凍結が解除される (#2973)。
+func TestSuspendUser_RecordsLocalOrigin(t *testing.T) {
+	h, userRepo, _, _ := newTestHandler(t)
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice"}
+	origins := newStubOriginRepo()
+	h.SetSuspensionOriginRepo(origins)
+
+	rec := doPost(h.SuspendUser, `{"userId":"u1"}`, nil)
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	assert.Equal(t, model.SuspensionOriginLocal, origins.origins["u1"],
+		"凍結の由来を刻んでいない。発信元が suspended を下ろすと解除される")
+}
+
+// **モデレーターの解除も local として刻む。** 刻まないと、発信元が立て続けて
+// いる限り次の actor refresh で無言で戻る (この issue が塞ぎに来た状態そのもの)。
+func TestUnsuspendUser_RecordsLocalOrigin(t *testing.T) {
+	h, userRepo, _, _ := newTestHandler(t)
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", IsSuspended: true}
+	origins := newStubOriginRepo()
+	origins.origins["u1"] = model.SuspensionOriginRemote // 発信元由来で凍結されていた
+	h.SetSuspensionOriginRepo(origins)
+
+	rec := doPost(h.UnsuspendUser, `{"userId":"u1"}`, nil)
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	assert.Equalf(t, model.SuspensionOriginLocal, origins.origins["u1"],
+		"解除の由来を刻んでいない。remote のまま残ると次の refresh で再凍結される")
+}
+
+// **解除で由来を記録できなかったら 500 を返す。** 記録できないまま解除すると
+// 「解除したはずが戻っている」状態になるので、成功として返さない。
+func TestUnsuspendUser_OriginWriteFailureIs500(t *testing.T) {
+	h, userRepo, _, _ := newTestHandler(t)
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", IsSuspended: true}
+	origins := newStubOriginRepo()
+	origins.setErr = errors.New("connection refused")
+	h.SetSuspensionOriginRepo(origins)
+
+	rec := doPost(h.UnsuspendUser, `{"userId":"u1"}`, nil)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code,
+		"由来を記録できないのに解除を成功として返している")
+}
+
+// **アカウント削除も local として刻む。** `isSuspended` と `isDeleted` を同時に
+// 立てるので、remote 由来の記録が残っていると発信元が tombstone の凍結を外せる。
+// inbound の gate は `isSuspended` しか見ないため、削除済みアカウントからの
+// activity が再び通ることになる。
+func TestAccountsDelete_RecordsLocalOrigin(t *testing.T) {
+	h, userRepo, _, _ := newTestHandler(t)
+	host := "remote.example"
+	userRepo.Users["u1"] = &model.User{ID: "u1", Username: "alice", Host: &host}
+	origins := newStubOriginRepo()
+	origins.origins["u1"] = model.SuspensionOriginRemote
+	h.SetSuspensionOriginRepo(origins)
+
+	rec := doPost(h.AccountsDelete, `{"userId":"u1"}`, nil)
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	assert.Equalf(t, model.SuspensionOriginLocal, origins.origins["u1"],
+		"削除で由来を刻んでいない。発信元が tombstone の凍結を外せる")
+}
+
+// #3015: 最小文字数の範囲検証。上限は `localUsernamePattern` の 20 と揃える。
+//
+// **21 以上を書けると登録が全滅する** — どの username も format 検証で先に
+// 落ちるので、管理画面から自分のインスタンスを壊せてしまう。service 側にも
+// clamp があるが、admin が入れた値が黙って別の値になるのは分かりにくいので
+// 入口で拒否する (分割アップロードの範囲検証と同じ判断)。
+func TestUpdateMeta_MinimumUsernameLengthRange(t *testing.T) {
+	h, _, metaRepo, _ := newTestHandler(t)
+
+	tooSmall := fmt.Sprintf(`{"minimumUsernameLength":%d}`, signup.MinUsernameLength-1)
+	assert.Equal(t, http.StatusBadRequest, doPost(h.UpdateMeta, tooSmall, nil).Code)
+	tooBig := fmt.Sprintf(`{"minimumUsernameLength":%d}`, signup.MaxUsernameLength+1)
+	assert.Equal(t, http.StatusBadRequest, doPost(h.UpdateMeta, tooBig, nil).Code)
+	assert.Equal(t, http.StatusBadRequest, doPost(h.UpdateMeta, `{"minimumUsernameLength":5.5}`, nil).Code, "non-integer must be rejected")
+
+	// 境界は通り、実際に保存されること。**弾きすぎていないことを見ないと
+	// 「常に 400」でも緑になる。**
+	for _, v := range []int{signup.MinUsernameLength, signup.MaxUsernameLength} {
+		body := fmt.Sprintf(`{"minimumUsernameLength":%d}`, v)
+		require.Equal(t, http.StatusNoContent, doPost(h.UpdateMeta, body, nil).Code, body)
+		assert.Equal(t, v, metaRepo.Meta.MinimumUsernameLength)
+	}
+}
+
+// #3015: admin/meta は**列の生値**を返す。
+//
+// 公開 meta (`/api/meta`) が返すのは clamp 後の「実際に効く値」だが、管理画面は
+// 入力欄の初期値に使うので、丸めた値を出すと**開いて保存しただけで設定が
+// 書き換わる**。
+func TestAdminMeta_ExposesMinimumUsernameLength(t *testing.T) {
+	h, _, metaRepo, _ := newTestHandler(t)
+	metaRepo.Meta.MinimumUsernameLength = 5
+
+	rec := doPost(h.AdminMeta, `{}`, nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, float64(5), resp["minimumUsernameLength"])
+}
+
+// #3015: `admin/accounts/create` は最小文字数を受けない。
+//
+// 運営が公式アカウントに短い ID を配れるようにするため
+// (`signup.UsernamePolicyOperator`)。**位置では区別が付かない** — admin も
+// `isInitialSetup == false` で `Signup` を呼ぶので、handler が policy を選ぶ。
+func TestAccountsCreate_IgnoresMinimumUsernameLength(t *testing.T) {
+	h, _, metaRepo, _ := newTestHandler(t)
+	rootID := "root1"
+	metaRepo.Meta.RootUserID = &rootID
+	metaRepo.Meta.MinimumUsernameLength = 10
+
+	rootUser := &model.User{ID: "root1", Username: "root"}
+	rec := doPost(h.AccountsCreate, `{"username":"ops","password":"pass1234"}`, rootUser)
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	// **予約は引き続き効く。** 除外したのは最小長だけなので、
+	// 「policy を渡したら全部素通り」になっていないことを見る。
+	metaRepo.Meta.PreservedUsernames = model.StringArray{"reserved"}
+	rec = doPost(h.AccountsCreate, `{"username":"reserved","password":"pass1234"}`, rootUser)
+	assert.NotEqual(t, http.StatusOK, rec.Code, "予約 username が admin 経路で通っている")
 }

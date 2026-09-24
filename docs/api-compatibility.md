@@ -1,7 +1,7 @@
 # API互換性状況
 
-対象バージョン: **Misskey 2026.7.0** (mk-go 1.2.1)
-最終更新: 2026-08-19
+対象バージョン: **Misskey 2026.9.1** (mk-go 1.4.0)
+最終更新: 2026-09-23
 
 本ドキュメントは互換性調査 (#107, #124) と、Playwright Phase 1-4 で発見・修正した drift backlog の**履歴**を集約したもの。
 
@@ -17,9 +17,9 @@
 
 ## 概要
 
-- **upstream catch-up**: **2026.7.0 まで追従完了**。2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 と段階的に追従した。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
-- **本家 backend e2e**: Misskey 本家の `test/e2e/**` をテスト本体無改変で mk-go に向けて実行する基盤を整備し、**25 ファイル 1245 テストが全通過**。PR ごとに CI で回る。『通らないことが正しい』23 件は根拠付きで expected-failure として登録している ([`upstream-backend-e2e.md`](upstream-backend-e2e.md))
-- **Playwright e2e**: 290 spec ファイルを PR ごとに実行。Misskey TS backend に対しては upstream 追従時に実行し、spec が mk-go の挙動に引きずられていないかを検証する
+- **upstream catch-up**: **2026.9.1 まで追従完了**。2026.3.2 → 2026.5.1 → 2026.5.4 → 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 と段階的に追従した (**2026.8.0 に stable は無い**)。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
+- **本家 backend e2e**: Misskey 本家の `test/e2e/**` をテスト本体無改変で mk-go に向けて実行する基盤を整備し、**25 ファイル 1256 テストが全通過**。PR ごとに CI で回る。『通らないことが正しい』23 件は根拠付きで expected-failure として登録している ([`upstream-backend-e2e.md`](upstream-backend-e2e.md))
+- **Playwright e2e**: 298 spec ファイルを PR ごとに実行。Misskey TS backend に対しては upstream 追従時に実行し、spec が mk-go の挙動に引きずられていないかを検証する
 - **drift backlog**: Phase 1-4 の spec 整備中に発見した 40+ 件の drop-in 互換 drift は fix 済
 
 ## エンドポイントカバー率 (Playwright Phase 1-4 時点)
@@ -31,7 +31,7 @@
 
 当時の数値は router.go 登録の 448 endpoint のうち 242 endpoint (54.3%)。残りは
 smoke 範囲外 (WebSocket / 複雑 mutation / federation delivery / cron / push server)
-または smoke 化困難な mutation。現在は本家 backend e2e が別軸で 1245 テストを
+または smoke 化困難な mutation。現在は本家 backend e2e が別軸で 1256 テストを
 回しているため、Playwright だけで cover 率を語る意味は薄れている。
 
 | カテゴリ | 主要 endpoint 群 | 状態 |
@@ -58,7 +58,11 @@ smoke 範囲外 (WebSocket / 複雑 mutation / federation delivery / cron / push
 未実装エンドポイントの応答は **method で分かれる**。GET は
 `404 UNKNOWN_API_ENDPOINT`、それ以外は `200 {}`。後者を 404 にしないのは、
 Misskey 公式フロントの一部ページが未登録エンドポイントの 404 で例外を投げる
-ため。いずれも warn ログ (`unimplemented API endpoint`) が出る。なお **upstream endpoint の未実装は現在ゼロ (coverage 100.0%、444/444)**。
+ため。**例外はプラグイン同士の通信の受け口** (`/api/plugin/<名前>/_peer`) で、
+method に関わらず 404 を返す (#2822。200 だと送信側が「受け口が無い」と
+「プラグインが空の応答を返した」を区別できない。詳細は
+[peer プロトコル](plugin-peer-protocol.md))。いずれも warn ログ
+(`unimplemented API endpoint`) が出る。なお **upstream endpoint の未実装は現在ゼロ (coverage 100.0%、444/444)**。
 
 ## 対応済みの互換性修正
 
@@ -248,11 +252,13 @@ Misskey TS の `users/show` は **自インスタンスで観測した範囲** �
 
 ### inbox processor の verify-in-worker 化 (#565)
 
-upstream は HTTP handler の中で AP signature verify を同期実行するため、悪意ある unsigned activity が手前で増えると HTTP 受信スループットが低下する。mk-go は HTTP handler は body + signature header だけを payload に詰めて 202 即返し、signature verify / host block / instance touch / chart hook を inbox worker (asynq processor) 側で実行することで HTTP 受信 rps が **TS の 2.6-2.8x** (queue-bench で確認)。
+upstream は HTTP handler の中で AP signature verify を同期実行するため、悪意ある unsigned activity が手前で増えると HTTP 受信スループットが低下する。mk-go は HTTP handler は body + signature header だけを payload に詰めて 202 即返し、signature verify / host block / instance touch / chart hook を inbox worker (queue processor) 側で実行することで HTTP 受信 rps が **TS の 2.6-2.8x** (queue-bench で確認)。
 
-### mkq driver default (#571 audit)
+### mkq driver (#571 audit / #2985)
 
-job queue driver の既定を asynq から mkq (BullMQ-compatible Go ライブラリ) に変更。queue-bench (`tests/queue-bench/`) で BullMQ / asynq / mkq を 3-way 比較した結果、deliver throughput / inbox throughput ともに mkq が最良。
+job queue driver の既定を asynq から mkq (BullMQ-compatible Go ライブラリ) に変更 (#571)。当時 queue-bench (`tests/queue-bench/`) で BullMQ / asynq / mkq を 3-way 比較した結果、**送信 rps は mkq が最良**だった (drain time は asynq のほうが速い計測もある。[queue-bench.md](queue-bench.md) の表を参照)。
+
+その後 **#2985 で asynq driver 自体を削除**したので、選択肢は mkq だけになっている。`jobQueueDriver: asynq` を明示した設定は起動エラーになる。
 
 ## エラーレスポンス
 
@@ -267,18 +273,18 @@ TS版の`.config/default.yml`をそのまま使用可能。以下の設定もGo�
 - trustProxy (#129)
 - dbSlaves (#133)
 - 各種Redis分離設定
-- jobQueueDriver (`mkq` 既定 / `asynq` 選択可、#571)
+- jobQueueDriver (`mkq` のみ。#571 で既定に、#2985 で唯一の driver に)
 - allowedPrivateNetworks (SSRF allowlist、開発時の self-loop 許可用)
 
 ## DB構造
 
 ### テーブル
 
-Go側のマイグレーション (000001〜) はTS版テーブルに対して原則追加のみだが、例外が 9 件ある ([migration-from-ts.md](migration-from-ts.md#破壊的なマイグレーション))。TS版のマイグレーションで作成される全テーブルは維持される。
+Go側のマイグレーション (000001〜) はTS版テーブルに対して原則追加のみだが、例外が 15 件ある ([migration-from-ts.md](migration-from-ts.md#破壊的なマイグレーション))。TS版のマイグレーションで作成される全テーブルは維持される。
 
-**mk-go 固有のテーブル (upstream に対応するものが無い) は 9 件:**
+**mk-go 固有のテーブル (upstream に対応するものが無い) は 13 件:**
 
-> [divergence.md](divergence.md) §2-1 は同じものを **12** と数えている。差は 3 件で、
+> [divergence.md](divergence.md) §2-1 は同じものを **16** と数えている。差は 3 件で、
 > あちらは `note_unread` (upstream DB には legacy として残るが 2026.7.0 の `models/` に
 > entity が無く参照 0 件。mk-go はこれを実用している) と bookkeeping 2 件
 > (`migrations` / `schema_migrations`) を加える。CI の
@@ -294,8 +300,12 @@ Go側のマイグレーション (000001〜) はTS版テーブルに対して原
 | `instance_secret` | インスタンス単位の秘密値 | `000072` |
 | `instance_signature_capability` | 相手インスタンスの署名方式 capability | `000073` |
 | `signup_application` | 登録申請 | `000075` |
+| `emoji_application` | カスタム絵文字の登録申請 (#2934) | `000086` |
+| `user_suspension_origin` | 凍結の由来 (local / remote、#2973) | `000087` |
+| `emoji_application_quota_reset` | 絵文字申請枠の手動リセットの記録 (#2962) | `000089` |
+| `ip_lookup_log` | IP 照会そのものの監査記録 (#3106) | `000096` |
 
-mk-go の migration が作るテーブルは 112。上記 9 件と golang-migrate 台帳の
+mk-go の migration が作るテーブルは 116。上記 13 件と golang-migrate 台帳の
 `schema_migrations` を除く **102 はすべて upstream にも存在する** (TypeORM 台帳の
 `migrations` を含む)。
 
@@ -327,7 +337,25 @@ drop-in テスト (#367) で発見した補完カラム:
   (`chat/messages/create` / `chat/rooms/joined` / `chat/rooms/members/ban` 等) を
   additive に足している。upstream のクライアントから見て欠けているものは無い
 - **search backend** — `fulltextSearch.provider` で挙動切替: 既定の `sqlLike` (= `lower(text) LIKE` による部分一致。**ILIKE ではない** — pg_bigm の GIN index `gin (lower(text) gin_bigm_ops)` は LIKE しか加速せず、ILIKE だと拡張を入れても index が効かないため。Meilisearch 不要、軽量 deploy 向け) / `meilisearch` (要 host 設定) / `sqlPgroonga` (要 PGroonga 拡張) / `none` (= upstream TS strict-mode 互換、400 UNAVAILABLE で reject、#877)
-- **upstream 2026.7.0 まで追従済** — `#947` (2026.3.2 → 2026.5.1) / `#1164` (2026.5.1 → 2026.5.4、LD-Signature 初期実装 + 2026.5.4 hardening 含む) を経て 2026.6.0 → 2026.7.0 まで完了。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
+- **promo は作成・既読化できるが表示されない (#2781)** — `admin/promo/create` と
+  `promo/read` は upstream と同じパス・同じ error id で実装済みで (#2784)、
+  DB 行も正しく増える。しかし
+  **`promo_note` を読んで利用者へ提示する経路が upstream にも無い**
+  (2026.7.0 の backend で `promoNote` / `promoRead` を参照するのは endpoint 2 本と
+  DI / model 定義だけ。`grep -rlni` で 8 ファイル、内訳は
+  [`upstream-catch-up.md`](upstream-catch-up.md) の「submodule bump 後に必須」)。
+  **frontend の menu 項目も無い** — `_promote()` 関数
+  (`packages/frontend/src/utility/get-note-menu.ts:279`) と `promote` locale
+  (`locales/*.yml:559`) は残っているが、どちらも参照ゼロ。menu 項目は upstream
+  #14554 (2024-09) でコメントアウトごと削除済み。到達するのは API を
+  直接叩く場合とサードパーティクライアントだけで、そこでは 204 が返るので
+  **成功したように見えて誰にも表示されない**。
+  mk-go はこの状態を忠実に再現している (endpoint を消すと 444/444 の
+  カバレッジが崩れ、drop-in 切替でも挙動が変わるため)。表示経路を足すなら
+  upstream に無い additive 拡張になる。
+  ただし入力側だけは mk-go に意図的乖離がある — `admin/promo/create` は public
+  以外の note を reject する (`docs/divergence.md` §7)
+- **upstream 2026.9.1 まで追従済** — `#947` (2026.3.2 → 2026.5.1) / `#1164` (2026.5.1 → 2026.5.4、LD-Signature 初期実装 + 2026.5.4 hardening 含む) を経て 2026.6.0 → 2026.7.0 → 2026.9.0 → 2026.9.1 まで完了。各 release 差分は [`docs/update/`](update/) を参照 (`<yyyymm><nn>diff.md`。`nn` は**対象 upstream release の patch 番号**で日付ではない。backend に変更が無い release は doc を作らないので番号は飛ぶ。同じディレクトリに `<yyyymmdd>-<issue>-triage.md` 形式の triage note も同居する)
 
 詳細は[TS版からの移行ガイド](migration-from-ts.md)の「既知の制限」セクションも参照。
 

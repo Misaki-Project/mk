@@ -354,3 +354,26 @@ func TestValidateAPContentType(t *testing.T) {
 		})
 	}
 }
+
+// **redirect は追従し、飛び先を呼び出し側へ返す。** 止めるかどうかは呼び出し側の
+// 判断 (nodeinfo は最終 URL が要求した host と違えば本文を読み戻さない)。
+// `CheckRedirect` で止める形は `allowExternalApRedirect` の設定を上書きして
+// しまうので採らない (3 周目レビュー M1)。
+func TestFetchUnsignedJSONWithURL_FollowsCrossHostRedirect(t *testing.T) {
+	victim := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer victim.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, victim.URL+"/ni", http.StatusFound)
+	}))
+	defer origin.Close()
+
+	c := NewClient(origin.Client(), "test")
+	body, finalURL, err := c.FetchUnsignedJSONWithURL(origin.URL + "/.well-known/nodeinfo")
+	require.NoError(t, err, "`.well-known` の委譲を落としている")
+	require.JSONEq(t, `{"ok":true}`, string(body))
+	require.Contains(t, finalURL, victim.URL, "飛び先を呼び出し側へ返していない")
+}

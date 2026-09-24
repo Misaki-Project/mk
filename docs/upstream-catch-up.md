@@ -57,12 +57,15 @@ make uds-frontend-build
 
 ```bash
 # 1-1 / 1-2 と 1-4 を済ませた状態 (= submodule + frontend asset が最新) で
-docker compose -f compose.uds.yaml up --build -d
+make uds-build      # image を作り直す
+make uds-restart    # 再起動 + 配信アセットの検証
 ```
 
 **重要**:
-- `--build` フラグ必須。`docker compose up -d` 単体だと前回 build 済の image が再利用され、submodule 更新が反映されない
-- 確実に再ビルドさせたい場合は `--build --force-recreate` を併用
+- **image の作り直しと再起動は別の話で、両方要る**。image に焼き込むのは `deploy/uds/Dockerfile.mkgo` が `COPY` する 4 つ — static-assets (`packages/backend/assets`)、repo-assets (`third_party/misskey/assets`)、twemoji、fluent-emoji。submodule bump でこれらが変わるので `uds-build` が要る
+- **SPA のアセット (`built/_frontend_vite_`) は image に入らない**。bind-mount で渡しているので `uds-frontend-build` (1-4) の出力がそのまま配信される
+- **`--build` を付けても再起動は保証されない**。compose は image と設定が変わらなければコンテナを作り直さないので、bind-mount しか変わっていない場合は何も起きず、mk-go は起動時にキャッシュした古いエントリを配り続ける (#2885)。`make uds-restart` は `restart` を明示したうえで配信中のアセットが実在するかまで検証する
+- **その検証は bind-mount の SPA アセットしか見ない**。image 側の asset (twemoji 等) が古いままでも緑になるので、`uds-build` を省かないこと
 - `make uds-frontend-build` を skip すると Dockerfile builder の sanity check (`test -f .../1f004.svg` 等) で早期 fail する
 
 `postgres` / `valkey` / `nginx` / `video-thumb` 等の外部 image は Misskey 無関係なので submodule bump で影響を受けない。
@@ -149,7 +152,94 @@ git add third_party/misskey
 # commit + PR
 ```
 
-`<tag>-mk.N` の `N` は revision 番号。同 release base で追加 patch が増えたら `.1` `.2` と上げる。
+#### fork タグの採番規則
+
+形式は `<upstream release>-mk.<N>[<英字>]`（例: `2026.9.0-mk.39`、`2026.9.0-mk.34c`）。
+**lightweight tag** で、fork の `mk-<upstream release>` 系列の先端に打つ。
+
+| 進めるもの | いつ | 例 |
+|---|---|---|
+| 数字 (`N`) | **新機能**、および**直前の数字タグとは無関係な修正** | `mk.38` → `mk.39` |
+| 英字 | **直前の数字タグで入れた変更の後追い修正** | `mk.39` → `mk.39a` → `mk.39b` |
+
+**英字は「直前の数字タグの後始末」に限る。** バグ修正だから英字、ではない —
+**世代をまたぐ修正は新しい数字を取る**。英字は列の順序を保つためのもので、`-mk.24` の後に
+`-mk.12a` を打つと `git describe --tags` が後戻りして見えるため (先例は `-mk.23` /
+`-mk.25` / `-mk.28`。規則の出どころは `docs/divergence.md` の「fork frontend の変更」で、
+`assertForkTagSequence` の GoDoc も同じことを書いている)。
+
+**1 PR = 1 タグ。** frontend に複数コミットを積む PR でも打つタグは 1 つで、`docs/divergence.md`
+§4-2 の表も 1 行になる。1 コミット = 1 タグにしないのは、表を「還元不能な差分の一覧」として
+読むときの単位が PR だから。
+
+**`N` は upstream release ごとに 0 から数え直す。** 取り込み直後の素の状態が `-mk.0` で、
+載せ替え (`git rebase --onto <新 release> <旧 release>`) で持ち込んだ custom commit も
+`-mk.0` に含める。§4-2 の tag 列は「その変更が**最初に入った世代**」なので、載せ替えても
+古い `2026.7.0-mk.*` の行はそのまま残す。
+
+**英字が `z` に達したら数字を上げる。** 26 回も後追いの修正が要る変更はもう別物とみなす。
+実測では 2026.9.0 の 82 タグを通して英字の最長連続は 8 なので、通常は到達しない。
+
+**`fix` のコミットでも数字を取ることがある。** `2026.9.0` の数字タグ 40 件のうち 13 件は
+`fix(...)` だが (`mk.1` / `mk.2` / `mk.4` …)、**どれも直前の数字タグとは無関係な修正**なので
+規則どおり。commit prefix と採番は 1 対 1 ではない — 見るのは「直前の数字タグの後始末か」
+であって、`feat` か `fix` かではない。
+
+**過去のタグは振り直さない。** タグは push 済みで、fork 側の
+`Publish frontend assets image` workflow が `*-mk.*` で発火して
+`ghcr.io/shiroha-a/misskey-ts-assets:<tag>` を publish しているため、打ち直すと配布物との
+対応が壊れる。
+
+タグを打ったら、**親リポ側で 4 箇所を同時に更新する**（順序は「submodule に commit →
+fork へ push → tag を push → 親リポの gitlink と doc」。逆順だと CI の checkout が
+`not our ref` で死ぬ）:
+
+- `docs/divergence.md` の pin 行（tag と**短縮 SHA の併記**。`make submodulepin-check` が gitlink と突き合わせる）
+- `docs/divergence.md` §4-2 の表に 1 行
+- 同ファイル冒頭サマリの件数と範囲（`TestDivergenceDoc_*` が表と突き合わせる）
+- `Dockerfile.bundled` の `MISSKEY_ASSETS_IMAGE`（配る image に焼く frontend。ずれても image はビルドできるので CI は落ちない）
+
+機械で守られているのはこのうち「表の連番が規則どおりか」（`assertForkTagSequence`。
+数字 +1 か、同じ数字への次の英字しか許さない）と「pin 行 ↔ gitlink」「tag → commit」
+(`make submodulepin-check` と CI の `build` job)。
+
+**数字と英字のどちらを選ぶかは機械では見ていないし、見られない。** 判定には「この修正は
+直前の数字タグで入れた変更の後始末か」という意味判断が要り、commit の件名からは導けない。
+`fix` なら英字という形なら機械化できるが、それは上のとおり規則と違う (#3141 で検討して
+採らなかった。実測で 121 タグはすべて規則どおりで、止めるべきドリフトが無かった。
+`docs(` や `Revert:` の commit も実在するので `feat` / `fix` の二択にも寄せられない)。
+
+
+#### mk 固有パッチだけを載せるとき（release bump 以外）
+
+upstream release の取り込み以外で fork frontend だけを直す PR でも、**submodule の gitlink は同じ規律で扱う**。
+
+mk の `develop` が追跡しているのは fork の **`mk-2026.x.x` 系列**（例: `mk-2026.9.0`）であり、fork の `develop` とは別系列。系列ごとに独自コミットが積まれており、**misskey-ts 側の PR を `develop` にマージしただけでは mk の submodule 系列には入らない**。差分の大きさは時期で変わるので、**fork 側** (`third_party/misskey`) で次を実行する:
+
+```bash
+cd third_party/misskey
+git fetch origin develop mk-2026.9.0   # 例: mk が指す系列
+git rev-list --left-right --count origin/develop...origin/mk-2026.9.0
+```
+
+| やること | 理由 |
+|---|---|
+| misskey-ts の PR base を **mk が指している `mk-2026.x.x`** に合わせる | マージ後に submodule を fast-forward で載せられる |
+| mk 側の bump 前に祖先関係を確認する | 誤った SHA だと fork 独自コミットが巻き戻る |
+| **閉じた PR の head SHA** を gitlink に使わない | 別系列・古い base のコミットを指しやすい |
+
+bump 前の確認（`third_party/misskey` 内で実行）:
+
+```bash
+OLD=<現在の mk develop が指す submodule SHA>
+NEW=<misskey-ts PR マージ後に載せたい SHA>
+
+git merge-base --is-ancestor "$OLD" "$NEW" && echo "fast-forward 可"
+git rev-list --count "$NEW..$OLD"    # 失われる mk 独自コミット数。0 であること
+git diff --diff-filter=D --name-only "$OLD" "$NEW" | wc -l   # 削除ファイル。0 であること
+```
+
+**CI は祖先関係の巻き戻りを検出しない。** `build` job は gitlink の SHA が fork に **push 済みか**は見るが、fast-forward 可能か（祖先関係）は見ない。`build` / `test` / `lint` の required check は submodule を checkout しない。`frontend-check` は型・eslint・vitest を見るが、**ファイルが消えても型が通る**場合がある。pointer の妥当性は上のコマンドで人手確認する。
 
 ### submodule bump 後に必須: shape drift snapshot の再生成
 
@@ -196,6 +286,54 @@ TypeORM の decorator から正規形を再現できないため **実 DB から
 
 落ちたら doc の件数・内訳・冒頭サマリ・表の行をまとめて直す。gate は 4 箇所すべてを見るので、どれか 1 つを直し忘れると通らない (#2634)。
 
+### submodule bump 後に必須: promo の表示経路が upstream に入っていないか見る
+
+**promo (`admin/promo/create` / `promo/read`)** は upstream にも mk-go にも
+**表示経路が無い** — 作成と既読化はできて DB 行も増えるが、`promo_note` を読んで
+利用者へ提示するものがどこにも無い (#2781)。mk-go はこの状態を忠実に再現している。
+
+**upstream は一度実装して外している。** 2020-02 に
+`server/api/common/inject-promo.ts` で timeline へ直挿しする実装が入ったが
+(`a54de07260`)、2021-03 に「クライアントサイドで実装したいため」無効化され
+(`73df95c42d`)、2022-09 にファイルごと削除された (`786f1d8be8`)。frontend の
+menu も 2024-09 の #14554 で消えている。**再実装される見込みは低いが、endpoint は
+残っているので bump ごとに一応見る。**
+
+bump 後に確認する:
+
+```bash
+grep -rlni "promonote\|promoread" third_party/misskey/packages/backend/src/
+```
+
+期待は **8 件** (case-insensitive にしてあるのは型名 `MiPromoNote` や
+repository 名 `PromoNotesRepository` を拾うため):
+
+```
+di-symbols.ts / postgres.ts
+models/_.ts / models/RepositoryModule.ts / models/PromoNote.ts / models/PromoRead.ts
+server/api/endpoints/promo/read.ts
+server/api/endpoints/admin/promo/create.ts     ← 表示経路はここに無い
+```
+
+**件数ではなくリストが一致するかを見る** (加減が相殺すると件数だけでは素通りする)。
+違っていたら中身を見て、`docs/api-compatibility.md` の「既知の制限」と
+`docs/divergence.md` §7 の promo 行を更新する。増えていれば表示経路が入った可能性、
+減っていれば endpoint が削除された可能性。
+
+**0 件や `No such file or directory` が出たら、まず submodule の checkout を疑う**
+(`git submodule update --init`)。checkout 済みで 0 件なら、upstream 側でパス構成が
+変わっている。
+
+**CI の Go テストでは検出できない。** submodule を checkout する job は 8 つある
+(`ci.yml` の `frontend-check`、diff-e2e の `diff`、docker の `build-and-push`、
+dropin-e2e の `dropin`、dropin-frontend-e2e の `frontend-e2e`、playwright の `spec`、
+queue-bench-smoke の `smoke`、upstream-backend-e2e の `e2e`) が、**いずれも Go
+テストを実行する step を持たない**。Go テストが走る `test-shards` / `plugin-tests`
+の checkout に `submodules` 指定は無いので、submodule を読むテストは CI では常に
+skip され gate にならない。ローカルの tripwire として書くなら
+`internal/misc/achievement/types_test.go` の `TestTypes_MatchUpstream` が同型
+(submodule を読み、不在なら `t.Skipf`)。
+
 ### submodule bump 後に必須: 比較対象の TS image を全部揃える
 
 mk-go と Misskey TS を並べて比較するハーネスは、**比較対象の image tag を
@@ -207,6 +345,39 @@ mk-go と Misskey TS を並べて比較するハーネスは、**比較対象の
 | `docker-compose.diff.yml` | 差分比較ハーネス ([diff-e2e.md](./diff-e2e.md)) |
 | `docker-compose.playwright.ts.yml` | Playwright の TS baseline |
 | `.github/workflows/playwright.yml` | 上記の pre-pull (tag が sync していないと pull が無駄になる) |
+| `.github/workflows/diff-e2e.yml` | diff ハーネスの pre-pull。**compose 側だけ上げて忘れやすい** (#2877 で実際に残した) |
+| `docker-compose.dropin.yml` / `docker-compose.dropin-frontend.yml` / `docker-compose.federation.misskey.yml` | drop-in / 実連合の TS インスタンス |
+| `.github/workflows/dropin-e2e.yml` / `dropin-frontend-e2e.yml` | 上記の pre-pull と matrix |
+| `tests/bench/` / `tests/queue-bench/` の compose | 性能比較の対象 |
+| `Dockerfile.bundled` の `MISSKEY_ASSETS_IMAGE` | **配る image に焼く frontend**。これだけは TS image ではなく fork の assets image (`ghcr.io/shiroha-a/misskey-ts-assets:<tag>-mk.N`) で、**submodule のタグと 1:1 で対応させる**。ずれると 2026.9.0 の backend に古い frontend を載せた image を配ることになる。`make submodulepin-check` が `docs/divergence.md` の pin 行と突き合わせる (#3011) |
+
+**`Dockerfile.bundled` は表に無かったせいで実際に 23 世代遅れた** (#2877 の時点で
+`2026.7.0-mk.10`。数え方は fork の `*-mk.*` タグを `2026.7.0-mk.10` より後で数えた値で、
+`mk.11`〜`mk.22` の 12 個に加えて `mk.22a`〜`mk.22j` の 10 個と `2026.9.0-mk.0` を含む)。
+**古い tag でも image は問題なくビルドできる**ので、腐っても CI は落ちない —
+落ちるのは配った先だけ。`tests/bench/` も同じ性質で、こちらはどの workflow からも
+参照されていない (`tests/queue-bench/` は nightly の `queue-bench-smoke.yml` が引く)。
+assets image は fork 側の `Publish frontend assets image` workflow が `*-mk.*` タグで
+発火して publish するので、**submodule のタグを push した後**に上げること
+(`gh run list --repo shiroha-a/misskey-ts` で success を確認できる)。
+
+**表に載せただけでは止まらなかった。** #2877 で表へ載せた後も `Dockerfile.bundled` の
+pin は `2026.9.0-mk.0` に置き去りのままで、**リリースした `1.3.0-bundled` は既に 2 世代**
+(submodule は `2026.9.0-mk.2`)、develop では 29 世代ずれていた (pin されていた `mk.0` から数えた間隔。数字付きの tag 30 個から 1 を引いた値で、英字付きを含めると 62 個から 1 を引いて 61)。現在は
+`make submodulepin-check` が pin 行の tag と突き合わせるので、片側だけ上げると
+`make gates` が落ちる (#3011)。**publish 済みかどうかまでは見ない** —
+ネットワークが要るので `make gates` では取れない。tag を上げたら上の `gh run list` で
+assets image の workflow が success していることを必ず確認し、**失敗していたら fork 側で
+回し直す** (`gh workflow run assets-image.yml --repo shiroha-a/misskey-ts -f tag=<tag>`。
+`tag` は `required: true` の input で、workflow 自身がその tag を checkout するので `--ref` では代用できない)。
+publish されていない tag を pin すると `docker.yml` の `build-and-push-bundled` が `FROM` の
+pull で落ちる。実測で `2026.7.0-mk.18` は**タグはあるのに image が無い**状態で残っている
+(`2026.7.0-mk.4` 以前は workflow 導入前なので期待どおり)。
+
+**探し方は `grep -rn 'misskey/misskey:' --include='*.yml' --include='*.yaml' --include='*.md' . | grep -v third_party`。**
+表を手で追うより確実で、doc の散文に埋まった版数 (`docs/dropin-e2e.md` のトラブルシュート等) も拾える。
+**ただし `Dockerfile.bundled` だけは拾えない** — image 名が `misskey-ts-assets` で、
+`--include` にも Dockerfile が無い。そちらは `make submodulepin-check` が見る。
 
 **除外リストの「version-gap」注記は、版を揃えたら必ず読み直す。** 実例として、
 diff harness の `META_IGNORE` には `app192IconUrl` / `app512IconUrl` /
@@ -218,10 +389,15 @@ diff harness の `META_IGNORE` には `app192IconUrl` / `app512IconUrl` /
 ### submodule bump 後に必須: TS baseline で Playwright を回す
 
 ```bash
-gh workflow run playwright.yml --ref <branch>   # TS backend も含めて実行される
+gh workflow run playwright.yml --ref <branch> -f ref=<branch>   # TS backend も含めて実行される
 # または手元で
 make playwright-ts-up && make playwright-ts-test && make playwright-ts-down
 ```
+
+**`-f ref=<branch>` を省かない。** checkout は `inputs.ref || github.ref` だが、入力 `ref` の既定値が
+`develop` なので `github.ref` には落ちない。`--ref` だけだと workflow 定義はそのブランチのものを使いつつ
+**develop のコードを検証する** (2026.9.1 の追従で 2 回踏んだ。落ちた行番号が修正前のものだった)。
+`diff-e2e.yml` / `dropin-e2e.yml` / `upstream-backend-e2e.yml` も同じ形。
 
 Playwright spec は普段 mk-go backend に対してしか走っていない (PR トリガーでも
 mk-go のみ)。**TS backend に対して回すのは upstream 追従のタイミングだけ**という

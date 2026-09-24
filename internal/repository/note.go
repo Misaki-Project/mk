@@ -130,6 +130,10 @@ type NoteRepository interface {
 	// specified 除外版を流用しないこと。post-fetch filter だとページ過少充填 +
 	// followers 判定 N+1 になるため (#1418 / #1452 と同 doctrine)。
 	ListRenotesOf(noteID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error)
+	// ListRenoteOrReplyRemoteUserIDs returns the ids of remote users who
+	// renoted or replied to noteID (#2995)。ノートを削除したとき、その相手の
+	// サーバーにも Delete を届けるために使う。
+	ListRenoteOrReplyRemoteUserIDs(noteID string) ([]string, error)
 	ListRepliesOf(noteID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error)
 	ListChildrenOf(noteID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error)
 	SearchByFilter(filter model.NoteSearchFilter) ([]*model.Note, error)
@@ -190,6 +194,12 @@ type NoteRepository interface {
 	// cancellation checkpoints and sleep pacing live in the processor
 	// (see CleanRemoteNotesProcessor).
 	DeleteExpiredRemoteNotes(expiryDays, batchSize int) (int64, error)
+	// DeleteExpiredRemoteNotesAfter is DeleteExpiredRemoteNotes that walks
+	// root notes in id order starting after the given cursor ("" = from the
+	// beginning). It returns the note rows deleted, the number of roots
+	// examined (fewer than batchSize = reached the end) and the id of the
+	// last root examined (to resume after; "" when none).
+	DeleteExpiredRemoteNotesAfter(expiryDays, batchSize int, after string) (deleted int64, scanned int, lastRootID string, err error)
 	// DeleteByUserBatch deletes up to batchSize notes authored by userID in a
 	// single DELETE statement. Returns the count actually removed. Callers
 	// drive the loop themselves so that cancellation checkpoints and sleep
@@ -276,6 +286,9 @@ func (r *noteRepository) Create(note *model.Note) error {
 }
 
 func (r *noteRepository) FindByID(id string) (*model.Note, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var note model.Note
 	if err := r.db.First(&note, "id = ?", id).Error; err != nil {
 		return nil, err
@@ -284,6 +297,9 @@ func (r *noteRepository) FindByID(id string) (*model.Note, error) {
 }
 
 func (r *noteRepository) FindByIDWithUser(id string) (*model.Note, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var note model.Note
 	if err := r.db.Preload("User").First(&note, "id = ?", id).Error; err != nil {
 		return nil, err
@@ -292,6 +308,9 @@ func (r *noteRepository) FindByIDWithUser(id string) (*model.Note, error) {
 }
 
 func (r *noteRepository) FindByIDWithRelations(id string) (*model.Note, error) {
+	if !storable(id) {
+		return nil, ErrNotFound
+	}
 	var note model.Note
 	if err := preloadNoteRelations(r.db).First(&note, "id = ?", id).Error; err != nil {
 		return nil, err
@@ -302,6 +321,9 @@ func (r *noteRepository) FindByIDWithRelations(id string) (*model.Note, error) {
 // FindByURI looks up a note by its ActivityPub URI. リモート由来の note は
 // uri 列に作成元のIRIが入っているため、配信や inbox 処理での重複検出に使う。
 func (r *noteRepository) FindByURI(uri string) (*model.Note, error) {
+	if !storable(uri) {
+		return nil, ErrNotFound
+	}
 	var note model.Note
 	if err := r.db.Where("uri = ?", uri).First(&note).Error; err != nil {
 		return nil, err
@@ -537,6 +559,34 @@ func (r *noteRepository) ListRenotesOf(noteID, viewerID, untilID, sinceID string
 	return notes, nil
 }
 
+// ListRenoteOrReplyRemoteUserIDs returns the distinct ids of remote users who
+// renoted or replied to noteID (upstream の getRenotedOrRepliedRemoteUsers 相当)。
+//
+// **可視性では絞らない。** 引きたいのは「この note を実際に取り込んで参照している
+// リモート user」で、削除を届ける必要があるかどうかはその一点で決まる。相手が
+// 今その note を見られるかは関係がない (見られなくなったからこそ消してほしい)。
+//
+// **`user` へ join せず `note.userHost` を見る。** 同じ判定を upstream も
+// `userHost IS NOT NULL` で書いており、note 側に列があるので join を足す理由が無い。
+//
+// **件数は絞らない。** 返るのは 1 つの note に対する distinct なリモート user なので
+// 実測で問題になる規模にならず、配送側は sharedInbox へ畳むのでインスタンス数まで
+// 落ちる。`public` / `home` も broadcast が失敗したときはこの経路へ来る
+// (`broadcastDelete` が false を返す) ので、「followers / specified だけ」では
+// ない点に注意。
+//
+// **`renoteId` / `replyId` には index が要る** (000091 / 000092)。無いと削除の
+// たびに `note` 全体の seq scan が同期の削除リクエストの中で走る。
+func (r *noteRepository) ListRenoteOrReplyRemoteUserIDs(noteID string) ([]string, error) {
+	var ids []string
+	if err := r.db.Raw(`SELECT DISTINCT "userId" FROM "note"
+		WHERE ("renoteId" = ? OR "replyId" = ?) AND "userHost" IS NOT NULL`,
+		noteID, noteID).Scan(&ids).Error; err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // ListRepliesOf returns notes whose replyId equals noteID.
 // すべてのユーザーからの返信を返す(ミュート判定はServiceで行う)。
 func (r *noteRepository) ListRepliesOf(noteID, viewerID, untilID, sinceID string, limit int) ([]*model.Note, error) {
@@ -592,6 +642,11 @@ func (r *noteRepository) ListChildrenOf(noteID, viewerID, untilID, sinceID strin
 // f.ViewerID 視点で push-down する (空は public/home のみ、非空なら viewer 自身の
 // followers/specified/visibleUserIds note も含む、#1554)。
 func (r *noteRepository) SearchByFilter(f model.NoteSearchFilter) ([]*model.Note, error) {
+	// 列に入らない文字は保存された値に現れないので、一致しえない (#3025)。
+	// **引く前に弾く** — LIKE のパターンに載せるとクエリごと落ちて 500 になる。
+	if !storable(f.Query) || !storable(f.UserID) || !storable(f.ChannelID) || !storable(f.Host) {
+		return nil, nil
+	}
 	var notes []*model.Note
 	q := preloadNoteRelations(r.db)
 	if f.Pgroonga {
@@ -685,6 +740,7 @@ func (r *noteRepository) ExistingNoteIDsOnPrimary(ids []string) ([]string, error
 // FindManyByIDsWithUser returns the requested notes preserving the order of `ids`.
 // Notes that are not found are simply omitted from the result.
 func (r *noteRepository) FindManyByIDsWithUser(ids []string) ([]*model.Note, error) {
+	ids = storableIDs(ids)
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -898,6 +954,11 @@ func (r *noteRepository) ListFeaturedByUser(userID, viewerID, untilID string, li
 		Where(`"userId" = ?`, userID).
 		Where(`"channelId" IS NULL`)
 	q = applyViewerVisibility(q, viewerID)
+	// **凍結した利用者のノートを出さない。** upstream
+	// `users/featured-notes.ts` は `generateSuspendedUserQueryForNote` を
+	// 掛けている。`users/show` が凍結ユーザーを `NO_SUCH_USER` で隠すのに
+	// 同じ利用者のノートが本文つきで返るのは、経路ごとに結果が食い違う形。
+	q = applySuspendedAuthorExclusion(q)
 	q = q.Order(`("renoteCount" + "repliesCount") DESC, id DESC`).Limit(FeaturedNotesPerUserPoolSize)
 	var pool []*model.Note
 	if err := q.Find(&pool).Error; err != nil {
@@ -926,6 +987,9 @@ func (r *noteRepository) ListFeaturedByUser(userID, viewerID, untilID string, li
 }
 
 func (r *noteRepository) FindRenoteByUser(userID, renoteID string) (*model.Note, error) {
+	if !storable(userID) || !storable(renoteID) {
+		return nil, ErrNotFound
+	}
 	var note model.Note
 	if err := r.db.Where("\"userId\" = ? AND \"renoteId\" = ? AND text IS NULL", userID, renoteID).
 		Order("id DESC").First(&note).Error; err != nil {
@@ -1402,6 +1466,26 @@ func (r *noteRepository) ListGlobalTimeline(limit int, sinceID, untilID string, 
 	return notes, nil
 }
 
+// noteRemovableExpr is the per-note removal criteria shared by the root
+// selection and the inductive step of DeleteExpiredRemoteNotes.
+//
+// **両方で同じ式を使うこと。** 片方だけに掛けると、根に掛ければ「新しい子孫
+// ごと消える」、枝に掛ければ「保護された根が LIMIT の枠を食う」。upstream も
+// `removalCriteria` を 1 つ組んで両方で使う。`?` を 1 つ含むので、
+// 呼び出し側は cutoff を式の出現回数ぶん渡すこと。
+const noteRemovableExpr = `
+			n."userHost" IS NOT NULL
+			AND n.id < ?
+			AND n."clippedCount" = 0
+			AND n."pageCount" = 0
+			AND NOT EXISTS (SELECT 1 FROM "clip_note" c WHERE c."noteId" = n.id)
+			AND NOT EXISTS (SELECT 1 FROM "user_note_pining" p WHERE p."noteId" = n.id)
+			AND NOT EXISTS (SELECT 1 FROM "note_favorite" f WHERE f."noteId" = n.id)
+			AND NOT EXISTS (
+				SELECT 1 FROM "note_reaction" rc
+				INNER JOIN "user" u ON u.id = rc."userId"
+				WHERE rc."noteId" = n.id AND u.host IS NULL)`
+
 // DeleteExpiredRemoteNotes はリモートノート (userHost IS NOT NULL) のうち
 // expiryDays より前に作成されたものを最大 batchSize 件削除し、実際に消えた
 // 行数を返す。ループは呼び出し側 (CleanRemoteNotesProcessor) が sleep / ctx
@@ -1421,30 +1505,108 @@ func (r *noteRepository) ListGlobalTimeline(limit int, sinceID, untilID string, 
 // 移植してもクリップを保護できない。`clippedCount` / `pageCount` の比較自体は
 // TS から切り戻したインスタンス (= カウンタが実際に入っている行) のために残す。
 func (r *noteRepository) DeleteExpiredRemoteNotes(expiryDays, batchSize int) (int64, error) {
+	deleted, _, _, err := r.DeleteExpiredRemoteNotesAfter(expiryDays, batchSize, "")
+	return deleted, err
+}
+
+// DeleteExpiredRemoteNotesAfter is the cursor-based form of
+// DeleteExpiredRemoteNotes.
+//
+// **根を id 順に、カーソルの後ろから見る (upstream 2026.9.1 #17957)。**
+// 以前は `ORDER BY` も位置も無い `LIMIT` だけで根を選んでいたので、配下に
+// 削除不可のノート (ローカルの返信など) を持つツリーの根が毎回同じ枠を食い、
+// そうした根が batchSize 件以上あると掃除が一歩も進まなかった。カーソルを
+// 進めれば、消せないツリーは 1 度見たら通り過ぎる。
+//
+// cutoff 以上のカーソル (期限を延ばした後など) は先頭からにする (upstream と同じ)。
+func (r *noteRepository) DeleteExpiredRemoteNotesAfter(expiryDays, batchSize int, after string) (int64, int, string, error) {
 	if batchSize <= 0 {
 		batchSize = 100
 	}
 	cutoffID := aidxCutoffID(time.Now().Add(-time.Duration(expiryDays) * 24 * time.Hour))
-	res := r.db.Exec(`
-		DELETE FROM "note" WHERE id IN (
-			SELECT n.id FROM "note" n
-			WHERE n."userHost" IS NOT NULL
-			  AND n.id < ?
-			  AND n."clippedCount" = 0
-			  AND n."pageCount" = 0
-			  AND NOT EXISTS (SELECT 1 FROM "clip_note" c WHERE c."noteId" = n.id)
-			  AND NOT EXISTS (SELECT 1 FROM "user_note_pining" p WHERE p."noteId" = n.id)
-			  AND NOT EXISTS (SELECT 1 FROM "note_favorite" f WHERE f."noteId" = n.id)
-			  AND NOT EXISTS (
-			        SELECT 1 FROM "note_reaction" rc
-			        INNER JOIN "user" u ON u.id = rc."userId"
-			        WHERE rc."noteId" = n.id AND u.host IS NULL)
-			LIMIT ?
-		)`, cutoffID, batchSize)
-	if res.Error != nil {
-		return 0, res.Error
+	if after >= cutoffID {
+		after = ""
 	}
-	return res.RowsAffected, nil
+	// **ツリー単位で守る。**
+	//
+	// 単体の条件だけで消すと、**ローカル利用者が返信・引用・リノートした
+	// リモートノートが、その利用者の投稿を残したまま消える**。返信先の無い
+	// 返信や「削除されたノート」のリノートがタイムラインに残り、しかも
+	// 不可逆 (相手サーバーから取り直す経路は無い)。
+	//
+	// upstream `CleanRemoteNotesProcessorService` と同じ 3 段にする —
+	// (a) 起点をルート (`replyId IS NULL AND renoteId IS NULL`) に絞り、
+	// (b) 再帰 CTE で `replyId` / `renoteId` を辿ってツリー全体を作り、
+	// (c) 1 件でも削除不可のノートを含むツリーは丸ごと除外する。
+	//
+	// **`UNION` であって `UNION ALL` ではない。** `replyId` と `renoteId` が
+	// 同じツリーの別ノートを指す形 (= 引用リプライ。Misskey の通常機能) だと
+	// 1 ノードが 2 行から派生するので、`UNION ALL` では **Fibonacci 的に増殖**
+	// する。実測では長さ 26 の連鎖で `tree` が 317,810 行 (0.90 秒)、31 で
+	// 2 分 38 秒を超えた。連合相手が投稿を積むだけで誘発できる。`UNION` が
+	// 重複排除と循環ガードを兼ねる (upstream も `UNION`)。
+	//
+	// **期限はノード単位でも見る。** cutoff を `roots` にしか掛けないと、
+	// **たった今届いた返信がぶら下がっているだけのツリーが丸ごと消える**。
+	// upstream は `removalCriteria` に `note."id" < :newestLimit` を含め、
+	// それを帰納ステップの判定にも使う。
+	//
+	// **`roots` にも removability を掛ける。** 掛けないと削除不可のルートが
+	// LIMIT の枠を食い、`deleted < batchSize` で break する processor が
+	// 前へ進めなくなる (実測: 保護されたルートが 1 件あるだけで掃除が止まった)。
+	//
+	// **保護そのものは (c) の anti-join が担う。** (a) の「起点をルートに絞る」は
+	// upstream に合わせた効率の話で、外しても結果は変わらない (子から辿っても
+	// 同じツリーに到達するため)。変異検証でもそこは検出できない。
+	var out struct {
+		Deleted    int64
+		Scanned    int
+		LastRootID *string
+	}
+	res := r.db.Raw(`
+		WITH RECURSIVE roots AS (
+			SELECT n.id AS "rootId", n.id
+			FROM "note" n
+			WHERE n."replyId" IS NULL
+			  AND n."renoteId" IS NULL
+			  AND n.id > ?
+			  AND (`+noteRemovableExpr+`)
+			ORDER BY n.id
+			LIMIT ?
+		),
+		tree AS (
+			SELECT r."rootId", r.id FROM roots r
+			UNION
+			SELECT t."rootId", c.id
+			FROM "note" c
+			INNER JOIN tree t ON c."replyId" = t.id OR c."renoteId" = t.id
+		),
+		judged AS (
+			SELECT t."rootId", t.id, (`+noteRemovableExpr+`) AS removable
+			FROM tree t
+			INNER JOIN "note" n ON n.id = t.id
+		),
+		deleted AS (
+			DELETE FROM "note" WHERE id IN (
+				SELECT j.id FROM judged j
+				WHERE NOT EXISTS (
+					SELECT 1 FROM judged k
+					WHERE k."rootId" = j."rootId" AND k.removable = FALSE
+				)
+			)
+			RETURNING 1
+		)
+		SELECT (SELECT count(*) FROM deleted) AS deleted,
+		       (SELECT count(*) FROM roots) AS scanned,
+		       (SELECT max(id) FROM roots) AS last_root_id`, after, cutoffID, batchSize, cutoffID).Scan(&out)
+	if res.Error != nil {
+		return 0, 0, "", res.Error
+	}
+	last := ""
+	if out.LastRootID != nil {
+		last = *out.LastRootID
+	}
+	return out.Deleted, out.Scanned, last, nil
 }
 
 func (r *noteRepository) DeleteByUserBatch(userID string, batchSize int) (int64, error) {
@@ -1543,20 +1705,52 @@ func (r *noteRepository) ListByUserList(listID string, limit int, sinceID, until
 	return notes, nil
 }
 
+// recentReplyScanLimit は CountReplyTargets が集計対象にする直近の返信件数。
+// upstream get-frequently-replied-users.ts の `limit(1000)` と同じ値。
+const recentReplyScanLimit = 1000
+
 func (r *noteRepository) CountReplyTargets(userID, viewerID string, limit int) ([]model.ReplyTargetCount, error) {
 	if limit <= 0 {
 		limit = 10
 	}
 	var rows []model.ReplyTargetCount
-	// replyUserIdがNULLのもの (通常起こり得ないが防御)と自己返信は集計から除外する。
-	q := r.db.Model(&model.Note{}).
-		Select(`"replyUserId", COUNT(*) AS count`).
-		Where(`"userId" = ? AND "replyId" IS NOT NULL AND "replyUserId" IS NOT NULL AND "replyUserId" <> ?`, userID, userID)
+	// **直近 1000 件の窓を取ってから集計する。** upstream
+	// (get-frequently-replied-users.ts) の recentNotesQuery が
+	// `ORDER BY note.id DESC LIMIT 1000` を持つのと同じ。この endpoint は
+	// upstream / mk-go とも **未認証で任意の userId に対して叩けて**、
+	// レート制限の定義も無い。上限が無いと投稿数に比例して重くなり、
+	// 下の相関 EXISTS が 1 行ごとの PK 探索になるので増幅する
+	// (実測: 返信 20 万件で 119ms -> 813ms)。
+	//
+	// **窓の条件は upstream と同じにすること。** 自己返信の除外
+	// (`"replyUserId" <> userID`) は mk-go 固有で upstream の窓には無い。これを
+	// 内側に置くと、述語に当たらない行が続く限り LIMIT が満たされず、planner が
+	// `Index Scan Backward using note_pkey` に倒れて **note テーブル全体**を走査する
+	// (実測: 自己返信 200k・他者宛 0 のユーザーで 1.8M 行を全部読み 421ms。外へ
+	// 出すと 1.15ms)。**上限を入れたつもりで別経路の DoS を開けることになる。**
+	recent := r.db.Model(&model.Note{}).
+		Select(`"id", "replyId", "replyUserId"`).
+		Where(`"userId" = ? AND "replyId" IS NOT NULL`, userID)
 	// visibility push-down: 集計対象 reply note のうち viewer が CanSeeNote で
 	// 見られるものだけを残す。これが無いと第三者 viewer が author の
 	// followers/specified reply の対人関係を集計値経由で観測できる (#1486)。
 	// 条件は ListByUserIDFiltered / ListMentions / SearchByTag と同一。
-	q = applyViewerVisibility(q, viewerID)
+	//
+	// **絞り込みの前に掛ける。** 後に掛けると「見える 1000 件」ではなく
+	// 「直近 1000 件のうち見えるもの」になり、upstream と件数が変わる。
+	recent = applyViewerVisibility(recent, viewerID).Order(`"id" DESC`).Limit(recentReplyScanLimit)
+
+	// replyUserId が NULL のもの (通常起こり得ないが防御) と自己返信は**窓を取った後**に
+	// 除外する (上記のとおり窓の内側に置くと LIMIT が効かなくなる)。
+	//
+	// **返信先の note にも可視性 gate を掛ける。** 集計は非正規化列 `"replyUserId"`
+	// を読むだけなので、これが無いと「返信元は見えるが返信先は見えない」組で
+	// 相手の身元が集計値に出る。upstream も 2 つのクエリの両方に
+	// generateVisibilityQuery を足している。
+	q := r.db.Table(`(?) AS t`, recent).
+		Select(`"replyUserId", COUNT(*) AS count`).
+		Where(`t."replyUserId" IS NOT NULL AND t."replyUserId" <> ?`, userID)
+	q = applyViewerVisibilityExists(q, `t."replyId"`, viewerID)
 	err := q.Group(`"replyUserId"`).
 		Order(`count DESC`).
 		Limit(limit).

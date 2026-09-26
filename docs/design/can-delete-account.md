@@ -55,9 +55,9 @@ native側が恒久的に保持する責務は、公開policy keyのschema、secu
 
 base policy画面とrole editorへboolean項目を追加し、instance既定値とrole overrideを管理できるようにする。mk-go固有policyは既存規約どおり`mkGoRolePolicyKeys`、`mkGoPolicyMetaKeys`、`mkGoPolicyValue`へ集約し、TS backendのOpenAPIから再生成される型を直接編集しない。本人設定画面での型境界も小さなboolean判定helperへ閉じ込め、templateへ任意castやprivate plugin API依存を散らさない。
 
-現在frontendは`third_party/misskey` submoduleで、設定URLは`shiroha-a/misskey-ts`である。上流repositoryは変更せず、これから作成する`Misaki-Project/misskey-ts` forkのfrontend PRを先にmergeし、そのcommitを参照するようmk-go側のsubmodule URLとgitlinkを更新する。
+frontendは`third_party/misskey` submoduleで、2026-09-26 時点で submodule URLは`Misaki-Project/misskey-ts`を指す。`shiroha-a/misskey-ts`は上流repositoryとして変更していない。本ドキュメントの作時点で計画していたfork移設は完了し、`canDeleteAccount`のfrontend PR (https://github.com/Misaki-Project/misskey-ts/pull/1) をmergeしたcommit `1a53308b` にtag `2026.9.1-mk.2` を打って、mk-go側はsubmodule URLとgitlinkをそのtagへ更新済み。baseの`mk-2026.9.1`ブランチには別PR (同fork PR #2) でsignup E2Eのtest fixも入っており、どちらも`2026.9.1-mk.2`に含まれる。
 
-bundled deploymentはsubmoduleではなく`Dockerfile.bundled`の`MISSKEY_ASSETS_IMAGE`を使うため、新fork側で同commitのfrontend assets imageをpublishし、mk-go側でimage repository/tagも更新する。submodule pin、assets image tag、`docs/divergence.md`のpin記録、および既存`submodulepin-check`を同じ変更単位で揃え、source buildと配布imageで異なるUIを出さない。
+bundled deploymentはsubmoduleではなく`Dockerfile.bundled`の`MISSKEY_ASSETS_IMAGE`を使うため、新fork側で同commitのfrontend assets imageをpublishし、mk-go側でimage repository/tagも更新する。submodule pin、assets image tag、`docs/divergence.md`のpin記録、および既存`submodulepin-check`を同じ変更単位で揃え、source buildと配布imageで異なるUIを出さない。公開済みなのは`ghcr.io/misaki-project/misskey-ts-assets:2026.9.1-mk.2` (submodule tagと1:1対応、workflow `Publish frontend assets image` が`*-mk.*`タグで発火)。
 
 将来frontendがmk repositoryへ統合された後も移動しやすいよう、専用frameworkや一時的なDOM操作は追加せず、policy表示条件とrole editor項目だけの最小差分にする。fork固有の変更はfrontend実装とassets publish設定に限定し、mk-go側はsubmodule/assets pin以外からfork repositoryを参照しない。
 

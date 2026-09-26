@@ -36,7 +36,7 @@ make build          # または docker build / make uds-build
 
 `Dockerfile` / `Dockerfile.bundled` / `deploy/uds/Dockerfile.mkgo` のいずれも生成ツールを実行するので、`plugins/` に置いた状態でイメージをビルドすれば取り込まれる。
 
-`Dockerfile.bundled` は SPA を同梱するが、その供給元は既定で mk-go 公式のアセットイメージ（`ghcr.io/shiroha-a/misskey-ts-assets`）なので、**プラグインのフロントエンドは入らない**。含めるには SPA を自前でビルドしたうえで `--build-arg ASSETS_SOURCE=local` を渡す。下記の GitHub Actions 経由ならこの判定は自動で行われる。
+`Dockerfile.bundled` は SPA を同梱するが、その供給元は既定で mk-go 公式のアセットイメージ（`ghcr.io/misaki-project/misskey-ts-assets`）なので、**プラグインのフロントエンドは入らない**。含めるには SPA を自前でビルドしたうえで `--build-arg ASSETS_SOURCE=local` を渡す。下記の GitHub Actions 経由ならこの判定は自動で行われる。
 
 ### フロントエンドを持つプラグイン
 

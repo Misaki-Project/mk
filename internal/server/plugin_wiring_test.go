@@ -763,9 +763,16 @@ func newEffectivePolicyTestService(t *testing.T) (*corerole.Service, *testutil.M
 	t.Helper()
 	roleRepo := testutil.NewMockRoleRepository()
 	assignmentRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
+	// **singleton meta の行は既定で存在させる。** 実 repository の Fetch は
+	// 行が無ければ upsert するので、成功した Fetch が「行が無い」を返すことは
+	// 無い。`NewMockMetaRepository()` を素で渡すと Fetch が ErrNotFound を
+	// 返し、role service は「base policy を読めない実在の障害」と見て
+	// checked 解決が error を返す (= native 既定しか乗らない)。
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x"}
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
-	return corerole.NewService(roleRepo, assignmentRepo, testutil.NewMockMetaRepository(), idGen), roleRepo, assignmentRepo
+	return corerole.NewService(roleRepo, assignmentRepo, metaRepo, idGen), roleRepo, assignmentRepo
 }
 
 func TestSetupPlugins_EffectivePolicyStartupOrderAndRegistration(t *testing.T) {

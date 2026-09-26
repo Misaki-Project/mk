@@ -23,10 +23,25 @@ func newTestService(t *testing.T) (*role.Service, *testutil.MockRoleRepository, 
 	t.Helper()
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	return svc, roleRepo, assignRepo, metaRepo
+}
+
+// newTestMetaRepository returns a meta repository holding the singleton row
+// with no base-policy override, i.e. what a freshly configured instance looks
+// like. **Do not start a role service from a bare `testutil.NewMockMetaRepository()`:
+// that mock reports a missing row as `ErrNotFound`, while the real repository's
+// `Fetch` upserts and therefore never fails that way.** A successful production
+// `Fetch` always yields a row, so a meta-less mock makes every policy resolution
+// look like an unreadable base (a real failure that checked resolution reports).
+// Break meta explicitly instead -- `FetchErr` for a fetch failure,
+// `Meta.Policies` for a decode failure.
+func newTestMetaRepository() *testutil.MockMetaRepository {
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x"}
+	return metaRepo
 }
 
 type roleLookupResult struct {
@@ -49,7 +64,7 @@ func (r *sequenceRoleRepository) FindByID(string) (*model.Role, error) {
 func newServiceWithRoleRepository(t *testing.T, roleRepo repository.RoleRepository, base *testutil.MockRoleRepository) *role.Service {
 	t.Helper()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(base)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(t, err)
 	return role.NewService(roleRepo, assignRepo, metaRepo, idGen)
@@ -350,8 +365,8 @@ func TestIsModerator_NoRole(t *testing.T) {
 }
 
 func TestIsAdministrator_MetaFetchError(t *testing.T) {
-	svc, _, _, _ := newTestService(t)
-	// metaRepo.Meta is nil → Fetch returns error
+	svc, _, _, metaRepo := newTestService(t)
+	metaRepo.FetchErr = errors.New("meta unavailable")
 	assert.False(t, svc.IsAdministrator("user1"))
 }
 
@@ -956,8 +971,9 @@ func TestIsModerator_RootUser(t *testing.T) {
 }
 
 func TestIsModerator_MetaFetchError(t *testing.T) {
-	svc, _, _, _ := newTestService(t)
-	// metaRepo.Meta = nil → Fetch error → isRootUser false → no roles → false
+	svc, _, _, metaRepo := newTestService(t)
+	metaRepo.FetchErr = errors.New("meta unavailable")
+	// Fetch error → isRootUser false → no roles → false
 	assert.False(t, svc.IsModerator("user1"))
 }
 
@@ -1039,7 +1055,7 @@ func TestCountAssignedUsers_Counts(t *testing.T) {
 func TestCountAssignedUsers_FailOpen(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := &failingAssignRepo{testutil.NewMockRoleAssignmentRepository(roleRepo)}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	assert.Equal(t, 0, svc.CountAssignedUsers("r1"))
@@ -1054,7 +1070,7 @@ func (f *failingRoleRepo) Create(_ *model.Role) error { return assert.AnError }
 func TestGetUserRoles_ListByUserError(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := &failingAssignRepo{testutil.NewMockRoleAssignmentRepository(roleRepo)}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -1065,8 +1081,7 @@ func TestGetUserRoles_ListByUserError(t *testing.T) {
 func TestIsAdministrator_GetRolesError_ReturnsFalse(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := &failingAssignRepo{testutil.NewMockRoleAssignmentRepository(roleRepo)}
-	metaRepo := testutil.NewMockMetaRepository()
-	metaRepo.Meta = &model.Meta{ID: "x"}
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -1076,8 +1091,7 @@ func TestIsAdministrator_GetRolesError_ReturnsFalse(t *testing.T) {
 func TestIsModerator_GetRolesError_ReturnsFalse(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := &failingAssignRepo{testutil.NewMockRoleAssignmentRepository(roleRepo)}
-	metaRepo := testutil.NewMockMetaRepository()
-	metaRepo.Meta = &model.Meta{ID: "x"}
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -1088,7 +1102,7 @@ func TestAssign_ExistsRepoError(t *testing.T) {
 	rr := testutil.NewMockRoleRepository()
 	rr.Roles["r1"] = &model.Role{ID: "r1"}
 	assignRepo := &failingAssignRepo{testutil.NewMockRoleAssignmentRepository(rr)}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(rr, assignRepo, metaRepo, idGen)
 
@@ -1099,7 +1113,7 @@ func TestAssign_ExistsRepoError(t *testing.T) {
 func TestUnassign_ExistsRepoError(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := &failingAssignRepo{testutil.NewMockRoleAssignmentRepository(roleRepo)}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -1110,7 +1124,7 @@ func TestUnassign_ExistsRepoError(t *testing.T) {
 func TestCreate_RepoCreateError(t *testing.T) {
 	rr := &failingRoleRepo{testutil.NewMockRoleRepository()}
 	assignRepo := testutil.NewMockRoleAssignmentRepository(rr.MockRoleRepository)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(rr, assignRepo, metaRepo, idGen)
 
@@ -1227,7 +1241,7 @@ func newServiceWithCountingAssign(t *testing.T) (*role.Service, *testutil.MockRo
 	assignRepo := &countingAssignmentRepo{
 		MockRoleAssignmentRepository: testutil.NewMockRoleAssignmentRepository(roleRepo),
 	}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	return svc, roleRepo, assignRepo
@@ -1512,7 +1526,7 @@ func newServiceWithCountingRoleRepo(t *testing.T) (*role.Service, *countingRoleR
 	mockRoleRepo := testutil.NewMockRoleRepository()
 	roleRepo := &countingRoleRepo{MockRoleRepository: mockRoleRepo}
 	assignRepo := testutil.NewMockRoleAssignmentRepository(mockRoleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	return svc, roleRepo, assignRepo
@@ -1732,7 +1746,7 @@ func TestListByRole_RepoError(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1"}
 	assignRepo := &failingListByRoleAssignRepo{testutil.NewMockRoleAssignmentRepository(roleRepo)}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -1806,7 +1820,7 @@ func TestUpdateFields_RepoError(t *testing.T) {
 	roleRepo.Roles["r1"] = &model.Role{ID: "r1", Name: "Old"}
 	wrapped := &failingUpdateFieldsRoleRepo{roleRepo}
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(wrapped, assignRepo, metaRepo, idGen)
 

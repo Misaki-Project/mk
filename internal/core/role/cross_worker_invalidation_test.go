@@ -22,7 +22,7 @@ func newHookedService(t *testing.T) (*role.Service, *int) {
 	t.Helper()
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -56,7 +56,7 @@ func TestInvalidateAllCachesLocally_DoesNotNotify(t *testing.T) {
 func TestInvalidateAllCachesLocally_DropsTheRoleCache(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -77,7 +77,7 @@ func TestInvalidateAllCachesLocally_DropsTheRoleCache(t *testing.T) {
 func TestInvalidationHook_UnwiredIsSafe(t *testing.T) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	svc.SetInvalidationHook(nil)

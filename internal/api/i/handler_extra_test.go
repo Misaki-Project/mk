@@ -792,6 +792,38 @@ func TestDeleteAccount_CanDeleteAccountPolicy(t *testing.T) {
 	}
 }
 
+// The stub above only proves "a checked error is fatal"; it cannot prove that
+// production *produces* one. Wire the real role.Service with an unreadable
+// instance meta (where the admin's canDeleteAccount=false base override lives)
+// so the end-to-end path -- fetch failure -> checked error -> 500 -- is the one
+// under test. No deletion side effect may happen.
+func TestDeleteAccount_RealRoleServiceMetaBaseFailureReturns500(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	roleRepo := testutil.NewMockRoleRepository()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x", Policies: datatypes.JSON([]byte(`{"canDeleteAccount":false}`))}
+	metaRepo.FetchErr = errors.New("meta unavailable")
+	roleIDGen, _ := id.NewGenerator("aidx")
+	h.SetRoleProvider(role.NewService(roleRepo, testutil.NewMockRoleAssignmentRepository(roleRepo), metaRepo, roleIDGen))
+
+	enq := &fakeDeleteEnqueuer{}
+	fed := &fakeAccountDeletionFed{}
+	inv := &stubTokenInvalidator{}
+	h.SetDeleteAccountEnqueuer(enq)
+	h.SetAccountDeletionFederationHook(fed)
+	h.SetAuthInvalidator(inv)
+	user := setupUserWithPassword(repo, "u1", "pass")
+
+	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INTERNAL_ERROR")
+	assert.False(t, repo.Users["u1"].IsDeleted)
+	assert.Empty(t, enq.called)
+	assert.Empty(t, fed.deleted)
+	assert.Empty(t, inv.userCalls)
+}
+
 // A provider that cannot resolve checked policies (here: none wired) must fail
 // closed with 500 rather than falling back to an allow.
 func TestDeleteAccount_MissingCheckedProviderFailsClosed(t *testing.T) {

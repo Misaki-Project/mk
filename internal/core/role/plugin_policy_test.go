@@ -245,6 +245,35 @@ func TestEffectivePolicy_CanDeleteAccountProviderCanDeny(t *testing.T) {
 	assert.Equal(t, false, policies[role.PolicyCanDeleteAccount])
 }
 
+// provider の contribution は**通常の priority / 型 / boolean-OR 集約の
+// 参加者にすぎない**。plugin が拒否を完全に所有する、あるいは false が
+// 常に優先する、というのは誤読で、同じ priority 群に `true` のロールが
+// 1 つあれば OR で勝ち返る。plugin veto を「今は無い」と明記するために、
+// 衝突時の結果 (true) を固定する。
+func TestEffectivePolicy_EqualPriorityRoleTrueOverridesPluginDeny(t *testing.T) {
+	svc, roleRepo, assignRepo, _ := newTestService(t)
+	roleRepo.Roles["r1"] = &model.Role{
+		ID:   "r1",
+		Name: "A",
+		Policies: datatypes.JSON([]byte(
+			`{"canDeleteAccount":{"useDefault":false,"priority":2,"value":true}}`)),
+	}
+	assign(t, assignRepo, "u1", "r1")
+	registerProvider(t, svc, "account-policy", []string{role.PolicyCanDeleteAccount},
+		func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
+			return []plugin.EffectivePolicyContribution{{
+				Key:      role.PolicyCanDeleteAccount,
+				Priority: 2,
+				Value:    false,
+			}}, nil
+		})
+
+	policies, err := svc.GetUserPoliciesChecked("u1")
+	require.NoError(t, err)
+	assert.Equal(t, true, policies[role.PolicyCanDeleteAccount],
+		"equal-priority bool OR: a true role contribution outranks the plugin's false")
+}
+
 func TestEffectivePolicy_UseDefaultFallsBackToNative(t *testing.T) {
 	svc, _, _, _ := newTestService(t)
 	registerProvider(t, svc, "p", []string{"canSearchNotes"}, func(context.Context, plugin.EffectivePolicyRequest) ([]plugin.EffectivePolicyContribution, error) {
@@ -569,7 +598,7 @@ func TestEffectivePolicy_RoleLookupErrorSkipsProvidersAndRemainsDistinct(t *test
 		MockRoleAssignmentRepository: testutil.NewMockRoleAssignmentRepository(roleRepo),
 		err:                          errors.New("role lookup failed"),
 	}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	var providerCalls atomic.Int32
@@ -584,6 +613,66 @@ func TestEffectivePolicy_RoleLookupErrorSkipsProvidersAndRemainsDistinct(t *test
 	assert.ErrorContains(t, err, "role lookup failed")
 	assert.False(t, policies["canSearchNotes"].(bool))
 	assert.Zero(t, providerCalls.Load())
+}
+
+// `meta.policies` は instance 全体の base override で、運営者はここで
+// `canDeleteAccount=false` を指定できる。**その meta を読み損ねた窓で
+// checked 解決が error を返さないと、native 既定値 `true` がそのまま答えに
+// なり本人削除の認可が fail open する** — 「運営者が拒否している」のに
+// 「許可している」と答えるので、fallback の向きが逆向きになる。
+// fetch 失敗と JSON decode 失敗の両方で checked 解決を error にし、
+// unchecked 経路 (`GetUserPolicies`) は error を捨てて **role override まで
+// 従来どおり反映した** map を返すことを固定する — ここで素の base に落とすと
+// role の拒否 (silence 等) を失い、同じ理由で fail open になる。
+func TestEffectivePolicy_MetaBasePolicyFailureIsReportedByCheckedResolution(t *testing.T) {
+	deny := datatypes.JSON([]byte(`{"canDeleteAccount":false}`))
+	for _, tt := range []struct {
+		name       string
+		breaksMeta func(*testutil.MockMetaRepository)
+	}{
+		{
+			name: "meta fetch failure",
+			breaksMeta: func(m *testutil.MockMetaRepository) {
+				m.FetchErr = errors.New("meta unavailable")
+			},
+		},
+		{
+			name: "malformed meta policies json",
+			breaksMeta: func(m *testutil.MockMetaRepository) {
+				m.Meta = &model.Meta{ID: "x", Policies: datatypes.JSON([]byte(`{"canDeleteAccount":`))}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, roleRepo, assignRepo, metaRepo := newTestService(t)
+			metaRepo.Meta = &model.Meta{ID: "x", Policies: deny}
+			tt.breaksMeta(metaRepo)
+
+			policies, err := svc.GetUserPoliciesChecked("u1")
+			require.Error(t, err, "base policy を読めないのに checked 解決が error を返さないと削除認可が fail open する")
+			assert.NotErrorIs(t, err, role.ErrEffectivePolicyProvider, "meta 障害は provider 障害と区別する")
+			assert.ErrorContains(t, err, "role: effective policy base")
+			assert.Equal(t, true, policies[role.PolicyCanDeleteAccount],
+				"fallback map は native 既定を保つ (error を受ける側で停止するのが責務)")
+
+			assert.Equal(t, true, svc.GetUserPolicies("u1")[role.PolicyCanDeleteAccount],
+				"unchecked 経路は fail-soft のまま (既存 consumer を壊さない)")
+
+			// **base を落とした early return は不可。** role override まで
+			// 反映した map を返さないと、base 障害の窓で role の拒否が
+			// 消えて checked 経路と unchecked 経路の答が食い違う。
+			roleRepo.Roles["deny"] = &model.Role{
+				ID:   "deny",
+				Name: "no self delete",
+				Policies: datatypes.JSON([]byte(
+					`{"canDeleteAccount":{"useDefault":false,"priority":2,"value":false}}`)),
+			}
+			assign(t, assignRepo, "u1", "deny")
+			svc.InvalidateUserRoleCache("u1") // 直上の解決が user cache を埋めている
+			assert.Equal(t, false, svc.GetUserPolicies("u1")[role.PolicyCanDeleteAccount],
+				"unchecked map must still carry the role override while base is unreadable")
+		})
+	}
 }
 
 func TestEffectivePolicy_ProviderPanicCheckedRestoresDeclaredKeys(t *testing.T) {
@@ -1637,7 +1726,7 @@ func TestInvalidateUser_InFlightMissCannotRepublishStaleRoles(t *testing.T) {
 		entered:                      make(chan struct{}),
 		release:                      make(chan struct{}),
 	}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -1664,7 +1753,7 @@ func TestInvalidateUser_OtherUserDoesNotDiscardInFlightRoleSnapshot(t *testing.T
 		entered:                      make(chan struct{}),
 		release:                      make(chan struct{}),
 	}
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 
@@ -1781,7 +1870,7 @@ func TestInvalidateUser_DoesNotDiscardInFlightSharedRoleList(t *testing.T) {
 		release:            make(chan struct{}),
 	}
 	assignRepo := testutil.NewMockRoleAssignmentRepository(baseRoleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	userRepo := testutil.NewMockUserRepository()
@@ -1826,7 +1915,7 @@ func TestInvalidateRolePolicies_InFlightConditionalSnapshotCannotRepublish(t *te
 		release:            make(chan struct{}),
 	}
 	assignRepo := testutil.NewMockRoleAssignmentRepository(baseRoleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, _ := id.NewGenerator("aidx")
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)
 	userRepo := testutil.NewMockUserRepository()
@@ -1854,7 +1943,7 @@ func TestInvalidateRolePolicies_EmptyRoleNoop(t *testing.T) {
 func BenchmarkEffectivePolicy_NoProviderAnonymous(b *testing.B) {
 	roleRepo := testutil.NewMockRoleRepository()
 	assignRepo := testutil.NewMockRoleAssignmentRepository(roleRepo)
-	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo := newTestMetaRepository()
 	idGen, err := id.NewGenerator("aidx")
 	require.NoError(b, err)
 	svc := role.NewService(roleRepo, assignRepo, metaRepo, idGen)

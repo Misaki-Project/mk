@@ -46,6 +46,15 @@ type RoleProvider interface {
 	HasRolePolicy(userID, policyKey string) bool
 }
 
+// checkedRoleProvider is the optional, narrower capability used by
+// i/delete-account to resolve effective policies while surfacing provider
+// failures. It is asserted on roleProvider rather than added to RoleProvider so
+// existing implementations and stubs stay unchanged. Unlike HasRolePolicy, the
+// caller applies no administrator bypass.
+type checkedRoleProvider interface {
+	GetUserPoliciesChecked(userID string) (map[string]any, error)
+}
+
 // EmailSender sends an email message (subject + text + optional HTML).
 // SMTP 設定は実装側が Meta から読み取る。テストではスタブを注入する。
 // HTML 同送が必要なら Message.HTML を設定する (#600 item 4)。

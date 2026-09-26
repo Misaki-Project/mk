@@ -167,12 +167,29 @@ func (s *Service) GetUserPoliciesChecked(userID string) (map[string]any, error) 
 // providers after native roles are resolved and before server caps are
 // applied. Provider failures return ErrEffectivePolicyProvider with the failed
 // providers' keys restored to native results. Native role-input failures return
-// their wrapped repository error without invoking providers.
-func (s *Service) resolvePolicies(userID string) (map[string]any, error) {
+// their wrapped repository error without invoking providers. An unreadable
+// instance base (`meta.policies`) is reported as a wrapped error too: falling
+// back to the native default silently would answer "allowed" for a base
+// override the admin may have set to deny.
+func (s *Service) resolvePolicies(userID string) (out map[string]any, err error) {
 	providers := s.snapshotPolicyProviders()
 	// applyMetaBasePolicies が base を mutate するため共有 cache ではなく clone を使う。
 	base := DefaultPoliciesClone()
-	s.applyMetaBasePolicies(base)
+	if baseErr := s.applyMetaBasePolicies(base); baseErr != nil {
+		// **fallback map は base を読めなかった頃と同じ形 (native default +
+		// role override) を保つ。** ここで素の base を返すと、unchecked
+		// consumer (`GetUserPolicies` → `IsSilenced` / `HasRolePolicy`) が base
+		// 障害の窓で role による拒否 (silence 等) を失い、fallback の向きが
+		// また許可側になる。return を続けず下の native 経路を通すのはそのため。
+		//
+		// provider は宣言 key の base 値が分からず集約の起点が壊れているの
+		// で呼ばない。error はこの defer で fixed に載せる — 下の return は
+		// 5 箇所あるので、1 箇所で確実に確認できる。
+		providers = nil
+		defer func() {
+			err = fmt.Errorf("role: effective policy base: %w", baseErr)
+		}()
+	}
 	if userID == "" && len(providers) == 0 {
 		return s.applyServerCaps(base), nil
 	}
@@ -197,7 +214,7 @@ func (s *Service) resolvePolicies(userID string) (map[string]any, error) {
 		roleOverrides = append(roleOverrides, parseRolePolicies(r.Policies))
 	}
 
-	out := make(map[string]any, len(base))
+	out = make(map[string]any, len(base))
 	for key, baseVal := range base {
 		out[key] = computePolicy(key, baseVal, roleOverrides, nil)
 	}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/shiroha-a/mk/internal/core/notification"
+	"github.com/shiroha-a/mk/internal/core/role"
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
 	"github.com/shiroha-a/mk/internal/entitycompat/shapetest"
 	"github.com/shiroha-a/mk/internal/misc/id"
@@ -42,6 +43,17 @@ func newExtraHandler(t *testing.T) (*Handler, *testutil.MockUserRepository) {
 	h := NewHandler(svc, idGen)
 	h.SetFavoriteRepo(testutil.NewMockNoteFavoriteRepository())
 	return h, userRepo
+}
+
+// newDeleteAccountHandler wires an allow-by-default checked role provider so
+// existing self-delete tests reach the legacy validation logic. Tests that need
+// to exercise denial mutate the returned provider's policies.
+func newDeleteAccountHandler(t *testing.T) (*Handler, *testutil.MockUserRepository, *stubRoleProvider) {
+	t.Helper()
+	h, repo := newExtraHandler(t)
+	provider := &stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}}
+	h.SetRoleProvider(provider)
+	return h, repo, provider
 }
 
 // postExtraCanceled は**キャンセル済みの request context** で叩く。
@@ -197,7 +209,7 @@ func TestChangePassword_NewPasswordTooLong(t *testing.T) {
 // --- DeleteAccount ---
 
 func TestDeleteAccount_Success(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
 	assert.Equal(t, http.StatusNoContent, rec.Code)
@@ -206,7 +218,7 @@ func TestDeleteAccount_Success(t *testing.T) {
 }
 
 func TestDeleteAccount_WrongPassword(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	_ = user
 	rec := postExtra(h.DeleteAccount, `{"password":"wrong"}`, repo.Users["u1"])
@@ -215,7 +227,7 @@ func TestDeleteAccount_WrongPassword(t *testing.T) {
 }
 
 func TestDeleteAccount_NoProfile(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := &model.User{ID: "u1"}
 	repo.Users["u1"] = user
 	rec := postExtra(h.DeleteAccount, `{"password":"x"}`, user)
@@ -223,7 +235,7 @@ func TestDeleteAccount_NoProfile(t *testing.T) {
 }
 
 func TestDeleteAccount_InvalidParam(t *testing.T) {
-	h, _ := newExtraHandler(t)
+	h, _, _ := newDeleteAccountHandler(t)
 	rec := postExtra(h.DeleteAccount, `{}`, &model.User{ID: "u1"})
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
@@ -231,7 +243,7 @@ func TestDeleteAccount_InvalidParam(t *testing.T) {
 // TOTP gate (upstream drop-in 互換): 2FA 有効ユーザが token 無しで
 // delete-account を呼ぶと 403 INVALID_TOKEN で refuse される。
 func TestDeleteAccount_With2FA_RequiresToken(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	enableTwoFactorWithBackupCodes(repo, "u1")
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
@@ -243,7 +255,7 @@ func TestDeleteAccount_With2FA_RequiresToken(t *testing.T) {
 
 // 2FA 有効でも valid token (backup code) を渡せば成功する。
 func TestDeleteAccount_With2FA_AcceptsBackupCode(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	enableTwoFactorWithBackupCodes(repo, "u1")
 	rec := postExtra(h.DeleteAccount, `{"password":"pass","token":"backup1"}`, user)
@@ -257,7 +269,7 @@ func TestDeleteAccount_With2FA_AcceptsBackupCode(t *testing.T) {
 // 失効させ、削除済 user 名義での操作が cache TTL 内 (最大 30s) に
 // 残らないようにする。
 func TestDeleteAccount_InvalidatesAllUserTokens(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 
 	inv := &stubTokenInvalidator{}
@@ -277,7 +289,7 @@ func TestDeleteAccount_InvalidatesAllUserTokens(t *testing.T) {
 // 削除自体は成功して 204 を返す。core 削除挙動が invalidator dependency に
 // 引きずられない defensive。
 func TestDeleteAccount_NoInvalidatorIsNoop(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
@@ -488,6 +500,7 @@ func TestDeleteAccount_UpdateError(t *testing.T) {
 	idGen, _ := id.NewGenerator("aidx")
 	svc := coreuser.NewService(failRepo, testutil.NewMockNoteRepository(), testutil.NewMockUserNotePiningRepository(), idGen)
 	h := NewHandler(svc, idGen)
+	h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}})
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, failRepo.Users["u1"])
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
 }
@@ -682,7 +695,7 @@ func (f *fakeAccountDeletionFed) OnUserDeleted(u *model.User) {
 // #2230: noteIds/drive purge の cascade job enqueue と AP Delete(actor) 配信が
 // 走ることを検証する (論理削除フラグだけでなく実削除が triggered される)。
 func TestDeleteAccount_EnqueuesCascadeAndFederates(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	enq := &fakeDeleteEnqueuer{}
 	fed := &fakeAccountDeletionFed{}
@@ -702,7 +715,7 @@ func TestDeleteAccount_EnqueuesCascadeAndFederates(t *testing.T) {
 // #2230: enqueue が失敗しても論理削除フラグは立ったままなので 204 を返す
 // (フラグが source of truth、cleanup は次回 retry に委ねる)。
 func TestDeleteAccount_EnqueueErrorStillReturns204(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	h.SetDeleteAccountEnqueuer(&fakeDeleteEnqueuer{err: errors.New("boom")})
 
@@ -713,7 +726,7 @@ func TestDeleteAccount_EnqueueErrorStillReturns204(t *testing.T) {
 
 // #2230: root アカウントの自己削除は cascade 前に 403 で拒否し、削除も enqueue もしない。
 func TestDeleteAccount_ProtectedRootRejected(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	user.IsRoot = true
 	enq := &fakeDeleteEnqueuer{}
@@ -728,7 +741,7 @@ func TestDeleteAccount_ProtectedRootRejected(t *testing.T) {
 
 // #2230: ローカル system account (host=nil + username に '.') も自己削除を拒否する。
 func TestDeleteAccount_ProtectedSystemRejected(t *testing.T) {
-	h, repo := newExtraHandler(t)
+	h, repo, _ := newDeleteAccountHandler(t)
 	user := setupUserWithPassword(repo, "u1", "pass")
 	user.Username = "relay.actor"
 	user.Host = nil
@@ -736,6 +749,107 @@ func TestDeleteAccount_ProtectedSystemRejected(t *testing.T) {
 	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.False(t, repo.Users["u1"].IsDeleted)
+}
+
+// Checked policy resolution must gate self-delete: a resolved deny (or a
+// non-bool / missing value) returns 403 and a resolver failure returns 500,
+// with no mutation, cascade enqueue, federation delivery or token invalidate.
+// Administrators get no bypass (unlike HasRolePolicy consumers).
+func TestDeleteAccount_CanDeleteAccountPolicy(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		provider *stubRoleProvider
+		wantCode int
+		wantBody string
+	}{
+		{"false", &stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: false}}, http.StatusForbidden, "ROLE_PERMISSION_DENIED"},
+		{"administrator false", &stubRoleProvider{admin: true, policies: map[string]any{role.PolicyCanDeleteAccount: false}}, http.StatusForbidden, "ROLE_PERMISSION_DENIED"},
+		{"missing", &stubRoleProvider{policies: map[string]any{}}, http.StatusForbidden, "ROLE_PERMISSION_DENIED"},
+		{"wrong type", &stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: "true"}}, http.StatusForbidden, "ROLE_PERMISSION_DENIED"},
+		{"resolver error", &stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}, policyErr: errors.New("resolver failed")}, http.StatusInternalServerError, "INTERNAL_ERROR"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, repo := newExtraHandler(t)
+			h.SetRoleProvider(tt.provider)
+			enq := &fakeDeleteEnqueuer{}
+			fed := &fakeAccountDeletionFed{}
+			inv := &stubTokenInvalidator{}
+			h.SetDeleteAccountEnqueuer(enq)
+			h.SetAccountDeletionFederationHook(fed)
+			h.SetAuthInvalidator(inv)
+			user := setupUserWithPassword(repo, "u1", "pass")
+
+			rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+
+			assert.Equal(t, tt.wantCode, rec.Code)
+			assert.Contains(t, rec.Body.String(), tt.wantBody)
+			assert.False(t, repo.Users["u1"].IsDeleted)
+			assert.False(t, repo.Users["u1"].IsSuspended)
+			assert.Empty(t, enq.called)
+			assert.Empty(t, fed.deleted)
+			assert.Empty(t, inv.userCalls)
+		})
+	}
+}
+
+// The stub above only proves "a checked error is fatal"; it cannot prove that
+// production *produces* one. Wire the real role.Service with an unreadable
+// instance meta (where the admin's canDeleteAccount=false base override lives)
+// so the end-to-end path -- fetch failure -> checked error -> 500 -- is the one
+// under test. No deletion side effect may happen.
+func TestDeleteAccount_RealRoleServiceMetaBaseFailureReturns500(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	roleRepo := testutil.NewMockRoleRepository()
+	metaRepo := testutil.NewMockMetaRepository()
+	metaRepo.Meta = &model.Meta{ID: "x", Policies: datatypes.JSON([]byte(`{"canDeleteAccount":false}`))}
+	metaRepo.FetchErr = errors.New("meta unavailable")
+	roleIDGen, _ := id.NewGenerator("aidx")
+	h.SetRoleProvider(role.NewService(roleRepo, testutil.NewMockRoleAssignmentRepository(roleRepo), metaRepo, roleIDGen))
+
+	enq := &fakeDeleteEnqueuer{}
+	fed := &fakeAccountDeletionFed{}
+	inv := &stubTokenInvalidator{}
+	h.SetDeleteAccountEnqueuer(enq)
+	h.SetAccountDeletionFederationHook(fed)
+	h.SetAuthInvalidator(inv)
+	user := setupUserWithPassword(repo, "u1", "pass")
+
+	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INTERNAL_ERROR")
+	assert.False(t, repo.Users["u1"].IsDeleted)
+	assert.Empty(t, enq.called)
+	assert.Empty(t, fed.deleted)
+	assert.Empty(t, inv.userCalls)
+}
+
+// A provider that cannot resolve checked policies (here: none wired) must fail
+// closed with 500 rather than falling back to an allow.
+func TestDeleteAccount_MissingCheckedProviderFailsClosed(t *testing.T) {
+	h, repo := newExtraHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	rec := postExtra(h.DeleteAccount, `{"password":"pass"}`, user)
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+	assert.Contains(t, rec.Body.String(), "INTERNAL_ERROR")
+	assert.False(t, repo.Users["u1"].IsDeleted)
+}
+
+// The policy gate runs before credential handling, so a denied request must not
+// consume the supplied backup code. Reusing the same code after flipping the
+// policy to allow proves the denial never touched it.
+func TestDeleteAccount_PolicyDenialDoesNotConsumeTwoFactorToken(t *testing.T) {
+	h, repo, provider := newDeleteAccountHandler(t)
+	user := setupUserWithPassword(repo, "u1", "pass")
+	enableTwoFactorWithBackupCodes(repo, "u1")
+	provider.policies[role.PolicyCanDeleteAccount] = false
+
+	denied := postExtra(h.DeleteAccount, `{"password":"pass","token":"backup1"}`, user)
+	assert.Equal(t, http.StatusForbidden, denied.Code)
+
+	provider.policies[role.PolicyCanDeleteAccount] = true
+	allowed := postExtra(h.DeleteAccount, `{"password":"pass","token":"backup1"}`, user)
+	assert.Equal(t, http.StatusNoContent, allowed.Code)
 }
 
 // change-password でも枠を取れなければ 503 を返す (#2849)。**400 に潰さない** —
@@ -810,7 +924,7 @@ func captureExtraLogs(t *testing.T) *bytes.Buffer {
 func TestDeleteAccount_RootProtectionUsesMeta(t *testing.T) {
 	setup := func(t *testing.T, rootID *string) (*Handler, *testutil.MockUserRepository, *testutil.MockMetaRepository) {
 		t.Helper()
-		h, repo := newExtraHandler(t)
+		h, repo, _ := newDeleteAccountHandler(t)
 		metaRepo := testutil.NewMockMetaRepository()
 		metaRepo.Meta = &model.Meta{ID: "x", RootUserID: rootID}
 		h.SetMetaRepo(metaRepo)

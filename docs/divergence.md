@@ -10,7 +10,7 @@ mk-go が持つ「純正 Misskey (misskey-dev/misskey) には無い、または�
 > Misskey TS は 1.0.0 時点と同じ `2026.7.0` のままだった。**2026.9.0 への追従 (#2877) で
 > ベースラインを `2026.9.0` へ更新し、2026.9.1 への追従 (#3176) で `2026.9.1` へ上げた。**
 > 個々の記述はまだ 2026.7.0 時点の観察に基づくものが
-> 混じりうるので、乖離を判断するときは対象の実装を現 pin (`2026.9.1-mk.1`) で確認すること。
+> 混じりうるので、乖離を判断するときは対象の実装を現 pin (`2026.9.1-mk.2`) で確認すること。
 
 ## このドキュメントの位置づけ
 
@@ -38,7 +38,7 @@ mk-go は drop-in 互換 (同じ DB / Redis / frontend を Misskey TS と共有�
 | DB カラム | 22 (+ 未使用の残存列 3) | 3 | 0 |
 | ActivityPub | Ed25519 / RemoteStatsFetcher ほか | reversi 連合 / chat 連合 | — |
 | config キー | 20 前後 | 0 | — |
-| fork frontend の独自変更 | 119 tag (`2026.7.0-mk.0` ～ `2026.9.1-mk.1`) | — | — |
+| fork frontend の独自変更 | 120 tag (`2026.7.0-mk.0` ～ `2026.9.1-mk.2`) | — | — |
 
 **upstream endpoint の未実装はゼロ** (coverage 100.0%、444/444)。DB schema も upstream の全テーブル・全共有カラムを superset で保持しており、逆方向の欠落は無い。
 
@@ -456,11 +456,11 @@ submodule bump の PR で人が見る。
 
 ## 4-2. fork frontend の独自変更
 
-`third_party/misskey` fork (`shiroha-a/misskey-ts`) に載せている frontend の custom commit。**原則として**純正へ還元できない (= 純正 backend が対応しない) ものだけを置く方針。
+`third_party/misskey` fork (`Misaki-Project/misskey-ts`) に載せている frontend の custom commit。**原則として**純正へ還元できない (= 純正 backend が対応しない) ものだけを置く方針。
 
 **還元できるものを一時的に置く場合は、その行に必ず明記する。** 純正にも同じ不具合があるものをここへ置くと、この表を「還元不能な差分の一覧」として読む運用 (upstream 追従時に残す / 落とすを判断する材料) が壊れる。純正へ取り込まれた時点で revert する対象なので、行を読んだだけでそれが分かる必要がある。現時点の該当は `2026.7.0-mk.22h` / `2026.7.0-mk.22i` / `2026.7.0-mk.22j` / `2026.9.0-mk.1` / `2026.9.0-mk.2` / `2026.9.0-mk.2a` / `2026.9.0-mk.8e` / `2026.9.0-mk.8f` / `2026.9.0-mk.15` / `2026.9.0-mk.15a` / `2026.9.0-mk.15b` / `2026.9.0-mk.15c` / `2026.9.0-mk.16` / `2026.9.0-mk.16a` / `2026.9.0-mk.16b` の 15 行 (**base を省略しない** — bump で `-mk.N` は 0 に戻るので省略形は曖昧になる)。
 
-**現在の pin は `2026.9.1-mk.1` (`71367bfe`)。** `2026.9.0-mk.*` の行はすべて 2026.9.1 への
+**現在の pin は `2026.9.1-mk.2` (`1a53308b`)。** `2026.9.0-mk.*` の行はすべて 2026.9.1 への
 載せ替え (`git rebase --onto 2026.9.1 2026.9.0`、custom commit 151 個) で `2026.9.1-mk.0` に
 入っている。**載せ替えの衝突は 0 件** — upstream と fork の両方が触ったファイルは
 `locales/en-US.yml` / `pages/flash/flash.vue` / `utility/get-user-menu.ts` の 3 つだが、
@@ -598,6 +598,7 @@ upstream が `jobState` の型を autogen (`AdminQueueJobsRequest['state'][numbe
 | `2026.9.0-mk.41` | `/about-mkgo` のコントリビューター一覧から 4sterisk を外す (shiroha-a/misskey-ts#6)。本人からの依頼。fork の PR をそのまま取り込むと、ベースの `mk-2026.9.0` ブランチがタグ系列より 20 commit 古いため古い側に載る。著作者を保ったまま タグ系列へ cherry-pick してある。**純正へは還元できない行** (`about-mkgo.vue` は mk-go 固有ページ)。 |
 | `2026.9.1-mk.0` | Misskey 2026.9.1 への載せ替え (#3176)。**独自変更の内容は上の `2026.9.0-mk.*` の行がそのまま移ったもの**で、衝突解決も無い (固有の変更は無い)。 |
 | `2026.9.1-mk.1` | 復帰直後の再接続で、タイムラインの穴埋めが捨てられる問題を直す (#3195)。`2026.9.0-mk.39` (#3132) の穴埋めは、生成時刻を「前回」に数えて 30 秒抑止し、見送った回を走らせ直す仕組みを持っていなかった。iPhone の PWA では「裏で自動リロード → 20 秒後に復帰」の張り直しが必ず見送られ、タイムラインがリロードするまで古いまま残った (実機 iOS 18.6.2 に一時的な記録を入れて確認)。**mount 直後の抑止は 5 秒に分け、その間の接続は起点も控えない** / **間隔で見送った回は明ける時刻に timer 1 本で走らせ直す** (表示に戻った直後はもっと早く明けるので、遅い timer は張り直す) / **裏にいる間は投げず、表示に戻ったら走らせる** — 購読は本体が持つ (ノート側には拾い直す口が無かった)。Vue の watch (`isPausingUpdate`) より先に投げると取れたノートが queue に取り残されるので timer を 1 段挟む / **表示に戻った直後 10 秒はジッターを入れず、間隔を 2 秒に縮める** (無くしはしない。接続が暴れたときに連打する) / **表示に戻った時点で飛行中の取得は裏をまたいでいるので見捨てて投げ直す** (iOS に止められて 1.5 分決着しなかった。世代が変わっていたら控えは戻さない) / 飛行中に来た接続の控えは終わった時点で走らせる。**既知の制約**: 一覧が空のときの `reload()` が裏で止まった場合は救えない / 裏と表を往復するたびに決着しない取得が 1 本ずつ残りうる (結果は id で重複が落ちる)。mk-go 側の静的ゲートは、SFC が本体のテスト用の注入点 (表示状態 / timer / 時計など) を渡していないことも見る。**upstream 追従で落とす対象ではない** (`2026.9.0-mk.39` と同じく fork 独自の実装)。 |
+| `2026.9.1-mk.2` | `canDeleteAccount` の frontend 配線 (mk-go #9)。`pages/settings/other.vue` のアカウント削除セクションを `v-if="isAccountDeletionAllowed($i.policies)"` で出し分け、判定は新しい `@/utility/account-delete-policy.ts` の `isAccountDeletionAllowed()` に 1 箇所へ集約した。**frontend は出し分けだけで、認可は backend の責務** — policy が `true` の account だけが実際に削除できる。常に出していた形では policy `false` の instance にも消せる入口が残り、押しても 403 になるだけになっていた。base policy を編集する側 (`pages/admin/roles.editor.vue` のキー一覧 / `roles.policy-editor.vue` の XFolder) も同時に足した。**関数を import しただけでは配線と数えない** — 使わなければデッドコードで、`v-if` を消しても関数自体は残るだけなので、mk-go 側の静的ゲート (`internal/server/rolepolicy_keys_gate_test.go` の `TestCanDeleteAccountIsWiredInSettings`) が import 行と `v-if` の両方を文字列で固定する。**同じタグに signup E2E の test fix も入る** — `MkSignupDialog.form.vue` はユーザー名の可用性を 1000ms debounce で問い合わせる (`usernameState` が `'ok'` になるまで送信ボタンは無効) のに、E2E がその完了を待たずに状態を確認していたため、base の時点で signup 1 ケースが必ず落ちていた。canDeleteAccount の PR 自体は frontend の表 gate だけを狙ったもので、この test fix は別 PR で同じブランチへ入れている。**純正へは還元できない行** (`canDeleteAccount` policy は mk-go 固有)。 |
 
 `2026.7.0-mk.1` の内訳:
 

@@ -30,6 +30,11 @@ var defaults = map[string]any{
 	"canSearchUsers":             true,
 	"canUseTranslator":           true,
 	"canHideAds":                 false,
+	// canDeleteAccount gates a user's own i/delete-account request. **default
+	// true** — 自分で作ったアカウントを自分で消せない理由は無いので全員に
+	// 開き、絞りたい運営者が role で false にする。管理者 bypass は無い
+	// (role_service.go の PolicyCanDeleteAccount 参照)。
+	"canDeleteAccount": true,
 	// upstream Misskey #17121のchannel作成権限。default trueで全員を許可し、
 	// adminがrole経由で個別userを絞る。
 	"canCreateChannel":       true,

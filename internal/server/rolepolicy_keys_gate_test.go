@@ -92,6 +92,31 @@ func TestMkGoRolePolicyKeysAreListedInFrontend(t *testing.T) {
 	}
 }
 
+// TestCanDeleteAccountIsWiredInSettings は `canDeleteAccount` が設定画面に実際に
+// 配線されていることを見る。
+//
+// **型検査では捕まらない。** ガードを外しただけでは policy を読まない画面になるだけで、
+// 上の role policy gate と同じ理屈 (`roles.editor` / `roles.policy-editor` だけ見て
+// いる) で素通りする。実際の出口は「利用者が自分のアカウントを消せるか」の
+// 1 画面だけなので、ここを文字列で固定する。
+//
+// **import と guard の両方を要求する。** helper を import しただけで使っていなければ
+// デッドコードで、`v-if` を消しても関数自体は残る。**どちらも落としたらその場で
+// 気づける形**にしてある (#2898 / #2900 と同じ形)。
+func TestCanDeleteAccountIsWiredInSettings(t *testing.T) {
+	path := filepath.Join(repoRootDir(t), "third_party", "misskey", "packages", "frontend", "src", "pages", "settings", "other.vue")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.Getenv("MK_FRONTEND_GATES_REQUIRE_SUBMODULE") != "" {
+			require.NoError(t, err)
+		}
+		t.Skipf("submodule が無い: %v", err)
+	}
+	src := htmlComment.ReplaceAll(raw, nil)
+	require.Contains(t, string(src), `import { isAccountDeletionAllowed } from '@/utility/account-delete-policy.js';`)
+	require.Regexp(t, regexp.MustCompile(`<SearchMarker\s+v-if="isAccountDeletionAllowed\(\$i\.policies\)"\s+:keywords="\['account', 'close', 'delete'\]">`), string(src))
+}
+
 // htmlComment matches a `<!-- ... -->` block in a Vue template.
 var htmlComment = regexp.MustCompile(`(?s)<!--.*?-->`)
 

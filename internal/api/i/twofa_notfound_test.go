@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
 
+	"github.com/shiroha-a/mk/internal/core/role"
 	coreuser "github.com/shiroha-a/mk/internal/core/user"
 	"github.com/shiroha-a/mk/internal/misc/id"
 	"github.com/shiroha-a/mk/internal/model"
@@ -94,6 +95,7 @@ func TestPasswordGate_DBFailureIsNot4xx(t *testing.T) {
 			return postRegistryWithScope(h.ChangePassword, `{"currentPassword":"a","newPassword":"bbbbbbbb"}`, u, nil).Code
 		}},
 		{"i/delete-account", func(h *Handler, u *model.User) int {
+			h.SetRoleProvider(&stubRoleProvider{policies: map[string]any{role.PolicyCanDeleteAccount: true}})
 			return postRegistryWithScope(h.DeleteAccount, `{"password":"p"}`, u, nil).Code
 		}},
 		{"i/regenerate-token", func(h *Handler, u *model.User) int {

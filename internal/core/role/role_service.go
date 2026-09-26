@@ -224,6 +224,10 @@ const (
 	// 値を見る pattern (空文字 userID で同等)。
 	PolicyLtlAvailable = "ltlAvailable"
 	PolicyGtlAvailable = "gtlAvailable"
+
+	// PolicyCanDeleteAccount gates a user's own i/delete-account request. Unlike
+	// HasRolePolicy consumers, this policy does not grant administrators a bypass.
+	PolicyCanDeleteAccount = "canDeleteAccount"
 )
 
 // roleCacheTTL は GetUserRoles キャッシュの有効期限。Misskey TS 同等の
@@ -1081,34 +1085,51 @@ func policyUnlimitedOrAboveCap(v any, limit int) bool {
 func (s *Service) GetUserPolicies(userID string) map[string]any {
 	// 解決は resolvePolicies に委譲する (provider 失敗時は errorless で
 	// native-onlyの安全なmapを返す)。checked版はGetUserPoliciesCheckedがerrorを返す。
+	//
+	// **ここでは error を握り潰す** — 実効 map だけを必要とする consumer
+	// (`IsSilenced` / `HasRolePolicy` / `/api/i` の policy 応答) は meta の
+	// 一時障害で 500 にしては困るので、base を読めなかった窓でも
+	// native 既定の map を返す。認可の判断をする consumer は
+	// `GetUserPoliciesChecked` を使い、そちらの error で fail closed する。
 	out, _ := s.resolvePolicies(userID)
 	return out
 }
 
 // applyMetaBasePolicies overlays `meta.policies` (admin UI 設定の base
-// override) onto the default policies map. Best-effort: meta fetch /
-// JSON unmarshal の失敗は silently skip して default のままにする
-// (= upstream TS と同じ fail-soft 挙動)。
+// override) onto the default policies map. `meta.policies` が空、または
+// metaRepo 未配線なら何も重ねない (= overlay する情報がない)。
 //
 // JSON unmarshal は数値を float64 に倒すため、key が DefaultPolicies で int
 // として宣言されている場合は明示的に int へ丸めて整合性を保つ (#1020 review:
 // consumer 側の `policies[key].(int)` type assert が float64 で panic する
 // regression を防ぐ)。base に無い未知 key は型情報が無いので素通し。
-func (s *Service) applyMetaBasePolicies(base map[string]any) {
+//
+// **fetch / decode の失敗は握り潰さない (= fail-soft だった挙動の撤回)。**
+// base override を読めないのに黙って native default のまま返すと、
+// 「運営者が base で `canDeleteAccount=false` を指定している」instance が
+// **その窓だけ `true` を返す**。他の失敗 (role 入力 / provider) と違い
+// fallback 側がそのまま認可の許可側なので、握り潰すと認可が fail open する。
+// 解決 error として呼び出し側へ渡し、fail-soft を望む consumer
+// (`GetUserPolicies`) だけが `resolvePolicies` の error を捨てる。
+func (s *Service) applyMetaBasePolicies(base map[string]any) error {
 	if s.metaRepo == nil {
-		return
+		return nil
 	}
 	meta, err := s.metaRepo.Fetch()
-	if err != nil || meta == nil || len(meta.Policies) == 0 {
-		return
+	if err != nil {
+		return err
+	}
+	if meta == nil || len(meta.Policies) == 0 {
+		return nil
 	}
 	var metaPolicies map[string]any
 	if err := json.Unmarshal(meta.Policies, &metaPolicies); err != nil {
-		return
+		return err
 	}
 	for k, v := range metaPolicies {
 		base[k] = coerceToBaseType(base[k], v)
 	}
+	return nil
 }
 
 // coerceToBaseType normalises a JSON-decoded value (typically float64 for

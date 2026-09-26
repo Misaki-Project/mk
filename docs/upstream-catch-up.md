@@ -136,7 +136,7 @@ triage で判定した item を `gh issue create` で 1 件 1 issue として起
 
 ### 2-5. submodule bump 時の fork 運用
 
-mk-go は `shiroha-a/misskey-ts` fork を経由して submodule を pin している (= upstream の release tag + mk 固有のパッチを cherry-pick したもの)。新 release を取り込む手順:
+mk-go は `Misaki-Project/misskey-ts` fork を経由して submodule を pin している (= upstream の release tag + mk 固有のパッチを cherry-pick したもの)。新 release を取り込む手順:
 
 ```bash
 cd third_party/misskey
@@ -187,7 +187,7 @@ git add third_party/misskey
 
 **過去のタグは振り直さない。** タグは push 済みで、fork 側の
 `Publish frontend assets image` workflow が `*-mk.*` で発火して
-`ghcr.io/shiroha-a/misskey-ts-assets:<tag>` を publish しているため、打ち直すと配布物との
+`ghcr.io/misaki-project/misskey-ts-assets:<tag>` を publish しているため、打ち直すと配布物との
 対応が壊れる。
 
 タグを打ったら、**親リポ側で 4 箇所を同時に更新する**（順序は「submodule に commit →
@@ -349,7 +349,7 @@ mk-go と Misskey TS を並べて比較するハーネスは、**比較対象の
 | `docker-compose.dropin.yml` / `docker-compose.dropin-frontend.yml` / `docker-compose.federation.misskey.yml` | drop-in / 実連合の TS インスタンス |
 | `.github/workflows/dropin-e2e.yml` / `dropin-frontend-e2e.yml` | 上記の pre-pull と matrix |
 | `tests/bench/` / `tests/queue-bench/` の compose | 性能比較の対象 |
-| `Dockerfile.bundled` の `MISSKEY_ASSETS_IMAGE` | **配る image に焼く frontend**。これだけは TS image ではなく fork の assets image (`ghcr.io/shiroha-a/misskey-ts-assets:<tag>-mk.N`) で、**submodule のタグと 1:1 で対応させる**。ずれると 2026.9.0 の backend に古い frontend を載せた image を配ることになる。`make submodulepin-check` が `docs/divergence.md` の pin 行と突き合わせる (#3011) |
+| `Dockerfile.bundled` の `MISSKEY_ASSETS_IMAGE` | **配る image に焼く frontend**。これだけは TS image ではなく fork の assets image (`ghcr.io/misaki-project/misskey-ts-assets:<tag>-mk.N`) で、**submodule のタグと 1:1 で対応させる**。ずれると 2026.9.0 の backend に古い frontend を載せた image を配ることになる。`make submodulepin-check` が `docs/divergence.md` の pin 行と突き合わせる (#3011) |
 
 **`Dockerfile.bundled` は表に無かったせいで実際に 23 世代遅れた** (#2877 の時点で
 `2026.7.0-mk.10`。数え方は fork の `*-mk.*` タグを `2026.7.0-mk.10` より後で数えた値で、
@@ -359,7 +359,7 @@ mk-go と Misskey TS を並べて比較するハーネスは、**比較対象の
 参照されていない (`tests/queue-bench/` は nightly の `queue-bench-smoke.yml` が引く)。
 assets image は fork 側の `Publish frontend assets image` workflow が `*-mk.*` タグで
 発火して publish するので、**submodule のタグを push した後**に上げること
-(`gh run list --repo shiroha-a/misskey-ts` で success を確認できる)。
+(`gh run list --repo Misaki-Project/misskey-ts` で success を確認できる)。
 
 **表に載せただけでは止まらなかった。** #2877 で表へ載せた後も `Dockerfile.bundled` の
 pin は `2026.9.0-mk.0` に置き去りのままで、**リリースした `1.3.0-bundled` は既に 2 世代**
@@ -368,7 +368,7 @@ pin は `2026.9.0-mk.0` に置き去りのままで、**リリースした `1.3.
 `make gates` が落ちる (#3011)。**publish 済みかどうかまでは見ない** —
 ネットワークが要るので `make gates` では取れない。tag を上げたら上の `gh run list` で
 assets image の workflow が success していることを必ず確認し、**失敗していたら fork 側で
-回し直す** (`gh workflow run assets-image.yml --repo shiroha-a/misskey-ts -f tag=<tag>`。
+回し直す** (`gh workflow run assets-image.yml --repo Misaki-Project/misskey-ts -f tag=<tag>`。
 `tag` は `required: true` の input で、workflow 自身がその tag を checkout するので `--ref` では代用できない)。
 publish されていない tag を pin すると `docker.yml` の `build-and-push-bundled` が `FROM` の
 pull で落ちる。実測で `2026.7.0-mk.18` は**タグはあるのに image が無い**状態で残っている

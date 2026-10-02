@@ -122,6 +122,20 @@ func (c *Catalog) NormalizeConst(key string, value any) (any, error) {
 			return nil, invalid(CodeInvalidRangeValue, "policyRanges.value",
 				"%q は数値ですが %#v が渡されました (%s)", key, value, err)
 		}
+		if key == "genshinRefreshIntervalMinutes" {
+			var minutes float64
+			switch v := n.(type) {
+			case int64:
+				minutes = float64(v)
+			case float64:
+				minutes = v
+			default:
+				return nil, invalid(CodeInvalidRangeValue, "policyRanges.value", "原神の取得間隔は1〜1440分の整数で指定してください")
+			}
+			if minutes < 1 || minutes > 1440 || math.Trunc(minutes) != minutes {
+				return nil, invalid(CodeInvalidRangeValue, "policyRanges.value", "原神の取得間隔は1〜1440分の整数で指定してください")
+			}
+		}
 		return n, nil
 	case KindString:
 		s, isStr := value.(string)

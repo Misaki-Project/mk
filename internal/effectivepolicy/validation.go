@@ -11,15 +11,17 @@ import (
 )
 
 var defaults = map[string]any{
-	"gtlAvailable":          true,
-	"ltlAvailable":          true,
-	"canPublicNote":         true,
-	"mentionLimit":          20,
-	"canInvite":             false,
-	"inviteLimit":           0,
-	"inviteLimitCycle":      10080,
-	"inviteExpirationTime":  0,
-	"canManageCustomEmojis": false,
+	// 原神の自動取得間隔（分）。Enka TTLより短く取得することはない。
+	"genshinRefreshIntervalMinutes": 10,
+	"gtlAvailable":                  true,
+	"ltlAvailable":                  true,
+	"canPublicNote":                 true,
+	"mentionLimit":                  20,
+	"canInvite":                     false,
+	"inviteLimit":                   0,
+	"inviteLimitCycle":              10080,
+	"inviteExpirationTime":          0,
+	"canManageCustomEmojis":         false,
 	// 絵文字の登録申請 (#2934)。**default true** — 登録は必ずモデレーターの
 	// 承認を通るので、申請そのものを既定で塞ぐ必要が無い。canCreateChannel と
 	// 同じく、絞りたい運営者が role で false にする。
@@ -257,6 +259,18 @@ func valueValid(key string, native, value any) bool {
 		_, ok := value.(bool)
 		return ok
 	case int:
+		if key == "genshinRefreshIntervalMinutes" {
+			switch v := value.(type) {
+			case int:
+				return v >= 1 && v <= 1440
+			case int64:
+				return v >= 1 && v <= 1440
+			case float64:
+				return v >= 1 && v <= 1440 && math.Trunc(v) == v
+			default:
+				return false
+			}
+		}
 		return numberValid(value)
 	case string:
 		v, ok := value.(string)

@@ -17,7 +17,7 @@ jobs:
       mk_repository: ${{ github.repository }}
       mk_ref: ${{ github.sha }}
       plugins: |
-        genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 151e135548d405fd39faddd38eeacf1dfaf51048
+        genshin https://github.com/Misaki-Project/mk-plugin-genshin.git 97eefa37bab74827df764bb8f3a482903c890c98
       image: ghcr.io/misaki-project/mk-genshin
       # 再実行でも既存tagを上書きしない。
       tags: rolelevel-20261002-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

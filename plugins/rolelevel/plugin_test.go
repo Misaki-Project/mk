@@ -62,6 +62,14 @@ func TestLegacyMigrationPolicyAllowlistMatchesCatalog(t *testing.T) {
 		t.Fatal("legacy migration 6が見つかりません")
 	}
 	for _, key := range defaultCatalog.Keys() {
+		// Migration 6の後に追加したpolicyは旧データに存在しない。
+		// 新policyのために適用済みmigrationを書き換えない。
+		if key == "genshinRefreshIntervalMinutes" {
+			if strings.Contains(legacySQL, "'"+key+"'") {
+				t.Fatal("新policyが適用済みlegacy migrationへ混入しています")
+			}
+			continue
+		}
 		if !strings.Contains(legacySQL, "'"+key+"'") {
 			t.Fatalf("legacy migration policy allowlist is missing %q", key)
 		}

@@ -33,6 +33,7 @@
     { "key": "emojiApplicationMaxPerDay", "kind": "number" },
     { "key": "emojiApplicationMaxPerMonth", "kind": "number" },
     { "key": "emojiApplicationMaxPerWeek", "kind": "number" },
+    { "key": "genshinRefreshIntervalMinutes", "kind": "number" },
     { "key": "gtlAvailable", "kind": "boolean" },
     { "key": "inviteExpirationTime", "kind": "number" },
     { "key": "inviteLimit", "kind": "number" },

@@ -1510,6 +1510,20 @@ func aggregatePolicyValues(key string, baseVal any, values []any) any {
 		}
 		return false
 	case int:
+		if key == "genshinRefreshIntervalMinutes" {
+			// 同じ優先度では短い間隔を採用する。ほかの数値policyは従来のmax。
+			best, found := 1440, false
+			for _, value := range values {
+				candidate, ok := intBaseNumber(value)
+				if ok && candidate.integer && candidate.intValue >= 1 && candidate.intValue <= 1440 {
+					best, found = min(best, int(candidate.intValue)), true
+				}
+			}
+			if found {
+				return best
+			}
+			return baseVal
+		}
 		return maxNumber(values, baseVal)
 	case string:
 		if key == "chatAvailability" {
